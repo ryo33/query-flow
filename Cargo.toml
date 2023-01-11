@@ -1,0 +1,13 @@
+[package]
+name = "query-flow"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A macro-free, data-oriented, general-purpose library for incremental, on-demand, self-adjusting computation using query-based dataflow"
+homepage = "https://github.com/ryo33/query-flow"
+repository = "https://github.com/ryo33/query-flow"
+readme = "README.md"
+keywords = ["incremental", "on-demand", "self-adjusting", "query-based", "dependency-graph"]
+categories = ["data-structures"]
+
+[dependencies]

@@ -10,4 +10,15 @@ readme = "README.md"
 keywords = ["incremental", "on-demand", "self-adjusting", "query-based", "dependency-graph"]
 categories = ["data-structures"]
 
+[features]
+default = ["async-query", "concurrent-storage"]
+async-query = ["async-trait", "parking_lot"]
+concurrent-storage = ["parking_lot"]
+
 [dependencies]
+parking_lot = { version = "0.12", optional = true }
+async-trait = { version = "0.1", optional = true }
+slab = "0.4"
+thiserror = "1.0"
+anyhow = "1.0"
+convertable = { path = "../convertable" }

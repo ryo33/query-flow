@@ -7,3 +7,5 @@
 ![GitHub Repo stars](https://img.shields.io/github/stars/ryo33/query-flow?style=social)
 
 A macro-free, data-oriented, general-purpose library for incremental, on-demand, self-adjusting computation using query-based dataflow
+
+DEVELOPPING!!

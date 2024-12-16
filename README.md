@@ -120,6 +120,7 @@ Whale maintains consistency through several key mechanisms:
 
 - **No Guarantees About**:
   - When get a node, it may be in an dirty state with other runnning operations
+	- When get a node, some of dependencies and dependents may be removed already or version is increased one or more times. However the node must be marked as invalidated. So the query must be re-computed.
   - Order of invalidation propagation across different queries
 
 ## License

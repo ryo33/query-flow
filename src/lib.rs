@@ -170,7 +170,7 @@ impl Node {
             .iter_mut()
             .filter(|(i, _reason)| i == &previous)
         {
-            *invalidation = (new, InvalidationReason::Invalidated);
+            *invalidation = (new, InvalidationReason::DependencyInvalidated);
         }
         Self {
             dependencies: Dependencies(Arc::new(dependencies)),
@@ -302,7 +302,7 @@ pub struct QueryRemovalResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InvalidationReason {
     /// Invalidated is a reason why a query is invalidated by another query is invalidated.
-    Invalidated,
+    DependencyInvalidated,
     /// NewVersion is a reason why a query is invalidated by a new version of another query.
     NewVersion,
     /// Removed is a reason why a query is invalidated by the removal of another query.
@@ -367,7 +367,7 @@ impl Runtime {
         }
         QueryRemovalResult {
             removed,
-            invalidated: vec![],
+            invalidated,
         }
     }
 
@@ -499,17 +499,17 @@ impl Runtime {
     #[must_use]
     pub fn invalidate(
         &self,
-        node: Pointer,
+        pointer: Pointer,
         revision_pointer: RevisionPointer,
         reason: InvalidationReason,
     ) -> Vec<Pointer> {
         let mut invalidated = vec![];
         let pinned = self.nodes.pin();
-        let result = pinned.compute(node.query_id, |node| {
+        let result = pinned.compute(pointer.query_id, |node| {
             let Some((_, node)) = node else {
                 return Operation::Abort(());
             };
-            if node.pointer().depends_on(node.pointer()) {
+            if node.pointer().depends_on(pointer) {
                 let mut node = node.clone();
                 node.invalidations = node.invalidations.pushed(revision_pointer, reason);
                 node.invalidation_revision.0 += 1;
@@ -532,7 +532,7 @@ impl Runtime {
                         invalidated.extend(self.invalidate(
                             dependents,
                             node.revision_pointer(),
-                            InvalidationReason::Invalidated,
+                            InvalidationReason::DependencyInvalidated,
                         ));
                     }
                 }
@@ -625,7 +625,7 @@ impl Runtime {
                     invalidated.extend(self.invalidate(
                         dependent,
                         new_node.revision_pointer(),
-                        InvalidationReason::Invalidated,
+                        InvalidationReason::DependencyInvalidated,
                     ));
                 }
             }
@@ -717,7 +717,7 @@ impl Runtime {
                 Compute::Removed(_, _) => {}
                 Compute::Aborted(AbortReason::NotFound) => {}
                 Compute::Aborted(AbortReason::AlreadyInvalidated(invalidator)) => {
-                    invalidations.push((invalidator, InvalidationReason::Invalidated));
+                    invalidations.push((invalidator, InvalidationReason::DependencyInvalidated));
                 }
                 Compute::Aborted(AbortReason::AlreadyUpdated(invalidator)) => {
                     invalidations.push((invalidator, InvalidationReason::NewVersion));

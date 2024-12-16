@@ -11,9 +11,9 @@ readme = "README.md"
 
 [features]
 default = []
-serde = ["dep:serde", "papaya/serde", "arc-swap/serde"]
+serde = ["dep:serde", "papaya/serde"]
 
 [dependencies]
-arc-swap = { version = "1.7.1" }
+ahash = "0.8"
 papaya = { version = "0.1.6" }
 serde = { version = "1", features = ["derive"], optional = true }

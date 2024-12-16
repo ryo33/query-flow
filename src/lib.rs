@@ -65,7 +65,7 @@ pub struct RevisionPointer {
 
 impl RevisionPointer {
     /// Returns true if this pointer can be uninvalidated by the other pointer.
-    pub fn can_be_uninvalidated(&self, other: &Self) -> bool {
+    pub fn can_restore(&self, other: &Self) -> bool {
         self.pointer == other.pointer
             && self.invalidation_revision.0 <= other.invalidation_revision.0
     }
@@ -73,7 +73,7 @@ impl RevisionPointer {
 
 impl Pointer {
     /// Returns true if this pointer should be invalidated if the other pointer is updated.
-    pub fn should_be_invalidated_by(&self, update: Self) -> bool {
+    pub fn depends_on(&self, update: Self) -> bool {
         if self.query_id != update.query_id {
             return false;
         }
@@ -131,11 +131,11 @@ impl Node {
 
     /// Remove an invalidator from this query.
     #[must_use]
-    pub fn remove_invalidator(&self, invalidator: RevisionPointer) -> Option<Self> {
+    pub fn remove_invalidation(&self, invalidator: RevisionPointer) -> Option<Self> {
         if self
             .invalidations
             .iter()
-            .any(|(i, _)| i.can_be_uninvalidated(&invalidator))
+            .any(|(i, _)| i.can_restore(&invalidator))
         {
             let mut node = self.clone();
             node.invalidations = node.invalidations.remove_uninvalidated(invalidator);
@@ -146,7 +146,7 @@ impl Node {
     }
 
     /// Extend invalidations with a list of precise pointers.
-    pub fn extend_invalidations(&mut self, with: Vec<(RevisionPointer, InvalidationReason)>) {
+    pub fn add_invalidations(&mut self, with: Vec<(RevisionPointer, InvalidationReason)>) {
         let mut invalidations = Vec::clone(&self.invalidations.0);
         invalidations.extend(with);
         self.invalidations = Invalidations(Arc::new(invalidations));
@@ -154,7 +154,7 @@ impl Node {
 
     /// Update the version of a dependency.
     #[must_use]
-    pub fn update_dependency_version(
+    pub fn update_version_reference(
         &self,
         previous: RevisionPointer,
         new: RevisionPointer,
@@ -185,7 +185,7 @@ pub struct Dependencies(Arc<Vec<Pointer>>);
 impl Dependencies {
     /// Returns true if this query should be invalidated if the other query is updated.
     pub fn should_be_invalidated_by(&self, update: Pointer) -> bool {
-        self.0.iter().any(|p| p.should_be_invalidated_by(update))
+        self.0.iter().any(|p| p.depends_on(update))
     }
 }
 
@@ -232,7 +232,7 @@ impl Invalidations {
     #[must_use]
     pub fn remove_uninvalidated(&self, pointer: RevisionPointer) -> Self {
         let mut invalidations = Vec::clone(&self.0);
-        invalidations.retain(|(i, _)| !i.can_be_uninvalidated(&pointer));
+        invalidations.retain(|(i, _)| !i.can_restore(&pointer));
         Invalidations(Arc::new(invalidations))
     }
 
@@ -284,6 +284,11 @@ impl Runtime {
         self.nodes.pin().get(&query_id).cloned()
     }
 
+    /// Iterate over all nodes.
+    pub fn keys(&self) -> Vec<QueryId> {
+        self.nodes.pin().keys().cloned().collect()
+    }
+
     /// Remove a node from the runtime. If the node is returned and has dependents, you should update them.
     #[must_use]
     pub fn remove(&self, query_id: QueryId) -> QueryRemovalResult {
@@ -299,7 +304,7 @@ impl Runtime {
                     node.dependents
                         .0
                         .iter()
-                        .any(|p| p.should_be_invalidated_by(removed.pointer()));
+                        .any(|p| p.depends_on(removed.pointer()));
                     let mut node = node.clone();
                     node.invalidations = node
                         .invalidations
@@ -385,7 +390,7 @@ impl Runtime {
             if !node.is_invalidated() {
                 return Operation::Abort(());
             }
-            if let Some(node) = node.remove_invalidator(invalidator) {
+            if let Some(node) = node.remove_invalidation(invalidator) {
                 Operation::Insert(node)
             } else {
                 Operation::Abort(())
@@ -410,31 +415,27 @@ impl Runtime {
     }
 
     /// Detect a cycle in the dependency graph.
-    pub fn detect_cycle(&self, query_id: QueryId) -> bool {
+    pub fn has_cycle(&self, query_id: QueryId) -> bool {
         let mut set = ahash::HashSet::default();
-        self.detect_cycle_with_set(query_id, &mut set)
+        self.has_cycle_with_set(query_id, &mut set)
     }
 
     /// Detect a cycle in the dependency graph with a set.
-    pub fn detect_cycle_with_set(
-        &self,
-        query_id: QueryId,
-        set: &mut ahash::HashSet<QueryId>,
-    ) -> bool {
+    pub fn has_cycle_with_set(&self, query_id: QueryId, set: &mut ahash::HashSet<QueryId>) -> bool {
         if set.contains(&query_id) {
             return true;
         }
         set.insert(query_id);
         for dependency in self.get(query_id).unwrap().dependencies.0.iter().cloned() {
-            if self.detect_cycle_with_set(dependency.query_id, set) {
+            if self.has_cycle_with_set(dependency.query_id, set) {
                 return true;
             }
         }
         false
     }
 
-    /// Free a query if it is not depended by any other queries. This is useful for garbage collection.
-    pub fn free_if_not_depended(&self, query_id: QueryId) -> Option<Node> {
+    /// Remove a query if it is not depended by any other queries. This is useful for garbage collection.
+    pub fn remove_if_unused(&self, query_id: QueryId) -> Option<Node> {
         let pinned = self.nodes.pin();
         let result = pinned.compute(query_id, |node| {
             let Some((_, node)) = node else {
@@ -470,7 +471,7 @@ impl Runtime {
             let Some((_, node)) = node else {
                 return Operation::Abort(());
             };
-            if node.pointer().should_be_invalidated_by(node.pointer()) {
+            if node.pointer().depends_on(node.pointer()) {
                 let mut node = node.clone();
                 node.invalidations = node.invalidations.pushed(precise_pointer, reason);
                 node.invalidation_revision.0 += 1;
@@ -507,24 +508,28 @@ impl Runtime {
     ///
     /// This should not hang though called with a cyclic dependency, since if all nodes in the cycle are invalidated, the recursion will be aborted.
     #[must_use]
-    pub fn register_new_version(
+    pub fn register(
         &self,
         query_id: QueryId,
         dependencies: Vec<Pointer>,
     ) -> QueryRegistrationResult {
         let dependencies = Dependencies(Arc::new(dependencies));
-        let (new_node, old_node) = self.register_new_version_inner(query_id, dependencies.clone());
+        let (new_node, old_node) = self.create_new_version(query_id, dependencies.clone());
 
         // At this point, other threads may be read this version without invalidated state before checking if it is invalidated.
 
         // Register dependents
         // While registering dependents, other threads may be update or invalidate those dependencies, so we need to collect all invalidated dependencies for this caller.
-        let invalidations = self.register_dependents(new_node.pointer(), dependencies);
+        let invalidations = self.update_dependency_graph(new_node.pointer(), dependencies);
         let new_node = self
             .extend_invalidations(new_node.pointer(), invalidations)
             .unwrap_or(new_node);
 
-        let mut newly_invalidated = vec![];
+        let mut newly_invalidated = if new_node.is_invalidated() {
+            vec![new_node.pointer()]
+        } else {
+            vec![]
+        };
 
         if let Some(old_node) = &old_node {
             // Recursively invalidate and collect old dependents
@@ -545,38 +550,43 @@ impl Runtime {
     }
 
     /// Register a new version for a query that has no change. So, dependents are not invalidated.
-    pub fn register_no_change(
+    ///
+    /// This returns invalidated pointers that are invalidated when the dependencies are updated.
+    pub fn update_dependencies(
         &self,
         query_id: QueryId,
         dependencies: Vec<Pointer>,
     ) -> QueryRegistrationResult {
         let dependencies = Dependencies(Arc::new(dependencies));
-        let (new_node, old_node) = self.register_new_version_inner(query_id, dependencies.clone());
+        let (new_node, old_node) = self.create_new_version(query_id, dependencies.clone());
 
         // At this point, other threads may be read this version without invalidated state before checking if it is invalidated.
 
         // Register dependents
         // While registering dependents, other threads may be update or invalidate those dependencies, so we need to collect all invalidated dependencies for this caller.
-        let invalidations = self.register_dependents(new_node.pointer(), dependencies);
+        let invalidations = self.update_dependency_graph(new_node.pointer(), dependencies);
         let new_node = self
             .extend_invalidations(new_node.pointer(), invalidations)
             .unwrap_or(new_node);
 
-        let mut invalidated = vec![];
+        let mut invalidated = if new_node.is_invalidated() {
+            vec![new_node.pointer()]
+        } else {
+            vec![]
+        };
 
         if let Some(old_node) = &old_node {
             for dependent in old_node.dependents.0.iter().cloned() {
+                self.update_dependency_version(
+                    dependent,
+                    old_node.revision_pointer(),
+                    new_node.revision_pointer(),
+                );
                 if new_node.is_invalidated() {
-                    self.update_dependency_version(
+                    invalidated.extend(self.invalidate(
                         dependent,
-                        old_node.revision_pointer(),
                         new_node.revision_pointer(),
-                    );
-                } else {
-                    invalidated.extend(self.update_and_invalidate(
-                        dependent,
-                        old_node.revision_pointer(),
-                        new_node.revision_pointer(),
+                        InvalidationReason::Invalidated,
                     ));
                 }
             }
@@ -589,7 +599,7 @@ impl Runtime {
     }
 
     #[must_use]
-    fn register_new_version_inner(
+    fn create_new_version(
         &self,
         query_id: QueryId,
         dependencies: Dependencies,
@@ -632,7 +642,7 @@ impl Runtime {
 
     /// Register a query as a dependents to each dependency, and find invalidations.
     #[must_use]
-    fn register_dependents(
+    fn update_dependency_graph(
         &self,
         pointer: Pointer,
         dependencies: Dependencies,
@@ -695,7 +705,7 @@ impl Runtime {
                     return Operation::Abort(());
                 }
                 let mut node = node.clone();
-                node.extend_invalidations(invalidations.clone());
+                node.add_invalidations(invalidations.clone());
                 Operation::Insert(node)
             });
             match result {
@@ -721,20 +731,7 @@ impl Runtime {
     ) {
         let pinned = self.nodes.pin();
         pinned.update(pointer.query_id, |node| {
-            node.update_dependency_version(previous, new)
+            node.update_version_reference(previous, new)
         });
-    }
-
-    fn update_and_invalidate(
-        &self,
-        pointer: Pointer,
-        previous: RevisionPointer,
-        new: RevisionPointer,
-    ) -> Vec<Pointer> {
-        let pinned = self.nodes.pin();
-        pinned.update(pointer.query_id, |node| {
-            node.update_dependency_version(previous, new)
-        });
-        self.invalidate(pointer, new, InvalidationReason::Invalidated)
     }
 }

@@ -40,9 +40,16 @@ pub struct Pointer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // Important! This does not have `reason` because it is unknown at some point, and it is not needed for equality check.
-pub struct Invalidator {
+pub struct PrecisePointer {
     pub pointer: Pointer,
     pub invalidation_version: InvalidationVersion,
+}
+
+impl PrecisePointer {
+    /// Returns true if this pointer can be uninvalidated by the other pointer.
+    pub fn can_be_uninvalidated(&self, other: &Self) -> bool {
+        self.pointer == other.pointer && self.invalidation_version.0 <= other.invalidation_version.0
+    }
 }
 
 impl Pointer {
@@ -68,7 +75,7 @@ pub struct Node {
     pub invalidation_version: InvalidationVersion,
     pub dependencies: Dependencies,
     pub dependents: Dependents,
-    pub invalidated_by: Vec<(Invalidator, InvalidatedReason)>,
+    pub invalidated_by: Vec<(PrecisePointer, InvalidatedReason)>,
 }
 
 impl Node {
@@ -79,8 +86,8 @@ impl Node {
         }
     }
 
-    pub fn invalidator(&self) -> Invalidator {
-        Invalidator {
+    pub fn presise_pointer(&self) -> PrecisePointer {
+        PrecisePointer {
             pointer: self.pointer(),
             invalidation_version: self.invalidation_version,
         }
@@ -90,10 +97,15 @@ impl Node {
         !self.invalidated_by.is_empty()
     }
 
-    pub fn remove_invalidator(&self, invalidator: Invalidator) -> Option<Self> {
-        if self.invalidated_by.iter().any(|(i, _)| i == &invalidator) {
+    pub fn remove_invalidator(&self, invalidator: PrecisePointer) -> Option<Self> {
+        if self
+            .invalidated_by
+            .iter()
+            .any(|(i, _)| i.can_be_uninvalidated(&invalidator))
+        {
             let mut node = self.clone();
-            node.invalidated_by.retain(|(i, _)| i != &invalidator);
+            node.invalidated_by
+                .retain(|(i, _)| !i.can_be_uninvalidated(&invalidator));
             Some(node)
         } else {
             None
@@ -182,7 +194,7 @@ impl Runtime {
                         .any(|p| p.should_be_invalidated_by(removed.pointer()));
                     let mut node = node.clone();
                     node.invalidated_by
-                        .push((removed.invalidator(), InvalidatedReason::Removed));
+                        .push((removed.presise_pointer(), InvalidatedReason::Removed));
                     Operation::Insert(node)
                 });
                 match result {
@@ -207,7 +219,48 @@ impl Runtime {
         }
     }
 
-    pub fn remove_invalidator(&self, pointer: Pointer, invalidator: Invalidator) {
+    pub fn uninvalidate(&self, precise_pointer: PrecisePointer) {
+        let pinned = self.nodes.pin();
+        enum AbortReason {
+            NotFound,
+            AlreadyUpdated,
+            MoreInvalidated,
+            AlreadyUninvalidated,
+        }
+        let result = pinned.compute(precise_pointer.pointer.query_id, |node| {
+            let Some((_, node)) = node else {
+                return Operation::Abort(AbortReason::NotFound);
+            };
+            if !node.is_invalidated() {
+                return Operation::Abort(AbortReason::AlreadyUninvalidated);
+            }
+            if node.version != precise_pointer.pointer.version {
+                return Operation::Abort(AbortReason::AlreadyUpdated);
+            }
+            if node.invalidation_version.0 > precise_pointer.invalidation_version.0 {
+                return Operation::Abort(AbortReason::MoreInvalidated);
+            }
+            let mut node = node.clone();
+            node.invalidated_by = vec![];
+            // This does not increase the invalidation version.
+            Operation::Insert(node)
+        });
+        match result {
+            Compute::Inserted(_, _) => unreachable!(),
+            Compute::Updated {
+                old: (_, old),
+                new: _,
+            } => {
+                for dependent in old.dependents.0.iter().cloned() {
+                    self.remove_invalidator(dependent, precise_pointer);
+                }
+            }
+            Compute::Removed(_, _) => unreachable!(),
+            Compute::Aborted(_) => {}
+        }
+    }
+
+    pub fn remove_invalidator(&self, pointer: Pointer, invalidator: PrecisePointer) {
         let pinned = self.nodes.pin();
         let result = pinned.compute(pointer.query_id, |node| {
             let Some((_, node)) = node else {
@@ -231,7 +284,7 @@ impl Runtime {
                 if !new.is_invalidated() {
                     // recursively uninvalidate dependents
                     for dependent in new.dependents.0.iter().cloned() {
-                        self.remove_invalidator(dependent, old.invalidator());
+                        self.remove_invalidator(dependent, old.presise_pointer());
                     }
                 }
             }
@@ -290,7 +343,7 @@ impl Runtime {
     pub fn invalidate(
         &self,
         node: Pointer,
-        reason: (Invalidator, InvalidatedReason),
+        reason: (PrecisePointer, InvalidatedReason),
     ) -> Vec<Pointer> {
         let mut invalidated = vec![];
         let pinned = self.nodes.pin();
@@ -321,7 +374,7 @@ impl Runtime {
                     for dependents in node.dependents.0.iter().cloned() {
                         invalidated.extend(self.invalidate(
                             dependents,
-                            (node.invalidator(), InvalidatedReason::Invalidated),
+                            (node.presise_pointer(), InvalidatedReason::Invalidated),
                         ));
                     }
                 }
@@ -387,8 +440,8 @@ impl Runtime {
         for dependency in dependencies.0.iter().cloned() {
             enum AbortReason {
                 NotFound,
-                AlreadyInvalidated(Invalidator),
-                AlreadyUpdated(Invalidator),
+                AlreadyInvalidated(PrecisePointer),
+                AlreadyUpdated(PrecisePointer),
             }
             let pinned = self.nodes.pin();
             let result = pinned.compute(dependency.query_id, |node| {
@@ -397,10 +450,12 @@ impl Runtime {
                 };
                 if node.version != dependency.version {
                     assert!(node.version.0 > dependency.version.0);
-                    return Operation::Abort(AbortReason::AlreadyUpdated(node.invalidator()));
+                    return Operation::Abort(AbortReason::AlreadyUpdated(node.presise_pointer()));
                 }
                 if node.is_invalidated() {
-                    return Operation::Abort(AbortReason::AlreadyInvalidated(node.invalidator()));
+                    return Operation::Abort(AbortReason::AlreadyInvalidated(
+                        node.presise_pointer(),
+                    ));
                 }
                 let mut node = node.clone();
                 node.dependents = node.dependents.updated(new_node.pointer());
@@ -459,7 +514,7 @@ impl Runtime {
         for dependent in old_node.dependents.0.iter().cloned() {
             invalidated.extend(self.invalidate(
                 dependent,
-                (old_node.invalidator(), InvalidatedReason::NewVersion),
+                (old_node.presise_pointer(), InvalidatedReason::NewVersion),
             ));
         }
 

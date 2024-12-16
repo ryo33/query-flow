@@ -146,7 +146,7 @@ impl Node {
     }
 
     /// Extend invalidations with a list of precise pointers.
-    pub fn extend_invalidations(&mut self, with: Vec<(RevisionPointer, InvalidatedReason)>) {
+    pub fn extend_invalidations(&mut self, with: Vec<(RevisionPointer, InvalidationReason)>) {
         let mut invalidations = Vec::clone(&self.invalidations.0);
         invalidations.extend(with);
         self.invalidations = Invalidations(Arc::new(invalidations));
@@ -168,7 +168,7 @@ impl Node {
             .iter_mut()
             .filter(|(i, _reason)| i == &previous)
         {
-            *invalidation = (new, InvalidatedReason::Invalidated);
+            *invalidation = (new, InvalidationReason::Invalidated);
         }
         Self {
             dependencies: Dependencies(Arc::new(dependencies)),
@@ -212,7 +212,7 @@ impl Dependents {
 
 /// Invalidations is a list of precise pointers that cause this query to be invalidated.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Invalidations(Arc<Vec<(RevisionPointer, InvalidatedReason)>>);
+pub struct Invalidations(Arc<Vec<(RevisionPointer, InvalidationReason)>>);
 
 impl Invalidations {
     /// Returns true if this query is not invalidated.
@@ -222,7 +222,7 @@ impl Invalidations {
 
     /// Push a precise pointer to the invalidations.
     #[must_use]
-    pub fn pushed(&self, pointer: RevisionPointer, reason: InvalidatedReason) -> Self {
+    pub fn pushed(&self, pointer: RevisionPointer, reason: InvalidationReason) -> Self {
         let mut invalidations = Vec::clone(&self.0);
         invalidations.push((pointer, reason));
         Invalidations(Arc::new(invalidations))
@@ -237,13 +237,13 @@ impl Invalidations {
     }
 
     /// Iterate over the invalidations.
-    pub fn iter(&self) -> impl Iterator<Item = (RevisionPointer, InvalidatedReason)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (RevisionPointer, InvalidationReason)> + '_ {
         self.0.iter().cloned()
     }
 }
 
-/// RegisterResult is a result of registering a new version.
-pub struct RegisterResult {
+/// QueryRegistrationResult is a result of registering a new version.
+pub struct QueryRegistrationResult {
     /// Node is the new node after registering a new version.
     pub node: Node,
     /// Previous version of the node.
@@ -252,8 +252,8 @@ pub struct RegisterResult {
     pub invalidated: Vec<Pointer>,
 }
 
-/// RemoveResult is a result of `Runtime::remove`.
-pub struct RemoveResult {
+/// QueryRemovalResult is a result of `Runtime::remove`.
+pub struct QueryRemovalResult {
     /// Removed is the node that is removed.
     pub removed: Option<Node>,
     /// Invalidated is a list of pointers to the queries that are invalidated by the removal.
@@ -262,7 +262,7 @@ pub struct RemoveResult {
 
 /// InvalidatedReason is a reason why a query is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum InvalidatedReason {
+pub enum InvalidationReason {
     /// Invalidated is a reason why a query is invalidated by another query is invalidated.
     Invalidated,
     /// NewVersion is a reason why a query is invalidated by a new version of another query.
@@ -286,7 +286,7 @@ impl Runtime {
 
     /// Remove a node from the runtime. If the node is returned and has dependents, you should update them.
     #[must_use]
-    pub fn remove(&self, query_id: QueryId) -> RemoveResult {
+    pub fn remove(&self, query_id: QueryId) -> QueryRemovalResult {
         let removed = self.nodes.pin().remove(&query_id).cloned();
         let mut invalidated = vec![];
         if let Some(removed) = &removed {
@@ -303,7 +303,7 @@ impl Runtime {
                     let mut node = node.clone();
                     node.invalidations = node
                         .invalidations
-                        .pushed(removed.revision_pointer(), InvalidatedReason::Removed);
+                        .pushed(removed.revision_pointer(), InvalidationReason::Removed);
                     Operation::Insert(node)
                 });
                 match result {
@@ -322,7 +322,7 @@ impl Runtime {
                 }
             }
         }
-        RemoveResult {
+        QueryRemovalResult {
             removed,
             invalidated: vec![],
         }
@@ -371,6 +371,8 @@ impl Runtime {
     }
 
     /// Remove an invalidator from a specific pointer.
+    ///
+    /// This function should never infinite loop while cyclic dependency, since if all possible invalidators are removed, the recursion will be aborted.
     pub fn remove_invalidator(&self, pointer: Pointer, invalidator: RevisionPointer) {
         let pinned = self.nodes.pin();
         let result = pinned.compute(pointer.query_id, |node| {
@@ -378,6 +380,9 @@ impl Runtime {
                 return Operation::Abort(());
             };
             if node.version != pointer.version {
+                return Operation::Abort(());
+            }
+            if !node.is_invalidated() {
                 return Operation::Abort(());
             }
             if let Some(node) = node.remove_invalidator(invalidator) {
@@ -457,7 +462,7 @@ impl Runtime {
         &self,
         node: Pointer,
         precise_pointer: RevisionPointer,
-        reason: InvalidatedReason,
+        reason: InvalidationReason,
     ) -> Vec<Pointer> {
         let mut invalidated = vec![];
         let pinned = self.nodes.pin();
@@ -487,7 +492,7 @@ impl Runtime {
                         invalidated.extend(self.invalidate(
                             dependents,
                             node.revision_pointer(),
-                            InvalidatedReason::Invalidated,
+                            InvalidationReason::Invalidated,
                         ));
                     }
                 }
@@ -506,7 +511,7 @@ impl Runtime {
         &self,
         query_id: QueryId,
         dependencies: Vec<Pointer>,
-    ) -> RegisterResult {
+    ) -> QueryRegistrationResult {
         let dependencies = Dependencies(Arc::new(dependencies));
         let (new_node, old_node) = self.register_new_version_inner(query_id, dependencies.clone());
 
@@ -527,12 +532,12 @@ impl Runtime {
                 newly_invalidated.extend(self.invalidate(
                     dependent,
                     old_node.revision_pointer(),
-                    InvalidatedReason::NewVersion,
+                    InvalidationReason::NewVersion,
                 ));
             }
         }
 
-        RegisterResult {
+        QueryRegistrationResult {
             node: new_node,
             old_node,
             invalidated: newly_invalidated,
@@ -544,7 +549,7 @@ impl Runtime {
         &self,
         query_id: QueryId,
         dependencies: Vec<Pointer>,
-    ) -> RegisterResult {
+    ) -> QueryRegistrationResult {
         let dependencies = Dependencies(Arc::new(dependencies));
         let (new_node, old_node) = self.register_new_version_inner(query_id, dependencies.clone());
 
@@ -576,7 +581,7 @@ impl Runtime {
                 }
             }
         }
-        RegisterResult {
+        QueryRegistrationResult {
             node: new_node,
             old_node,
             invalidated,
@@ -631,7 +636,7 @@ impl Runtime {
         &self,
         pointer: Pointer,
         dependencies: Dependencies,
-    ) -> Vec<(RevisionPointer, InvalidatedReason)> {
+    ) -> Vec<(RevisionPointer, InvalidationReason)> {
         let mut invalidations = vec![];
         for dependency in dependencies.0.iter().cloned() {
             enum AbortReason {
@@ -663,10 +668,10 @@ impl Runtime {
                 Compute::Removed(_, _) => {}
                 Compute::Aborted(AbortReason::NotFound) => {}
                 Compute::Aborted(AbortReason::AlreadyInvalidated(invalidator)) => {
-                    invalidations.push((invalidator, InvalidatedReason::Invalidated));
+                    invalidations.push((invalidator, InvalidationReason::Invalidated));
                 }
                 Compute::Aborted(AbortReason::AlreadyUpdated(invalidator)) => {
-                    invalidations.push((invalidator, InvalidatedReason::NewVersion));
+                    invalidations.push((invalidator, InvalidationReason::NewVersion));
                 }
             }
         }
@@ -678,7 +683,7 @@ impl Runtime {
     fn extend_invalidations(
         &self,
         pointer: Pointer,
-        invalidations: Vec<(RevisionPointer, InvalidatedReason)>,
+        invalidations: Vec<(RevisionPointer, InvalidationReason)>,
     ) -> Option<Node> {
         if !invalidations.is_empty() {
             let pinned = self.nodes.pin();
@@ -730,6 +735,6 @@ impl Runtime {
         pinned.update(pointer.query_id, |node| {
             node.update_dependency_version(previous, new)
         });
-        self.invalidate(pointer, new, InvalidatedReason::Invalidated)
+        self.invalidate(pointer, new, InvalidationReason::Invalidated)
     }
 }

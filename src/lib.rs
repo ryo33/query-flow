@@ -1,3 +1,6 @@
+#![deny(missing_docs)]
+#![doc = include_str!("../README.md")]
+
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -5,11 +8,14 @@ use std::sync::{
 
 use papaya::{Compute, HashMap, Operation};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Runtime is a data structure that manages the all state of the dependency tracking system.
+///
+/// This is cheap to clone, so you can pass it around by just cloning it.
 pub struct Runtime {
-    nodes: HashMap<QueryId, Node, ahash::RandomState>,
-    next_version: AtomicU64,
+    nodes: Arc<HashMap<QueryId, Node, ahash::RandomState>>,
+    next_version: Arc<AtomicU64>,
 }
 
 #[test]
@@ -22,26 +28,38 @@ fn test_send_sync() {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-
+/// QueryId is a unique identifier for a query.
 pub struct QueryId(pub u64);
 
-/// Version is a monotonically increasing number. This does not implement `PartialOrd` and `Ord` because it is not comparable across different queries.
+/// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
+///
+/// This does not implement `PartialOrd` and `Ord` because it is not comparable across different queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Version(pub u64);
 
+/// Pointer is a pair of `QueryId` and `Version`.
+///
+/// This is used to identify a specific version of a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Pointer {
+    /// QueryId is a unique identifier for a query.
     pub query_id: QueryId,
+    /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
     pub version: Version,
 }
 
+/// A precise pointer is a pair of `Pointer` and `InvalidationVersion`.
+///
+/// This is used to identify a specific precise version of a query that is incremented when it is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // Important! This does not have `reason` because it is unknown at some point, and it is not needed for equality check.
 pub struct PrecisePointer {
+    /// Pointer is a pair of `QueryId` and `Version`.
     pub pointer: Pointer,
+    /// InvalidationVersion is a query-local monotonically increasing number.
     pub invalidation_version: InvalidationVersion,
 }
 
@@ -63,22 +81,33 @@ impl Pointer {
     }
 }
 
+/// InvalidationVersion is a query-local monotonically increasing number.
+///
+/// This is used to identify a specific precise version of a query that is incremented when it is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InvalidationVersion(pub u64);
 
+/// Node is a data structure that represents a state of a query, and it is managed by the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Node {
+    /// QueryId is a unique identifier for a query.
     pub id: QueryId,
+    /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
     pub version: Version,
+    /// InvalidationVersion is a query-local monotonically increasing number.
     pub invalidation_version: InvalidationVersion,
+    /// Dependencies is a list of pointers to the queries that this query depends on.
     pub dependencies: Dependencies,
+    /// Dependents is a list of pointers to the queries that depend on this query.
     pub dependents: Dependents,
-    pub invalidated_by: Vec<(PrecisePointer, InvalidatedReason)>,
+    /// Invalidations is a list of precise pointers that invalidate this query.
+    pub invalidations: Invalidations,
 }
 
 impl Node {
+    /// Get a pointer to this query.
     pub fn pointer(&self) -> Pointer {
         Pointer {
             query_id: self.id,
@@ -86,6 +115,7 @@ impl Node {
         }
     }
 
+    /// Get a precise pointer to this query.
     pub fn presise_pointer(&self) -> PrecisePointer {
         PrecisePointer {
             pointer: self.pointer(),
@@ -93,37 +123,49 @@ impl Node {
         }
     }
 
+    /// Returns true if this query is invalidated.
     pub fn is_invalidated(&self) -> bool {
-        !self.invalidated_by.is_empty()
+        !self.invalidations.is_empty()
     }
 
+    /// Remove an invalidator from this query.
+    #[must_use]
     pub fn remove_invalidator(&self, invalidator: PrecisePointer) -> Option<Self> {
         if self
-            .invalidated_by
+            .invalidations
             .iter()
             .any(|(i, _)| i.can_be_uninvalidated(&invalidator))
         {
             let mut node = self.clone();
-            node.invalidated_by
-                .retain(|(i, _)| !i.can_be_uninvalidated(&invalidator));
+            node.invalidations = node.invalidations.remove_uninvalidated(invalidator);
             Some(node)
         } else {
             None
         }
     }
+
+    /// Extend invalidations with a list of precise pointers.
+    pub fn extend_invalidations(&mut self, with: Vec<(PrecisePointer, InvalidatedReason)>) {
+        let mut invalidations = Vec::clone(&self.invalidations.0);
+        invalidations.extend(with);
+        self.invalidations = Invalidations(Arc::new(invalidations));
+    }
 }
 
+/// Dependencies is a list of pointers to the queries that this query depends on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Dependencies(pub Arc<Vec<Pointer>>);
+pub struct Dependencies(Arc<Vec<Pointer>>);
 
 impl Dependencies {
+    /// Returns true if this query should be invalidated if the other query is updated.
     pub fn should_be_invalidated_by(&self, update: Pointer) -> bool {
         self.0.iter().any(|p| p.should_be_invalidated_by(update))
     }
 }
 
+/// Dependents is a list of pointers to the queries that depend on this query.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Dependents(pub Arc<Vec<Pointer>>);
+pub struct Dependents(Arc<Vec<Pointer>>);
 
 impl Dependents {
     #[must_use]
@@ -141,30 +183,69 @@ impl Dependents {
     }
 }
 
-pub struct Dependency {
-    pub query_id: QueryId,
-    pub version: Version,
+/// Invalidations is a list of precise pointers that cause this query to be invalidated.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Invalidations(Arc<Vec<(PrecisePointer, InvalidatedReason)>>);
+
+impl Invalidations {
+    /// Returns true if this query is not invalidated.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Push a precise pointer to the invalidations.
+    #[must_use]
+    pub fn pushed(&self, pointer: PrecisePointer, reason: InvalidatedReason) -> Self {
+        let mut invalidations = Vec::clone(&self.0);
+        invalidations.push((pointer, reason));
+        Invalidations(Arc::new(invalidations))
+    }
+
+    /// Remove an invalidator from the invalidations.
+    #[must_use]
+    pub fn remove_uninvalidated(&self, pointer: PrecisePointer) -> Self {
+        let mut invalidations = Vec::clone(&self.0);
+        invalidations.retain(|(i, _)| !i.can_be_uninvalidated(&pointer));
+        Invalidations(Arc::new(invalidations))
+    }
+
+    /// Iterate over the invalidations.
+    pub fn iter(&self) -> impl Iterator<Item = (PrecisePointer, InvalidatedReason)> + '_ {
+        self.0.iter().cloned()
+    }
 }
 
+/// RegisterNewVersionResult is a result of `Runtime::register_new_version`.
 pub struct RegisterNewVersionResult {
+    /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
     pub version: Version,
+    /// Node is the new node after registering a new version.
     pub node: Node,
+    /// Invalidated is a list of pointers to the queries that are invalidated by the new version.
     pub invalidated: Vec<Pointer>,
 }
 
+/// RemoveResult is a result of `Runtime::remove`.
 pub struct RemoveResult {
+    /// Removed is the node that is removed.
     pub removed: Option<Node>,
+    /// Invalidated is a list of pointers to the queries that are invalidated by the removal.
     pub invalidated: Vec<Pointer>,
 }
 
+/// InvalidatedReason is a reason why a query is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InvalidatedReason {
+    /// Invalidated is a reason why a query is invalidated by another query is invalidated.
     Invalidated,
+    /// NewVersion is a reason why a query is invalidated by a new version of another query.
     NewVersion,
+    /// Removed is a reason why a query is invalidated by the removal of another query.
     Removed,
 }
 
 impl Runtime {
+    /// Create a new runtime.
     pub fn new() -> Self {
         Default::default()
     }
@@ -193,8 +274,9 @@ impl Runtime {
                         .iter()
                         .any(|p| p.should_be_invalidated_by(removed.pointer()));
                     let mut node = node.clone();
-                    node.invalidated_by
-                        .push((removed.presise_pointer(), InvalidatedReason::Removed));
+                    node.invalidations = node
+                        .invalidations
+                        .pushed(removed.presise_pointer(), InvalidatedReason::Removed);
                     Operation::Insert(node)
                 });
                 match result {
@@ -219,6 +301,7 @@ impl Runtime {
         }
     }
 
+    /// Uninvalidate a specific precise pointer.
     pub fn uninvalidate(&self, precise_pointer: PrecisePointer) {
         let pinned = self.nodes.pin();
         enum AbortReason {
@@ -241,7 +324,7 @@ impl Runtime {
                 return Operation::Abort(AbortReason::MoreInvalidated);
             }
             let mut node = node.clone();
-            node.invalidated_by = vec![];
+            node.invalidations = Default::default();
             // This does not increase the invalidation version.
             Operation::Insert(node)
         });
@@ -260,6 +343,7 @@ impl Runtime {
         }
     }
 
+    /// Remove an invalidator from a specific pointer.
     pub fn remove_invalidator(&self, pointer: Pointer, invalidator: PrecisePointer) {
         let pinned = self.nodes.pin();
         let result = pinned.compute(pointer.query_id, |node| {
@@ -293,11 +377,13 @@ impl Runtime {
         }
     }
 
+    /// Detect a cycle in the dependency graph.
     pub fn detect_cycle(&self, query_id: QueryId) -> bool {
         let mut set = ahash::HashSet::default();
         self.detect_cycle_with_set(query_id, &mut set)
     }
 
+    /// Detect a cycle in the dependency graph with a set.
     pub fn detect_cycle_with_set(
         &self,
         query_id: QueryId,
@@ -336,14 +422,15 @@ impl Runtime {
         }
     }
 
-    /// Recursively invalidate a specific version of a query, and returns the pointers of the invalidated nodes including the query itself.
+    /// Recursively invalidate a specific version of a query, and returns the pointers of the invalidated nodes.
     ///
     /// This should not hang though called with a cyclic dependency, since if all nodes in the cycle are invalidated, the recursion will be aborted.
     #[must_use]
     pub fn invalidate(
         &self,
         node: Pointer,
-        reason: (PrecisePointer, InvalidatedReason),
+        precise_pointer: PrecisePointer,
+        reason: InvalidatedReason,
     ) -> Vec<Pointer> {
         let mut invalidated = vec![];
         let pinned = self.nodes.pin();
@@ -353,9 +440,7 @@ impl Runtime {
             };
             if node.pointer().should_be_invalidated_by(node.pointer()) {
                 let mut node = node.clone();
-                node.invalidated_by.push(reason);
-                // The node is invalidated.
-                invalidated.push(node.pointer());
+                node.invalidations = node.invalidations.pushed(precise_pointer, reason);
                 node.invalidation_version.0 += 1;
                 Operation::Insert(node)
             } else {
@@ -374,7 +459,8 @@ impl Runtime {
                     for dependents in node.dependents.0.iter().cloned() {
                         invalidated.extend(self.invalidate(
                             dependents,
-                            (node.presise_pointer(), InvalidatedReason::Invalidated),
+                            node.presise_pointer(),
+                            InvalidatedReason::Invalidated,
                         ));
                     }
                 }
@@ -416,7 +502,7 @@ impl Runtime {
                 dependencies: dependencies.clone(),
                 dependents: preknown_dependents.clone(),
                 invalidation_version: Default::default(),
-                invalidated_by: Default::default(),
+                invalidations: Default::default(),
             })
         });
 
@@ -436,7 +522,7 @@ impl Runtime {
 
         // Register dependents
         // While registering dependents, other threads may be update or invalidate those dependencies, so we need to collect all invalidated dependencies.
-        let mut invalidated_by = vec![];
+        let mut invalidations = vec![];
         for dependency in dependencies.0.iter().cloned() {
             enum AbortReason {
                 NotFound,
@@ -467,15 +553,15 @@ impl Runtime {
                 Compute::Removed(_, _) => {}
                 Compute::Aborted(AbortReason::NotFound) => {}
                 Compute::Aborted(AbortReason::AlreadyInvalidated(invalidator)) => {
-                    invalidated_by.push((invalidator, InvalidatedReason::Invalidated));
+                    invalidations.push((invalidator, InvalidatedReason::Invalidated));
                 }
                 Compute::Aborted(AbortReason::AlreadyUpdated(invalidator)) => {
-                    invalidated_by.push((invalidator, InvalidatedReason::NewVersion));
+                    invalidations.push((invalidator, InvalidatedReason::NewVersion));
                 }
             }
         }
 
-        if !invalidated_by.is_empty() {
+        if !invalidations.is_empty() {
             let pinned = self.nodes.pin();
             let result = pinned.compute(query_id, |node| {
                 let Some((_, node)) = node else {
@@ -485,7 +571,7 @@ impl Runtime {
                     return Operation::Abort(());
                 }
                 let mut node = node.clone();
-                node.invalidated_by.extend(invalidated_by.clone());
+                node.extend_invalidations(invalidations.clone());
                 Operation::Insert(node)
             });
             match result {
@@ -514,7 +600,8 @@ impl Runtime {
         for dependent in old_node.dependents.0.iter().cloned() {
             invalidated.extend(self.invalidate(
                 dependent,
-                (old_node.presise_pointer(), InvalidatedReason::NewVersion),
+                old_node.presise_pointer(),
+                InvalidatedReason::NewVersion,
             ));
         }
 

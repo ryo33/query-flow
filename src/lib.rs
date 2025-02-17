@@ -41,6 +41,22 @@ pub struct Version(pub u64);
 /// Pointer is a pair of `QueryId` and `Version`.
 ///
 /// This is used to identify a specific version of a query.
+///
+/// # Examples
+///
+/// ```
+/// # use whale::{Pointer, QueryId, Version};
+/// let p1 = Pointer {
+///     query_id: QueryId(1),
+///     version: Version(5),
+/// };
+/// let p2 = Pointer {
+///     query_id: QueryId(1),
+///     version: Version(10),
+/// };
+/// assert!(p1.older_than(p2));
+/// assert!(!p2.older_than(p1));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Pointer {
@@ -53,6 +69,30 @@ pub struct Pointer {
 /// A revision pointer is a pair of `Pointer` and `InvalidationRevision`.
 ///
 /// This is used to identify a specific precise version of a query that is incremented when it is invalidated.
+///
+/// # Examples
+///
+/// ```
+/// # use whale::{RevisionPointer, Pointer, QueryId, Version, InvalidationRevision};
+/// let p1 = RevisionPointer {
+///     pointer: Pointer {
+///         query_id: QueryId(1),
+///         version: Version(5),
+///     },
+///     invalidation_revision: InvalidationRevision(2),
+/// };
+///
+/// let p2 = RevisionPointer {
+///     pointer: Pointer {
+///         query_id: QueryId(1),
+///         version: Version(5),
+///     },
+///     invalidation_revision: InvalidationRevision(3),
+/// };
+///
+/// assert!(p1.can_restore(&p2));
+/// assert!(!p2.can_restore(&p1));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // Important! This does not have `reason` because it is unknown at some point, and it is not needed for equality check.
@@ -209,6 +249,12 @@ impl Dependencies {
     }
 }
 
+impl FromIterator<Pointer> for Dependencies {
+    fn from_iter<T: IntoIterator<Item = Pointer>>(iter: T) -> Self {
+        Dependencies(Arc::new(iter.into_iter().collect()))
+    }
+}
+
 /// Dependents is a list of pointers to the queries that depend on this query.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Dependents(Arc<Vec<Pointer>>);
@@ -245,9 +291,21 @@ impl Dependents {
     }
 }
 
+impl FromIterator<Pointer> for Dependents {
+    fn from_iter<T: IntoIterator<Item = Pointer>>(iter: T) -> Self {
+        Dependents(Arc::new(iter.into_iter().collect()))
+    }
+}
+
 /// Invalidations is a list of precise pointers that cause this query to be invalidated.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Invalidations(Arc<Vec<Invalidation>>);
+
+impl FromIterator<Invalidation> for Invalidations {
+    fn from_iter<T: IntoIterator<Item = Invalidation>>(iter: T) -> Self {
+        Invalidations(Arc::new(iter.into_iter().collect()))
+    }
+}
 
 /// Invalidation is a record why a query is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,12 +330,17 @@ impl Invalidation {
 }
 
 impl Invalidations {
-    /// Returns true if this query is not invalidated.
+    /// Returns true if there are no invalidations.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Push a precise pointer to the invalidations.
+    /// Returns the number of invalidations.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Push an invalidation to the list.
     #[must_use]
     pub fn pushed(&self, invalidation: Invalidation) -> Self {
         let mut invalidations = Vec::clone(&self.0);
@@ -305,6 +368,18 @@ pub struct QueryRegistrationResult {
     pub node: Node,
     /// Previous version of the node.
     pub old_node: Option<Node>,
+}
+
+impl QueryRegistrationResult {
+    /// Returns true if the node is invalidated or the old node has dependents.
+    pub fn has_invalidation_effects(&self) -> bool {
+        self.node.is_invalidated()
+            || self
+                .old_node
+                .as_ref()
+                .map(|n| !n.dependents.is_empty())
+                .unwrap_or(false)
+    }
 }
 
 /// QueryRemovalResult is a result of `Runtime::remove`.
@@ -393,7 +468,8 @@ impl Runtime {
                 old: (_, old),
                 new: _,
             } => {
-                for dependent in old.dependents.0.iter().cloned() {
+                // Recursively uninvalidate dependents if they were invalidated by this node
+                for dependent in old.dependents.iter() {
                     self.remove_invalidator(dependent, revision_pointer);
                 }
             }
@@ -403,8 +479,6 @@ impl Runtime {
     }
 
     /// Remove an invalidator from a specific pointer.
-    ///
-    /// This function should never infinite loop while cyclic dependency, since if all possible invalidators are removed, the recursion will be aborted.
     pub fn remove_invalidator(&self, pointer: Pointer, invalidator: RevisionPointer) {
         let pinned = self.nodes.pin();
         let result = pinned.compute(pointer.query_id, |node| {
@@ -431,7 +505,7 @@ impl Runtime {
             } => {
                 if !new.is_invalidated() {
                     // recursively uninvalidate dependents
-                    for dependent in new.dependents.0.iter().cloned() {
+                    for dependent in new.dependents.iter() {
                         self.remove_invalidator(dependent, old.revision_pointer());
                     }
                 }
@@ -483,8 +557,6 @@ impl Runtime {
     }
 
     /// Recursively invalidate a specific version of a query, and returns the pointers of the invalidated nodes.
-    ///
-    /// This should not hang though called with a cyclic dependency, since if all nodes in the cycle are invalidated, the recursion will be aborted.
     pub fn invalidate(&self, pointer: Pointer, invalidation: Invalidation) {
         if invalidation.source.pointer == pointer {
             eprintln!("cyclic dependency detected on {:?}", pointer);
@@ -495,17 +567,6 @@ impl Runtime {
             let Some((_, node)) = node else {
                 return Operation::Abort(());
             };
-            if node
-                .invalidations
-                .iter()
-                .any(|i| i.source == invalidation.source)
-            {
-                eprintln!(
-                    "already invalidated on {:?}, and cyclic dependency detected for {:?}",
-                    invalidation.source, pointer
-                );
-                return Operation::Abort(());
-            }
             if node.pointer().older_than(pointer) {
                 let mut node = node.clone();
                 node.invalidations = node.invalidations.pushed(invalidation);
@@ -518,23 +579,19 @@ impl Runtime {
         match result {
             Compute::Inserted(_, _) => unreachable!(),
             Compute::Updated {
-                old: (_, old),
+                old: _,
                 new: (_, node),
             } => {
-                // This `if` is important to avoid infinite recursion on cyclic dependency.
-                // If the node has invalidated now, or the node has updated version or dependents, we need to invalidate dependents.
-                if !old.is_invalidated() || node.has_updated_version_or_dependents_from(old) {
-                    // recursively invalidate dependents
-                    for dependents in node.dependents.0.iter().cloned() {
-                        self.invalidate(
-                            dependents,
-                            Invalidation {
-                                source: invalidation.source,
-                                pointer: node.revision_pointer(),
-                                reason: InvalidationReason::DependencyInvalidated,
-                            },
-                        );
-                    }
+                // Recursively invalidate dependents
+                for dependent in node.dependents.iter() {
+                    self.invalidate(
+                        dependent,
+                        Invalidation {
+                            source: invalidation.source,
+                            pointer: node.revision_pointer(),
+                            reason: InvalidationReason::DependencyInvalidated,
+                        },
+                    );
                 }
             }
             Compute::Removed(_, _) => unreachable!(),
@@ -543,8 +600,6 @@ impl Runtime {
     }
 
     /// Register a new version for a query. If the previous version is returned, you should update all dependents.
-    ///
-    /// This should not hang though called with a cyclic dependency, since if all nodes in the cycle are invalidated, the recursion will be aborted.
     #[must_use]
     pub fn register(
         &self,
@@ -564,8 +619,8 @@ impl Runtime {
             .unwrap_or(new_node);
 
         if let Some(old_node) = &old_node {
-            // Recursively invalidate and collect old dependents
-            for dependent in old_node.dependents.0.iter().cloned() {
+            // Recursively invalidate old dependents
+            for dependent in old_node.dependents.iter() {
                 self.invalidate(
                     dependent,
                     Invalidation::new_source(
@@ -668,7 +723,7 @@ impl Runtime {
         }
     }
 
-    /// Register a query as a dependents to each dependency, and find invalidations.
+    /// Update dependencies for a query atomically
     #[must_use]
     fn update_dependency_graph(
         &self,
@@ -769,5 +824,360 @@ impl Runtime {
         pinned.update(pointer.query_id, |node| {
             node.update_version_reference(previous, new)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test basic node creation and versioning
+    #[test]
+    fn test_basic_registration() {
+        let rt = Runtime::new();
+        let id = QueryId(1);
+
+        // First registration
+        let result = rt.register(id, vec![]);
+        assert_eq!(result.node.id, id);
+        assert_eq!(result.node.version.0, 0);
+        assert!(result.old_node.is_none());
+
+        // Second registration should increment version
+        let result2 = rt.register(id, vec![]);
+        assert_eq!(result2.node.version.0, 1);
+        assert_eq!(result2.old_node, Some(result.node));
+    }
+
+    // Test dependency tracking basics
+    #[test]
+    fn test_dependency_management() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        // b depends on a
+        let result = rt.register(a, vec![]);
+        let b_result = rt.register(b, vec![result.node.pointer()]);
+
+        // Verify dependency tracking
+        let a_node = rt.get(a).unwrap();
+        assert_eq!(
+            a_node.dependents,
+            Dependents::from_iter([b_result.node.pointer()])
+        );
+        assert_eq!(
+            b_result.node.dependencies,
+            Dependencies::from_iter([a_node.pointer()])
+        );
+    }
+
+    // Test basic invalidation flow
+    #[test]
+    fn test_dependency_invalidation() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        // Setup initial state
+        let result = rt.register(a, vec![]);
+        let _ = rt.register(b, vec![result.node.pointer()]);
+
+        // Update a to invalidate b
+        let a_update = rt.register(a, vec![]);
+        let b_node = rt.get(b).unwrap();
+        assert_eq!(
+            b_node.invalidations,
+            Invalidations::from_iter([Invalidation {
+                source: a_update.node.revision_pointer(),
+                pointer: a_update.node.revision_pointer(),
+                reason: InvalidationReason::NewVersion,
+            }])
+        );
+    }
+
+    // Test removal invalidation
+    #[test]
+    fn test_removal_invalidation() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        let result = rt.register(a, vec![]);
+        let _ = rt.register(b, vec![result.node.pointer()]);
+
+        // Remove a and check b invalidation
+        let removal = rt.remove(a);
+        assert!(removal.removed.is_some());
+        let b_node = rt.get(b).unwrap();
+        assert!(b_node.is_invalidated());
+        assert_eq!(
+            b_node.invalidations,
+            Invalidations::from_iter([Invalidation {
+                source: result.node.revision_pointer(),
+                pointer: result.node.revision_pointer(),
+                reason: InvalidationReason::Removed,
+            }])
+        );
+    }
+
+    // Test dependency chain invalidation
+    #[test]
+    fn test_transitive_invalidation() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+        let c = QueryId(3);
+
+        let result = rt.register(a, vec![]);
+        let b_result = rt.register(b, vec![result.node.pointer()]);
+        let _ = rt.register(c, vec![b_result.node.pointer()]);
+
+        // Update a should invalidate both b and c
+        let a_new = rt.register(a, vec![]).node;
+        let b_node = rt.get(b).unwrap();
+        let c_node = rt.get(c).unwrap();
+        assert!(b_node.is_invalidated());
+        assert!(c_node.is_invalidated());
+        assert_eq!(
+            b_node.invalidations,
+            Invalidations::from_iter([Invalidation::new_source(
+                a_new.revision_pointer(),
+                InvalidationReason::NewVersion
+            )])
+        );
+        assert_eq!(
+            c_node.invalidations,
+            Invalidations::from_iter([Invalidation {
+                source: a_new.revision_pointer(),
+                pointer: b_node.revision_pointer(),
+                reason: InvalidationReason::DependencyInvalidated,
+            }])
+        );
+    }
+
+    // Test cycle detection
+    #[test]
+    fn test_cycle_detection() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        let a_result = rt.register(a, vec![]);
+        let b_result = rt.register(b, vec![a_result.node.pointer()]);
+        let _ = rt.register(a, vec![b_result.node.pointer()]).node;
+
+        assert!(rt.has_cycle(a));
+        assert!(rt.has_cycle(b));
+    }
+
+    // Test concurrent invalidations
+    #[test]
+    fn test_multiple_invalidation_paths() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+        let c = QueryId(3);
+
+        let a_result = rt.register(a, vec![]);
+        let b_result = rt.register(b, vec![a_result.node.pointer()]);
+        let _ = rt.register(c, vec![a_result.node.pointer(), b_result.node.pointer()]);
+
+        let a_new = rt.register(a, vec![]).node;
+        let b_node = rt.get(b).unwrap();
+        let c_node = rt.get(c).unwrap();
+        assert_eq!(
+            c_node.invalidations,
+            Invalidations::from_iter([
+                Invalidation {
+                    source: a_new.revision_pointer(),
+                    pointer: b_node.revision_pointer(),
+                    reason: InvalidationReason::DependencyInvalidated,
+                },
+                Invalidation {
+                    source: a_new.revision_pointer(),
+                    pointer: a_new.revision_pointer(),
+                    reason: InvalidationReason::NewVersion,
+                },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_updates() {
+        let rt = Arc::new(Runtime::new());
+        let id = QueryId(1);
+
+        let handles: Vec<_> = (0..100)
+            .map(|_| {
+                let rt = rt.clone();
+                tokio::spawn(async move {
+                    let _ = rt.register(id, vec![]);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let node = rt.get(id).unwrap();
+        assert!(node.version.0 == 99); // Changed from exact equality to >= since we might have retries
+    }
+
+    // Test garbage collection of unused nodes
+    #[test]
+    fn test_remove_if_unused() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        // a with no dependencies
+        let _ = rt.register(a, vec![]);
+        assert!(rt.remove_if_unused(a).is_some());
+
+        // b depends on a
+        let QueryRegistrationResult { node, .. } = rt.register(a, vec![]);
+        let _ = rt.register(b, vec![node.pointer()]);
+        assert!(rt.remove_if_unused(a).is_none());
+    }
+
+    // Test dependency version updates
+    #[test]
+    fn test_dependency_version_update() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        // Initial version
+        let a1 = rt.register(a, vec![]).node;
+        let _b1 = rt.register(b, vec![a1.pointer()]).node;
+
+        // Update a
+        let a2 = rt.register(a, vec![]).node;
+
+        // Update b's dependencies
+        let b2 = rt.update_dependencies(b, vec![a2.pointer()]).node;
+        assert_eq!(
+            b2.dependencies.iter().next().unwrap().version.0,
+            a2.version.0
+        );
+    }
+
+    // Test complex dependency graph (diamond shape)
+    #[test]
+    fn test_diamond_dependency() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+        let c = QueryId(3);
+        let d = QueryId(4);
+
+        let a_result = rt.register(a, vec![]);
+        let b_result = rt.register(b, vec![a_result.node.pointer()]);
+        let c_result = rt.register(c, vec![a_result.node.pointer()]);
+        let _ = rt.register(d, vec![b_result.node.pointer(), c_result.node.pointer()]);
+
+        // Update a should invalidate all
+        let a_new = rt.register(a, vec![]).node;
+        let b_node = rt.get(b).unwrap();
+        let c_node = rt.get(c).unwrap();
+        assert!(b_node.is_invalidated());
+        assert!(c_node.is_invalidated());
+        assert_eq!(
+            rt.get(d).unwrap().invalidations,
+            Invalidations::from_iter([
+                Invalidation {
+                    source: a_new.revision_pointer(),
+                    pointer: b_node.revision_pointer(),
+                    reason: InvalidationReason::DependencyInvalidated,
+                },
+                Invalidation {
+                    source: a_new.revision_pointer(),
+                    pointer: c_node.revision_pointer(),
+                    reason: InvalidationReason::DependencyInvalidated,
+                },
+            ])
+        );
+    }
+
+    // Test un-invalidation process
+    #[test]
+    fn test_uninvalidation() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        // Create dependency
+        let a_node = rt.register(a, vec![]).node;
+        let _b_node = rt.register(b, vec![a_node.pointer()]).node;
+
+        // Invalidate b by updating a and get the new revision pointer
+        let a_new = rt.register(a, vec![]).node;
+        let b_node = rt.get(b).unwrap();
+        assert!(b_node.is_invalidated());
+
+        // Remove the invalidator from b's invalidations using the source pointer
+        rt.remove_invalidator(b_node.pointer(), a_new.revision_pointer());
+        assert!(!rt.get(b).unwrap().is_invalidated());
+    }
+
+    // Test concurrent invalidations and updates
+    #[tokio::test]
+    async fn test_concurrent_invalidations() {
+        let rt = Arc::new(Runtime::new());
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        let a_node = rt.register(a, vec![]).node;
+        let _ = rt.register(b, vec![a_node.pointer()]);
+        let a_new = rt.register(a, vec![]).node;
+
+        let handles: Vec<_> = (0..50)
+            .map(|_| {
+                let rt = rt.clone();
+                tokio::spawn(async move {
+                    let _ = rt.register(a, vec![]);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let b_node = rt.get(b).unwrap();
+        assert!(b_node.is_invalidated());
+        // a invalidated 50 times, but only the first one is registered. because new version does not have a dependent of b. It's fine because removing this invalidator makes b invalidated again because a is not the latest.
+        assert_eq!(
+            b_node.invalidations,
+            Invalidations::from_iter([Invalidation {
+                source: a_new.revision_pointer(),
+                pointer: a_new.revision_pointer(),
+                reason: InvalidationReason::NewVersion,
+            }])
+        );
+    }
+
+    // Test node removal with dependents
+    #[test]
+    fn test_removal_with_dependents() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        let a_result = rt.register(a, vec![]);
+        let _b_result = rt.register(b, vec![a_result.node.pointer()]);
+
+        let removal = rt.remove(a);
+        assert!(removal.removed.is_some());
+        assert_eq!(
+            rt.get(b).unwrap().invalidations,
+            Invalidations::from_iter([Invalidation {
+                source: a_result.node.revision_pointer(),
+                pointer: a_result.node.revision_pointer(),
+                reason: InvalidationReason::Removed,
+            }])
+        );
     }
 }

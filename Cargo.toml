@@ -17,3 +17,6 @@ serde = ["dep:serde", "papaya/serde"]
 ahash = "0.8"
 papaya = { version = "0.1.6" }
 serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

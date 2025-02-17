@@ -971,6 +971,53 @@ mod tests {
         assert!(rt.has_cycle(b));
     }
 
+    // loop invalidation in b, c, and d, but a triggers the invalidation.
+    #[test]
+    fn test_cyclic_invalidation_from_outer_source() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+        let c = QueryId(3);
+        let d = QueryId(4);
+
+        let a_result = rt.register(a, vec![]);
+        let b_result = rt.register(b, vec![a_result.node.pointer()]);
+        let c_result = rt.register(c, vec![b_result.node.pointer()]);
+        let d_result = rt.register(d, vec![c_result.node.pointer()]);
+        let b_result = rt.register(b, vec![a_result.node.pointer(), d_result.node.pointer()]);
+
+        let a_new = rt.register(a, vec![]).node;
+
+        let b_node = rt.get(b).unwrap();
+        let c_node = rt.get(c).unwrap();
+        let d_node = rt.get(d).unwrap();
+        assert!(b_node.is_invalidated());
+        assert!(c_node.is_invalidated());
+        assert!(d_node.is_invalidated());
+        assert_eq!(
+            b_node.invalidations,
+            Invalidations::from_iter([Invalidation::new_source(
+                a_new.revision_pointer(),
+                InvalidationReason::NewVersion,
+            )])
+        );
+        assert_eq!(
+            c_node.invalidations,
+            Invalidations::from_iter([Invalidation::new_source(
+                b_result.node.revision_pointer(),
+                InvalidationReason::NewVersion,
+            )])
+        );
+        assert_eq!(
+            d_node.invalidations,
+            Invalidations::from_iter([Invalidation {
+                source: b_result.node.revision_pointer(),
+                pointer: c_node.revision_pointer(),
+                reason: InvalidationReason::DependencyInvalidated,
+            }])
+        );
+    }
+
     // Test concurrent invalidations
     #[test]
     fn test_multiple_invalidation_paths() {
@@ -1120,6 +1167,38 @@ mod tests {
         // Remove the invalidator from b's invalidations using the source pointer
         rt.remove_invalidator(b_node.pointer(), a_new.revision_pointer());
         assert!(!rt.get(b).unwrap().is_invalidated());
+    }
+
+    #[test]
+    fn test_uninvalidation_reinvalidates_since_invalidator_has_new_version() {
+        let rt = Runtime::new();
+        let a = QueryId(1);
+        let b = QueryId(2);
+
+        let a_result = rt.register(a, vec![]);
+        let _b_result = rt.register(b, vec![a_result.node.pointer()]);
+
+        let a_new1 = rt.register(a, vec![]).node;
+        let a_new2 = rt.register(a, vec![]).node;
+
+        let b_node = rt.get(b).unwrap();
+        assert!(b_node.is_invalidated());
+        assert_eq!(
+            b_node.invalidations,
+            Invalidations::from_iter([Invalidation::new_source(
+                a_new1.revision_pointer(),
+                InvalidationReason::NewVersion,
+            )])
+        );
+        rt.remove_invalidator(b_node.pointer(), a_new1.revision_pointer());
+        assert!(rt.get(b).unwrap().is_invalidated());
+        assert_eq!(
+            rt.get(b).unwrap().invalidations,
+            Invalidations::from_iter([Invalidation::new_source(
+                a_new2.revision_pointer(),
+                InvalidationReason::NewVersion,
+            )])
+        );
     }
 
     // Test concurrent invalidations and updates

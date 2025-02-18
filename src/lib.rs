@@ -34,7 +34,7 @@ pub struct QueryId(pub u64);
 /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
 ///
 /// This does not implement `PartialOrd` and `Ord` because it is not comparable across different queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Version(pub u64);
 
@@ -503,6 +503,19 @@ impl Runtime {
                 old: (_, old),
                 new: (_, new),
             } => {
+                // Check if the invalidator has a newer version
+                if let Some(latest) =
+                    self.ensure_latest_dependency(invalidator.pointer.query_id, pointer)
+                {
+                    if latest.pointer.version > invalidator.pointer.version {
+                        // Re-invalidate with the latest version
+                        self.invalidate(
+                            pointer,
+                            Invalidation::new_source(latest, InvalidationReason::NewVersion),
+                        );
+                        return;
+                    }
+                }
                 if !new.is_invalidated() {
                     // recursively uninvalidate dependents
                     for dependent in new.dependents.iter() {
@@ -512,6 +525,28 @@ impl Runtime {
             }
             Compute::Removed(_, _) => unreachable!(),
             Compute::Aborted(_) => {}
+        }
+    }
+
+    fn ensure_latest_dependency(
+        &self,
+        node_id: QueryId,
+        dependent: Pointer,
+    ) -> Option<RevisionPointer> {
+        let pinned = self.nodes.pin();
+        let result = pinned.compute(node_id, |node| {
+            let Some((_, node)) = node else {
+                return Operation::Abort(());
+            };
+            let mut node = node.clone();
+            node.dependents = node.dependents.added(dependent);
+            Operation::Insert(node)
+        });
+        match result {
+            Compute::Inserted(_, _) => unreachable!(),
+            Compute::Updated { new: (_, node), .. } => Some(node.revision_pointer()),
+            Compute::Removed(_, _) => unreachable!(),
+            Compute::Aborted(_) => None,
         }
     }
 
@@ -1174,30 +1209,42 @@ mod tests {
         let rt = Runtime::new();
         let a = QueryId(1);
         let b = QueryId(2);
+        let other = QueryId(3);
 
         let a_result = rt.register(a, vec![]);
-        let _b_result = rt.register(b, vec![a_result.node.pointer()]);
+        let other_result = rt.register(other, vec![]);
+        let _b_result = rt.register(
+            b,
+            vec![a_result.node.pointer(), other_result.node.pointer()],
+        );
 
         let a_new1 = rt.register(a, vec![]).node;
         let a_new2 = rt.register(a, vec![]).node;
+        let other_new = rt.register(other, vec![]).node;
 
         let b_node = rt.get(b).unwrap();
         assert!(b_node.is_invalidated());
         assert_eq!(
             b_node.invalidations,
-            Invalidations::from_iter([Invalidation::new_source(
-                a_new1.revision_pointer(),
-                InvalidationReason::NewVersion,
-            )])
+            Invalidations::from_iter([
+                Invalidation::new_source(a_new1.revision_pointer(), InvalidationReason::NewVersion,),
+                Invalidation::new_source(
+                    other_new.revision_pointer(),
+                    InvalidationReason::NewVersion
+                )
+            ]),
         );
         rt.remove_invalidator(b_node.pointer(), a_new1.revision_pointer());
         assert!(rt.get(b).unwrap().is_invalidated());
         assert_eq!(
             rt.get(b).unwrap().invalidations,
-            Invalidations::from_iter([Invalidation::new_source(
-                a_new2.revision_pointer(),
-                InvalidationReason::NewVersion,
-            )])
+            Invalidations::from_iter([
+                Invalidation::new_source(
+                    other_new.revision_pointer(),
+                    InvalidationReason::NewVersion
+                ),
+                Invalidation::new_source(a_new2.revision_pointer(), InvalidationReason::NewVersion),
+            ])
         );
     }
 

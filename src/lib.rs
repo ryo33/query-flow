@@ -54,8 +54,8 @@ pub struct Version(pub u64);
 ///     query_id: QueryId(1),
 ///     version: Version(10),
 /// };
-/// assert!(p1.older_than(p2));
-/// assert!(!p2.older_than(p1));
+/// assert!(p1.has_influence_on_update(p2));
+/// assert!(!p2.has_influence_on_update(p1));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -109,15 +109,19 @@ impl RevisionPointer {
         self.pointer == other.pointer
             && self.invalidation_revision.0 <= other.invalidation_revision.0
     }
+
+    /// Returns true if this pointer is older than the other pointer both in version and invalidation revision.
+    pub fn has_newer_version_or_revision(&self, other: Self) -> bool {
+        assert!(self.pointer.query_id == other.pointer.query_id);
+        self.pointer.version > other.pointer.version
+            || self.invalidation_revision > other.invalidation_revision
+    }
 }
 
 impl Pointer {
     /// Returns true if this pointer should be invalidated if the other pointer is updated.
-    pub fn older_than(&self, update: Self) -> bool {
-        if self.query_id != update.query_id {
-            return false;
-        }
-        // depends on updated version or more old version
+    pub fn has_influence_on_update(&self, update: Self) -> bool {
+        assert!(self.query_id == update.query_id);
         self.version.0 <= update.version.0
     }
 }
@@ -125,7 +129,7 @@ impl Pointer {
 /// InvalidationRevision is a query-local monotonically increasing number.
 ///
 /// This is used to identify a specific revision of a query that is incremented when it is invalidated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InvalidationRevision(pub u64);
 
@@ -177,7 +181,7 @@ impl Node {
         if self
             .invalidations
             .iter()
-            .any(|i| i.pointer.can_restore(&invalidator))
+            .any(|i| i.dependency.can_restore(&invalidator))
         {
             let mut node = self.clone();
             node.invalidations = node.invalidations.remove_uninvalidated(invalidator);
@@ -206,8 +210,11 @@ impl Node {
             *dependency = new.pointer;
         }
         let mut invalidations = Vec::clone(&self.invalidations.0);
-        for invalidation in invalidations.iter_mut().filter(|i| i.pointer == previous) {
-            invalidation.pointer = new;
+        for invalidation in invalidations
+            .iter_mut()
+            .filter(|i| i.dependency == previous)
+        {
+            invalidation.dependency = new;
         }
         Self {
             dependencies: Dependencies(Arc::new(dependencies)),
@@ -230,7 +237,9 @@ pub struct Dependencies(Arc<Vec<Pointer>>);
 impl Dependencies {
     /// Returns true if this query should be invalidated if the other query is updated.
     pub fn should_be_invalidated_by(&self, update: Pointer) -> bool {
-        self.0.iter().any(|p| p.older_than(update))
+        self.0
+            .iter()
+            .any(|p| p.query_id == update.query_id && p.has_influence_on_update(update))
     }
 
     /// Returns true if there are no dependents.
@@ -313,7 +322,7 @@ pub struct Invalidation {
     /// Source is the pointer that causes this query to be invalidated.
     pub source: RevisionPointer,
     /// Revision pointer to a dependency that is invalidated.
-    pub pointer: RevisionPointer,
+    pub dependency: RevisionPointer,
     /// Reason is the reason why this query is invalidated.
     pub reason: InvalidationReason,
 }
@@ -323,7 +332,7 @@ impl Invalidation {
     pub fn new_source(source: RevisionPointer, reason: InvalidationReason) -> Self {
         Self {
             source,
-            pointer: source,
+            dependency: source,
             reason,
         }
     }
@@ -352,7 +361,7 @@ impl Invalidations {
     #[must_use]
     pub fn remove_uninvalidated(&self, pointer: RevisionPointer) -> Self {
         let mut invalidations = Vec::clone(&self.0);
-        invalidations.retain(|i| !i.pointer.can_restore(&pointer));
+        invalidations.retain(|i| !i.dependency.can_restore(&pointer));
         Invalidations(Arc::new(invalidations))
     }
 
@@ -504,18 +513,7 @@ impl Runtime {
                 new: (_, new),
             } => {
                 // Check if the invalidator has a newer version
-                if let Some(latest) =
-                    self.ensure_latest_dependency(invalidator.pointer.query_id, pointer)
-                {
-                    if latest.pointer.version > invalidator.pointer.version {
-                        // Re-invalidate with the latest version
-                        self.invalidate(
-                            pointer,
-                            Invalidation::new_source(latest, InvalidationReason::NewVersion),
-                        );
-                        return;
-                    }
-                }
+                self.ensure_tracking_dependent_by_latest_version(invalidator, pointer);
                 if !new.is_invalidated() {
                     // recursively uninvalidate dependents
                     for dependent in new.dependents.iter() {
@@ -528,25 +526,39 @@ impl Runtime {
         }
     }
 
-    fn ensure_latest_dependency(
+    fn ensure_tracking_dependent_by_latest_version(
         &self,
-        node_id: QueryId,
+        pointer: RevisionPointer,
         dependent: Pointer,
-    ) -> Option<RevisionPointer> {
+    ) {
         let pinned = self.nodes.pin();
-        let result = pinned.compute(node_id, |node| {
+        let result = pinned.compute(pointer.pointer.query_id, |node| {
             let Some((_, node)) = node else {
                 return Operation::Abort(());
             };
-            let mut node = node.clone();
-            node.dependents = node.dependents.added(dependent);
-            Operation::Insert(node)
+            if node.version > pointer.pointer.version {
+                let mut node = node.clone();
+                node.dependents = node.dependents.added(dependent);
+                Operation::Insert(node)
+            } else {
+                Operation::Abort(())
+            }
         });
         match result {
             Compute::Inserted(_, _) => unreachable!(),
-            Compute::Updated { new: (_, node), .. } => Some(node.revision_pointer()),
+            Compute::Updated {
+                new: (_, latest), ..
+            } => {
+                self.invalidate(
+                    dependent,
+                    Invalidation::new_source(
+                        latest.revision_pointer(),
+                        InvalidationReason::NewVersion,
+                    ),
+                );
+            }
             Compute::Removed(_, _) => unreachable!(),
-            Compute::Aborted(_) => None,
+            Compute::Aborted(_) => {}
         }
     }
 
@@ -602,7 +614,7 @@ impl Runtime {
             let Some((_, node)) = node else {
                 return Operation::Abort(());
             };
-            if node.pointer().older_than(pointer) {
+            if node.pointer().has_influence_on_update(pointer) {
                 let mut node = node.clone();
                 node.invalidations = node.invalidations.pushed(invalidation);
                 node.invalidation_revision.0 += 1;
@@ -623,7 +635,7 @@ impl Runtime {
                         dependent,
                         Invalidation {
                             source: invalidation.source,
-                            pointer: node.revision_pointer(),
+                            dependency: node.revision_pointer(),
                             reason: InvalidationReason::DependencyInvalidated,
                         },
                     );
@@ -925,7 +937,7 @@ mod tests {
             b_node.invalidations,
             Invalidations::from_iter([Invalidation {
                 source: a_update.node.revision_pointer(),
-                pointer: a_update.node.revision_pointer(),
+                dependency: a_update.node.revision_pointer(),
                 reason: InvalidationReason::NewVersion,
             }])
         );
@@ -950,7 +962,7 @@ mod tests {
             b_node.invalidations,
             Invalidations::from_iter([Invalidation {
                 source: result.node.revision_pointer(),
-                pointer: result.node.revision_pointer(),
+                dependency: result.node.revision_pointer(),
                 reason: InvalidationReason::Removed,
             }])
         );
@@ -985,7 +997,7 @@ mod tests {
             c_node.invalidations,
             Invalidations::from_iter([Invalidation {
                 source: a_new.revision_pointer(),
-                pointer: b_node.revision_pointer(),
+                dependency: b_node.revision_pointer(),
                 reason: InvalidationReason::DependencyInvalidated,
             }])
         );
@@ -1047,7 +1059,7 @@ mod tests {
             d_node.invalidations,
             Invalidations::from_iter([Invalidation {
                 source: b_result.node.revision_pointer(),
-                pointer: c_node.revision_pointer(),
+                dependency: c_node.revision_pointer(),
                 reason: InvalidationReason::DependencyInvalidated,
             }])
         );
@@ -1073,12 +1085,12 @@ mod tests {
             Invalidations::from_iter([
                 Invalidation {
                     source: a_new.revision_pointer(),
-                    pointer: b_node.revision_pointer(),
+                    dependency: b_node.revision_pointer(),
                     reason: InvalidationReason::DependencyInvalidated,
                 },
                 Invalidation {
                     source: a_new.revision_pointer(),
-                    pointer: a_new.revision_pointer(),
+                    dependency: a_new.revision_pointer(),
                     reason: InvalidationReason::NewVersion,
                 },
             ])
@@ -1171,12 +1183,12 @@ mod tests {
             Invalidations::from_iter([
                 Invalidation {
                     source: a_new.revision_pointer(),
-                    pointer: b_node.revision_pointer(),
+                    dependency: b_node.revision_pointer(),
                     reason: InvalidationReason::DependencyInvalidated,
                 },
                 Invalidation {
                     source: a_new.revision_pointer(),
-                    pointer: c_node.revision_pointer(),
+                    dependency: c_node.revision_pointer(),
                     reason: InvalidationReason::DependencyInvalidated,
                 },
             ])
@@ -1279,7 +1291,7 @@ mod tests {
             b_node.invalidations,
             Invalidations::from_iter([Invalidation {
                 source: a_new.revision_pointer(),
-                pointer: a_new.revision_pointer(),
+                dependency: a_new.revision_pointer(),
                 reason: InvalidationReason::NewVersion,
             }])
         );
@@ -1301,7 +1313,7 @@ mod tests {
             rt.get(b).unwrap().invalidations,
             Invalidations::from_iter([Invalidation {
                 source: a_result.node.revision_pointer(),
-                pointer: a_result.node.revision_pointer(),
+                dependency: a_result.node.revision_pointer(),
                 reason: InvalidationReason::Removed,
             }])
         );

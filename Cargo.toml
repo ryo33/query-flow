@@ -3,6 +3,7 @@ name = "whale"
 version = "0.1.0"
 edition = "2021"
 keywords = ["reactive", "incremental", "dependency-tracking"]
+description = "A lock-free, dependency-tracking primitive for incremental computation."
 categories = ["data-structures"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/ryo33/whale"

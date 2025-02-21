@@ -408,6 +408,62 @@ pub enum InvalidationReason {
     Removed,
 }
 
+/// A trait for collecting and give strategy for invalidation propagation.
+pub trait InvalidationCollector {
+    /// Collect invalidations.
+    fn notify(
+        &mut self,
+        target: RevisionPointer,
+        invalidation: Invalidation,
+    ) -> InvalidationPropagation;
+}
+
+/// InvalidationPropagation is a strategy for invalidation propagation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InvalidationPropagation {
+    /// Propagate invalidations to dependents.
+    Propagate,
+    /// Do not propagate invalidations.
+    #[default]
+    DoNotPropagate,
+}
+
+/// A noop implementation of InvalidationCollector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoopInvalidationCollector;
+
+impl InvalidationCollector for NoopInvalidationCollector {
+    fn notify(&mut self, _: RevisionPointer, _: Invalidation) -> InvalidationPropagation {
+        InvalidationPropagation::DoNotPropagate
+    }
+}
+
+/// A collector that propagates invalidations to dependents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PropagateInvalidationCollector;
+
+impl InvalidationCollector for PropagateInvalidationCollector {
+    fn notify(&mut self, _: RevisionPointer, _: Invalidation) -> InvalidationPropagation {
+        InvalidationPropagation::Propagate
+    }
+}
+
+/// A collector that collects all invalidations into a Vec.
+pub struct CollectInvalidationCollector {
+    invalidations: Vec<Invalidation>,
+}
+
+impl InvalidationCollector for CollectInvalidationCollector {
+    fn notify(
+        &mut self,
+        _: RevisionPointer,
+        invalidation: Invalidation,
+    ) -> InvalidationPropagation {
+        self.invalidations.push(invalidation);
+        InvalidationPropagation::Propagate
+    }
+}
+
 impl Runtime {
     /// Create a new runtime.
     pub fn new() -> Self {

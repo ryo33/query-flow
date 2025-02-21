@@ -16,7 +16,7 @@ serde = ["dep:serde", "papaya/serde"]
 
 [dependencies]
 ahash = "0.8"
-papaya = { version = "0.1.6" }
+papaya = { version = "0.2" }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]

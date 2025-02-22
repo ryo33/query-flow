@@ -411,11 +411,7 @@ pub enum InvalidationReason {
 /// A trait for collecting and give strategy for invalidation propagation.
 pub trait InvalidationCollector {
     /// Collect invalidations.
-    fn notify(
-        &mut self,
-        target: RevisionPointer,
-        invalidation: Invalidation,
-    ) -> InvalidationPropagation;
+    fn notify(&mut self, target: Pointer, invalidation: Invalidation) -> InvalidationPropagation;
 }
 
 /// InvalidationPropagation is a strategy for invalidation propagation.
@@ -433,7 +429,7 @@ pub enum InvalidationPropagation {
 pub struct NoopInvalidationCollector;
 
 impl InvalidationCollector for NoopInvalidationCollector {
-    fn notify(&mut self, _: RevisionPointer, _: Invalidation) -> InvalidationPropagation {
+    fn notify(&mut self, _: Pointer, _: Invalidation) -> InvalidationPropagation {
         InvalidationPropagation::DoNotPropagate
     }
 }
@@ -443,22 +439,18 @@ impl InvalidationCollector for NoopInvalidationCollector {
 pub struct PropagateInvalidationCollector;
 
 impl InvalidationCollector for PropagateInvalidationCollector {
-    fn notify(&mut self, _: RevisionPointer, _: Invalidation) -> InvalidationPropagation {
+    fn notify(&mut self, _: Pointer, _: Invalidation) -> InvalidationPropagation {
         InvalidationPropagation::Propagate
     }
 }
 
 /// A collector that collects all invalidations into a Vec.
-pub struct CollectInvalidationCollector {
+pub struct VecInvalidationCollector {
     invalidations: Vec<Invalidation>,
 }
 
-impl InvalidationCollector for CollectInvalidationCollector {
-    fn notify(
-        &mut self,
-        _: RevisionPointer,
-        invalidation: Invalidation,
-    ) -> InvalidationPropagation {
+impl InvalidationCollector for VecInvalidationCollector {
+    fn notify(&mut self, _: Pointer, invalidation: Invalidation) -> InvalidationPropagation {
         self.invalidations.push(invalidation);
         InvalidationPropagation::Propagate
     }

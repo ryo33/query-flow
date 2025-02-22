@@ -474,18 +474,35 @@ impl Runtime {
         self.nodes.pin().keys().cloned().collect()
     }
 
+    /// Helper method to notify collector and propagate invalidation if needed
+    fn notify_and_propagate(
+        &self,
+        target: Pointer,
+        invalidation: Invalidation,
+        collector: &mut impl InvalidationCollector,
+    ) {
+        if collector.notify(target, invalidation) == InvalidationPropagation::Propagate {
+            self.invalidate(target, invalidation, collector);
+        }
+    }
+
     /// Remove a node from the runtime. If the node is returned and has dependents, you should update them.
     #[must_use]
-    pub fn remove(&self, query_id: QueryId) -> QueryRemovalResult {
+    pub fn remove(
+        &self,
+        query_id: QueryId,
+        collector: &mut impl InvalidationCollector,
+    ) -> QueryRemovalResult {
         let removed = self.nodes.pin().remove(&query_id).cloned();
         if let Some(removed) = &removed {
             for dependent in removed.dependents.0.iter().cloned() {
-                self.invalidate(
+                self.notify_and_propagate(
                     dependent,
                     Invalidation::new_source(
                         removed.revision_pointer(),
                         InvalidationReason::Removed,
                     ),
+                    collector,
                 );
             }
         }
@@ -493,7 +510,11 @@ impl Runtime {
     }
 
     /// Uninvalidate a specific revision pointer.
-    pub fn uninvalidate(&self, revision_pointer: RevisionPointer) {
+    pub fn uninvalidate(
+        &self,
+        revision_pointer: RevisionPointer,
+        collector: &mut impl InvalidationCollector,
+    ) {
         let pinned = self.nodes.pin();
         enum AbortReason {
             NotFound,
@@ -527,7 +548,7 @@ impl Runtime {
             } => {
                 // Recursively uninvalidate dependents if they were invalidated by this node
                 for dependent in old.dependents.iter() {
-                    self.remove_invalidator(dependent, revision_pointer);
+                    self.remove_invalidator(dependent, revision_pointer, collector);
                 }
             }
             Compute::Removed(_, _) => unreachable!(),
@@ -536,7 +557,12 @@ impl Runtime {
     }
 
     /// Remove an invalidator from a specific pointer.
-    pub fn remove_invalidator(&self, pointer: Pointer, invalidator: RevisionPointer) {
+    pub fn remove_invalidator(
+        &self,
+        pointer: Pointer,
+        invalidator: RevisionPointer,
+        collector: &mut impl InvalidationCollector,
+    ) {
         let pinned = self.nodes.pin();
         let result = pinned.compute(pointer.query_id, |node| {
             let Some((_, node)) = node else {
@@ -561,11 +587,11 @@ impl Runtime {
                 new: (_, new),
             } => {
                 // Check if the invalidator has a newer version
-                self.ensure_tracking_dependent_by_latest_version(invalidator, pointer);
+                self.ensure_tracking_dependent_by_latest_version(invalidator, pointer, collector);
                 if !new.is_invalidated() {
                     // recursively uninvalidate dependents
                     for dependent in new.dependents.iter() {
-                        self.remove_invalidator(dependent, old.revision_pointer());
+                        self.remove_invalidator(dependent, old.revision_pointer(), collector);
                     }
                 }
             }
@@ -578,6 +604,7 @@ impl Runtime {
         &self,
         pointer: RevisionPointer,
         dependent: Pointer,
+        collector: &mut impl InvalidationCollector,
     ) {
         let pinned = self.nodes.pin();
         let result = pinned.compute(pointer.pointer.query_id, |node| {
@@ -597,12 +624,13 @@ impl Runtime {
             Compute::Updated {
                 new: (_, latest), ..
             } => {
-                self.invalidate(
+                self.notify_and_propagate(
                     dependent,
                     Invalidation::new_source(
                         latest.revision_pointer(),
                         InvalidationReason::NewVersion,
                     ),
+                    collector,
                 );
             }
             Compute::Removed(_, _) => unreachable!(),
@@ -652,7 +680,12 @@ impl Runtime {
     }
 
     /// Recursively invalidate a specific version of a query, and returns the pointers of the invalidated nodes.
-    pub fn invalidate(&self, pointer: Pointer, invalidation: Invalidation) {
+    pub fn invalidate(
+        &self,
+        pointer: Pointer,
+        invalidation: Invalidation,
+        collector: &mut impl InvalidationCollector,
+    ) {
         if invalidation.source.pointer == pointer {
             eprintln!("cyclic dependency detected on {:?}", pointer);
             return;
@@ -677,16 +710,19 @@ impl Runtime {
                 old: _,
                 new: (_, node),
             } => {
-                // Recursively invalidate dependents
-                for dependent in node.dependents.iter() {
-                    self.invalidate(
-                        dependent,
-                        Invalidation {
-                            source: invalidation.source,
-                            dependency: node.revision_pointer(),
-                            reason: InvalidationReason::DependencyInvalidated,
-                        },
-                    );
+                if collector.notify(pointer, invalidation) == InvalidationPropagation::Propagate {
+                    // Recursively invalidate dependents
+                    for dependent in node.dependents.iter() {
+                        self.invalidate(
+                            dependent,
+                            Invalidation {
+                                source: invalidation.source,
+                                dependency: node.revision_pointer(),
+                                reason: InvalidationReason::DependencyInvalidated,
+                            },
+                            collector,
+                        );
+                    }
                 }
             }
             Compute::Removed(_, _) => unreachable!(),
@@ -700,28 +736,25 @@ impl Runtime {
         &self,
         query_id: QueryId,
         dependencies: Vec<Pointer>,
+        collector: &mut impl InvalidationCollector,
     ) -> QueryRegistrationResult {
         let dependencies = Dependencies(Arc::new(dependencies));
         let (new_node, old_node) = self.create_new_version(query_id, dependencies.clone());
 
-        // At this point, other threads may be read this version without invalidated state before checking if it is invalidated.
-
-        // Register dependents
-        // While registering dependents, other threads may be update or invalidate those dependencies, so we need to collect all invalidated dependencies for this caller.
         let invalidations = self.update_dependency_graph(new_node.pointer(), dependencies);
         let new_node = self
             .extend_invalidations(new_node.pointer(), invalidations)
             .unwrap_or(new_node);
 
         if let Some(old_node) = &old_node {
-            // Recursively invalidate old dependents
             for dependent in old_node.dependents.iter() {
-                self.invalidate(
+                self.notify_and_propagate(
                     dependent,
                     Invalidation::new_source(
                         new_node.revision_pointer(),
                         InvalidationReason::NewVersion,
                     ),
+                    collector,
                 );
             }
         }
@@ -739,14 +772,11 @@ impl Runtime {
         &self,
         query_id: QueryId,
         dependencies: Vec<Pointer>,
+        collector: &mut impl InvalidationCollector,
     ) -> QueryRegistrationResult {
         let dependencies = Dependencies(Arc::new(dependencies));
         let (new_node, old_node) = self.create_new_version(query_id, dependencies.clone());
 
-        // At this point, other threads may be read this version without invalidated state before checking if it is invalidated.
-
-        // Register dependents
-        // While registering dependents, other threads may be update or invalidate those dependencies, so we need to collect all invalidated dependencies for this caller.
         let invalidations = self.update_dependency_graph(new_node.pointer(), dependencies);
         let new_node = self
             .extend_invalidations(new_node.pointer(), invalidations)
@@ -760,12 +790,13 @@ impl Runtime {
                     new_node.revision_pointer(),
                 );
                 if new_node.is_invalidated() {
-                    self.invalidate(
+                    self.notify_and_propagate(
                         dependent,
                         Invalidation::new_source(
                             new_node.revision_pointer(),
                             InvalidationReason::DependencyInvalidated,
                         ),
+                        collector,
                     );
                 }
             }
@@ -933,13 +964,13 @@ mod tests {
         let id = QueryId(1);
 
         // First registration
-        let result = rt.register(id, vec![]);
+        let result = rt.register(id, vec![], &mut PropagateInvalidationCollector);
         assert_eq!(result.node.id, id);
         assert_eq!(result.node.version.0, 0);
         assert!(result.old_node.is_none());
 
         // Second registration should increment version
-        let result2 = rt.register(id, vec![]);
+        let result2 = rt.register(id, vec![], &mut PropagateInvalidationCollector);
         assert_eq!(result2.node.version.0, 1);
         assert_eq!(result2.old_node, Some(result.node));
     }
@@ -952,8 +983,12 @@ mod tests {
         let b = QueryId(2);
 
         // b depends on a
-        let result = rt.register(a, vec![]);
-        let b_result = rt.register(b, vec![result.node.pointer()]);
+        let result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let b_result = rt.register(
+            b,
+            vec![result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
         // Verify dependency tracking
         let a_node = rt.get(a).unwrap();
@@ -975,11 +1010,15 @@ mod tests {
         let b = QueryId(2);
 
         // Setup initial state
-        let result = rt.register(a, vec![]);
-        let _ = rt.register(b, vec![result.node.pointer()]);
+        let result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let _ = rt.register(
+            b,
+            vec![result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
         // Update a to invalidate b
-        let a_update = rt.register(a, vec![]);
+        let a_update = rt.register(a, vec![], &mut PropagateInvalidationCollector);
         let b_node = rt.get(b).unwrap();
         assert_eq!(
             b_node.invalidations,
@@ -998,11 +1037,15 @@ mod tests {
         let a = QueryId(1);
         let b = QueryId(2);
 
-        let result = rt.register(a, vec![]);
-        let _ = rt.register(b, vec![result.node.pointer()]);
+        let result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let _ = rt.register(
+            b,
+            vec![result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
         // Remove a and check b invalidation
-        let removal = rt.remove(a);
+        let removal = rt.remove(a, &mut PropagateInvalidationCollector);
         assert!(removal.removed.is_some());
         let b_node = rt.get(b).unwrap();
         assert!(b_node.is_invalidated());
@@ -1024,12 +1067,22 @@ mod tests {
         let b = QueryId(2);
         let c = QueryId(3);
 
-        let result = rt.register(a, vec![]);
-        let b_result = rt.register(b, vec![result.node.pointer()]);
-        let _ = rt.register(c, vec![b_result.node.pointer()]);
+        let result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let b_result = rt.register(
+            b,
+            vec![result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let _ = rt.register(
+            c,
+            vec![b_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
         // Update a should invalidate both b and c
-        let a_new = rt.register(a, vec![]).node;
+        let a_new = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
         let b_node = rt.get(b).unwrap();
         let c_node = rt.get(c).unwrap();
         assert!(b_node.is_invalidated());
@@ -1058,9 +1111,19 @@ mod tests {
         let a = QueryId(1);
         let b = QueryId(2);
 
-        let a_result = rt.register(a, vec![]);
-        let b_result = rt.register(b, vec![a_result.node.pointer()]);
-        let _ = rt.register(a, vec![b_result.node.pointer()]).node;
+        let a_result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let b_result = rt.register(
+            b,
+            vec![a_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let _ = rt
+            .register(
+                a,
+                vec![b_result.node.pointer()],
+                &mut PropagateInvalidationCollector,
+            )
+            .node;
 
         assert!(rt.has_cycle(a));
         assert!(rt.has_cycle(b));
@@ -1075,13 +1138,31 @@ mod tests {
         let c = QueryId(3);
         let d = QueryId(4);
 
-        let a_result = rt.register(a, vec![]);
-        let b_result = rt.register(b, vec![a_result.node.pointer()]);
-        let c_result = rt.register(c, vec![b_result.node.pointer()]);
-        let d_result = rt.register(d, vec![c_result.node.pointer()]);
-        let b_result = rt.register(b, vec![a_result.node.pointer(), d_result.node.pointer()]);
+        let a_result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let b_result = rt.register(
+            b,
+            vec![a_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let c_result = rt.register(
+            c,
+            vec![b_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let d_result = rt.register(
+            d,
+            vec![c_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let b_result = rt.register(
+            b,
+            vec![a_result.node.pointer(), d_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
-        let a_new = rt.register(a, vec![]).node;
+        let a_new = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
 
         let b_node = rt.get(b).unwrap();
         let c_node = rt.get(c).unwrap();
@@ -1121,11 +1202,21 @@ mod tests {
         let b = QueryId(2);
         let c = QueryId(3);
 
-        let a_result = rt.register(a, vec![]);
-        let b_result = rt.register(b, vec![a_result.node.pointer()]);
-        let _ = rt.register(c, vec![a_result.node.pointer(), b_result.node.pointer()]);
+        let a_result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let b_result = rt.register(
+            b,
+            vec![a_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let _ = rt.register(
+            c,
+            vec![a_result.node.pointer(), b_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
-        let a_new = rt.register(a, vec![]).node;
+        let a_new = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
         let b_node = rt.get(b).unwrap();
         let c_node = rt.get(c).unwrap();
         assert_eq!(
@@ -1154,7 +1245,7 @@ mod tests {
             .map(|_| {
                 let rt = rt.clone();
                 tokio::spawn(async move {
-                    let _ = rt.register(id, vec![]);
+                    let _ = rt.register(id, vec![], &mut PropagateInvalidationCollector);
                 })
             })
             .collect();
@@ -1175,12 +1266,13 @@ mod tests {
         let b = QueryId(2);
 
         // a with no dependencies
-        let _ = rt.register(a, vec![]);
+        let _ = rt.register(a, vec![], &mut PropagateInvalidationCollector);
         assert!(rt.remove_if_unused(a).is_some());
 
         // b depends on a
-        let QueryRegistrationResult { node, .. } = rt.register(a, vec![]);
-        let _ = rt.register(b, vec![node.pointer()]);
+        let QueryRegistrationResult { node, .. } =
+            rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let _ = rt.register(b, vec![node.pointer()], &mut PropagateInvalidationCollector);
         assert!(rt.remove_if_unused(a).is_none());
     }
 
@@ -1192,14 +1284,22 @@ mod tests {
         let b = QueryId(2);
 
         // Initial version
-        let a1 = rt.register(a, vec![]).node;
-        let _b1 = rt.register(b, vec![a1.pointer()]).node;
+        let a1 = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
+        let _b1 = rt
+            .register(b, vec![a1.pointer()], &mut PropagateInvalidationCollector)
+            .node;
 
         // Update a
-        let a2 = rt.register(a, vec![]).node;
+        let a2 = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
 
         // Update b's dependencies
-        let b2 = rt.update_dependencies(b, vec![a2.pointer()]).node;
+        let b2 = rt
+            .update_dependencies(b, vec![a2.pointer()], &mut PropagateInvalidationCollector)
+            .node;
         assert_eq!(
             b2.dependencies.iter().next().unwrap().version.0,
             a2.version.0
@@ -1215,13 +1315,27 @@ mod tests {
         let c = QueryId(3);
         let d = QueryId(4);
 
-        let a_result = rt.register(a, vec![]);
-        let b_result = rt.register(b, vec![a_result.node.pointer()]);
-        let c_result = rt.register(c, vec![a_result.node.pointer()]);
-        let _ = rt.register(d, vec![b_result.node.pointer(), c_result.node.pointer()]);
+        let a_result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let b_result = rt.register(
+            b,
+            vec![a_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let c_result = rt.register(
+            c,
+            vec![a_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let _ = rt.register(
+            d,
+            vec![b_result.node.pointer(), c_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
         // Update a should invalidate all
-        let a_new = rt.register(a, vec![]).node;
+        let a_new = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
         let b_node = rt.get(b).unwrap();
         let c_node = rt.get(c).unwrap();
         assert!(b_node.is_invalidated());
@@ -1251,16 +1365,30 @@ mod tests {
         let b = QueryId(2);
 
         // Create dependency
-        let a_node = rt.register(a, vec![]).node;
-        let _b_node = rt.register(b, vec![a_node.pointer()]).node;
+        let a_node = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
+        let _b_node = rt
+            .register(
+                b,
+                vec![a_node.pointer()],
+                &mut PropagateInvalidationCollector,
+            )
+            .node;
 
         // Invalidate b by updating a and get the new revision pointer
-        let a_new = rt.register(a, vec![]).node;
+        let a_new = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
         let b_node = rt.get(b).unwrap();
         assert!(b_node.is_invalidated());
 
         // Remove the invalidator from b's invalidations using the source pointer
-        rt.remove_invalidator(b_node.pointer(), a_new.revision_pointer());
+        rt.remove_invalidator(
+            b_node.pointer(),
+            a_new.revision_pointer(),
+            &mut PropagateInvalidationCollector,
+        );
         assert!(!rt.get(b).unwrap().is_invalidated());
     }
 
@@ -1271,16 +1399,23 @@ mod tests {
         let b = QueryId(2);
         let other = QueryId(3);
 
-        let a_result = rt.register(a, vec![]);
-        let other_result = rt.register(other, vec![]);
+        let a_result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let other_result = rt.register(other, vec![], &mut PropagateInvalidationCollector);
         let _b_result = rt.register(
             b,
             vec![a_result.node.pointer(), other_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
         );
 
-        let a_new1 = rt.register(a, vec![]).node;
-        let a_new2 = rt.register(a, vec![]).node;
-        let other_new = rt.register(other, vec![]).node;
+        let a_new1 = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
+        let a_new2 = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
+        let other_new = rt
+            .register(other, vec![], &mut PropagateInvalidationCollector)
+            .node;
 
         let b_node = rt.get(b).unwrap();
         assert!(b_node.is_invalidated());
@@ -1294,7 +1429,11 @@ mod tests {
                 )
             ]),
         );
-        rt.remove_invalidator(b_node.pointer(), a_new1.revision_pointer());
+        rt.remove_invalidator(
+            b_node.pointer(),
+            a_new1.revision_pointer(),
+            &mut PropagateInvalidationCollector,
+        );
         assert!(rt.get(b).unwrap().is_invalidated());
         assert_eq!(
             rt.get(b).unwrap().invalidations,
@@ -1315,15 +1454,23 @@ mod tests {
         let a = QueryId(1);
         let b = QueryId(2);
 
-        let a_node = rt.register(a, vec![]).node;
-        let _ = rt.register(b, vec![a_node.pointer()]);
-        let a_new = rt.register(a, vec![]).node;
+        let a_node = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
+        let _ = rt.register(
+            b,
+            vec![a_node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
+        let a_new = rt
+            .register(a, vec![], &mut PropagateInvalidationCollector)
+            .node;
 
         let handles: Vec<_> = (0..50)
             .map(|_| {
                 let rt = rt.clone();
                 tokio::spawn(async move {
-                    let _ = rt.register(a, vec![]);
+                    let _ = rt.register(a, vec![], &mut PropagateInvalidationCollector);
                 })
             })
             .collect();
@@ -1352,10 +1499,14 @@ mod tests {
         let a = QueryId(1);
         let b = QueryId(2);
 
-        let a_result = rt.register(a, vec![]);
-        let _b_result = rt.register(b, vec![a_result.node.pointer()]);
+        let a_result = rt.register(a, vec![], &mut PropagateInvalidationCollector);
+        let _b_result = rt.register(
+            b,
+            vec![a_result.node.pointer()],
+            &mut PropagateInvalidationCollector,
+        );
 
-        let removal = rt.remove(a);
+        let removal = rt.remove(a, &mut PropagateInvalidationCollector);
         assert!(removal.removed.is_some());
         assert_eq!(
             rt.get(b).unwrap().invalidations,

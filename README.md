@@ -13,8 +13,8 @@ A lock-free, dependency-tracking primitive for incremental computation.
 
 ## Design and focus
 
-Whale is designed to be a low-level primitive for building a high-level incremental computing systems.
-So it does not provide,
+Whale is designed to be a low-level primitive for building high-level incremental computing systems.
+So it does not provide:
 
 - What actually the "query" is
 - How to calculate a query ID
@@ -40,33 +40,32 @@ The system seamlessly supports a mixture of:
 
 The main API functionalities are:
 
-- **Get a node**: `runtime.get(query_id: QueryId)`
-  Returns the node of the query. And you can get the version, dependencies, dependents, and invalidation states from the returned node.
+- **Get a node**: `runtime.get(query_id: QueryId) -> Option<Node>`
+  Returns the node of the query. The node contains version, dependencies, dependents, and invalidation states.
 
-- **Iterate over all nodes**: `runtime.keys()`
+- **Iterate over all nodes**: `runtime.keys() -> Vec<QueryId>`
   Returns all query IDs in the runtime.
 
-- **Registering Dependencies**: `runtime.register(query_id: QueryId, dependencies: Vec<Pointer>)`
-  Registers a new version of a query with its dependencies. This effectively manages pairs of query_id and version, and invalidates the dependents of the previous version. This returns both the new and old nodes, and also all invalidations that transitively invalidated by this registration.
+- **Registering Dependencies**: `runtime.register(query_id: QueryId, dependencies: Vec<Pointer>, collector: &mut impl InvalidationCollector) -> QueryRegistrationResult`
+  Registers a new version of a query with its dependencies. This effectively manages pairs of query_id and version, and invalidates the dependents of the previous version. Returns both the new and old nodes.
 
-- **Updating Dependencies**: `runtime.update_dependencies(query_id: QueryId, dependencies: Vec<Pointer>)`
-  Almost same as `register`, but this does not invalidate the dependents of the previous version by this update.
-  Typically, this is used when a query is invalidated and recalculated and it does produce the same result as the previous version. If dependencies are the same, prefer the `uninvalidate` instead.
+- **Updating Dependencies**: `runtime.update_dependencies(query_id: QueryId, dependencies: Vec<Pointer>, collector: &mut impl InvalidationCollector) -> QueryRegistrationResult`
+  Similar to `register`, but does not invalidate the dependents of the previous version. Used when a query is invalidated and recalculated with the same result but different dependencies.
 
-- **Uninvalidating a node**: `runtime.uninvalidate(revision_pointer: RevisionPointer)`
-  Mark a specific revision state of a node as not invalidated. This is typically used when a query is recalculated and it does produce the same result as the previous version. If dependencies are changed, use `update_dependencies` instead.
+- **Uninvalidating a node**: `runtime.uninvalidate(revision_pointer: RevisionPointer, collector: &mut impl InvalidationCollector, uninvalidation_collector: &mut impl UninvalidationCollector)`
+  Marks a specific revision state of a node as not invalidated. Used when a query is recalculated and produces the same result as the previous version.
 
-- **Removing an invalidator**: `runtime.remove_invalidator(pointer: Pointer, revision_pointer: RevisionPointer)`
-  Removes an invalidation reason from a revision state. This method is used when a query has marked as invalidated by a depended query had invalidated it, and confirmed that the query actually does not need to be re-computed.
+- **Removing an invalidator**: `runtime.remove_invalidator(pointer: Pointer, revision_pointer: RevisionPointer, collector: &mut impl InvalidationCollector, uninvalidation_collector: &mut impl UninvalidationCollector)`
+  Removes an invalidation reason from a revision state. Used when a query was invalidated by a dependency but confirmed not to need recomputation.
 
-- **Removing a node**: `runtime.remove(query_id: QueryId)`
-  Removes a node from the runtime. If the node is returned and has dependents, they will be marked as invalidated, and the full list is returned within the result.
+- **Removing a node**: `runtime.remove(query_id: QueryId, collector: &mut impl InvalidationCollector) -> QueryRemovalResult`
+  Removes a node from the runtime. If the node has dependents, they will be marked as invalidated.
 
-- **Detecting a cycle**: `runtime.has_cycle(query_id: QueryId)`
-  Detects a cycle in the dependency graph. Even while a graph has cycles, the whole system should work correctly and methods should not hang in infinite loops.
+- **Detecting a cycle**: `runtime.has_cycle(query_id: QueryId) -> bool`
+  Detects a cycle in the dependency graph. The system remains functional even with cycles present.
 
-- **Freeing a unused node**: `runtime.remove_if_unused(query_id: QueryId)`
-  Removes a node from the runtime if it is not depended by any other queries. This is useful for manual garbage collection when combined with `keys()` to iterate over all nodes.
+- **Freeing an unused node**: `runtime.remove_if_unused(query_id: QueryId) -> Option<Node>`
+  Removes a node from the runtime if it is not depended on by any other queries. Useful for manual garbage collection.
 
 ## Architecture
 
@@ -81,6 +80,7 @@ Whale is built around a lock-free dependency graph where nodes represent computa
   - A version number that changes when the computation result changes
   - Lists of dependencies and dependents
   - An invalidation state tracking when recomputation is needed
+  - An invalidation revision counter for tracking multiple invalidation states
 
 - **Pointer**: A reference to a specific version of a computation, consisting of:
   - A query ID to identify the computation
@@ -96,7 +96,7 @@ Whale is built around a lock-free dependency graph where nodes represent computa
 The system uses atomic operations and immutable data structures to achieve thread safety without locks:
 
 - Nodes are updated through atomic compare-and-swap operations
-- Dependencies are stored in immutable Arc-wrapped vectors
+- Dependencies and dependents are stored in immutable collections
 - Version numbers are managed through atomic counters
 
 This design allows multiple threads to concurrently:
@@ -109,14 +109,15 @@ This design allows multiple threads to concurrently:
 
 Whale maintains consistency through several key mechanisms:
 
-- **Version Monotonicity**: For each query (not a Runtime-wide), its version number only increases, ensuring a clear timeline of changes.
+- **Version Monotonicity**: For each query, its version number only increases, ensuring a clear timeline of changes.
 
-- **Cyclic safety**: The system is consistent while there are cycles in the dependency graph.
-  Also, it does not hang in infinite loops even if there are cycles in the dependency graph.
+- **Cyclic Safety**: The system remains consistent and functional even with cycles in the dependency graph.
+  Operations will not hang in infinite loops even in the presence of cycles.
 
-- **Invalidation Guarantees**: The system provides guarantees about invalidation:
-  - All dependent computations are notified of changes, and at least one caller of operation will be notified of the invalidation.
-  - Uninvalidating a node succeeds only if the node has not been invalidated since the given revision pointer
+- **Invalidation Guarantees**: The system ensures:
+  - All dependent computations are notified of changes
+  - At least one caller of an operation will be notified of invalidation
+  - Uninvalidation of a node succeeds only if the node hasn't been invalidated since the given revision pointer
 
 - **No Guarantees About**:
   - When get a node, it may be in an dirty state with other runnning operations

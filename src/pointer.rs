@@ -1,8 +1,3 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-/// QueryId is a unique identifier for a query.
-pub struct QueryId(pub u64);
-
 /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
 ///
 /// This does not implement `PartialOrd` and `Ord` because it is not comparable across different queries.
@@ -10,20 +5,20 @@ pub struct QueryId(pub u64);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Version(pub u64);
 
-/// Pointer is a pair of `QueryId` and `Version`.
+/// Pointer is a pair of query identifier and `Version`.
 ///
 /// This is used to identify a specific version of a query.
 ///
 /// # Examples
 ///
 /// ```
-/// # use whale::{Pointer, QueryId, Version};
+/// # use whale::{Pointer, Version};
 /// let p1 = Pointer {
-///     query_id: QueryId(1),
+///     query_id: 1,
 ///     version: Version(5),
 /// };
 /// let p2 = Pointer {
-///     query_id: QueryId(1),
+///     query_id: 1,
 ///     version: Version(10),
 /// };
 /// assert!(p1.has_influence_on_update(p2));
@@ -31,9 +26,9 @@ pub struct Version(pub u64);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Pointer {
-    /// QueryId is a unique identifier for a query.
-    pub query_id: QueryId,
+pub struct Pointer<I> {
+    /// K is a unique identifier for a query.
+    pub query_id: I,
     /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
     pub version: Version,
 }
@@ -45,10 +40,10 @@ pub struct Pointer {
 /// # Examples
 ///
 /// ```
-/// # use whale::{RevisionPointer, Pointer, QueryId, Version, InvalidationRevision};
+/// # use whale::{RevisionPointer, Pointer, Version, InvalidationRevision};
 /// let p1 = RevisionPointer {
 ///     pointer: Pointer {
-///         query_id: QueryId(1),
+///         query_id: 1,
 ///         version: Version(5),
 ///     },
 ///     invalidation_revision: InvalidationRevision(2),
@@ -56,7 +51,7 @@ pub struct Pointer {
 ///
 /// let p2 = RevisionPointer {
 ///     pointer: Pointer {
-///         query_id: QueryId(1),
+///         query_id: 1,
 ///         version: Version(5),
 ///     },
 ///     invalidation_revision: InvalidationRevision(3),
@@ -68,14 +63,14 @@ pub struct Pointer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // Important! This does not have `reason` because it is unknown at some point, and it is not needed for equality check.
-pub struct RevisionPointer {
-    /// Pointer is a pair of `QueryId` and `Version`.
-    pub pointer: Pointer,
+pub struct RevisionPointer<I> {
+    /// Pointer is a pair of `K` and `Version`.
+    pub pointer: Pointer<I>,
     /// InvalidationRevision is a query-local monotonically increasing number.
     pub invalidation_revision: InvalidationRevision,
 }
 
-impl RevisionPointer {
+impl<I: PartialEq> RevisionPointer<I> {
     /// Returns true if this pointer can be uninvalidated by the other pointer.
     pub fn can_restore(&self, other: &Self) -> bool {
         self.pointer == other.pointer
@@ -90,7 +85,7 @@ impl RevisionPointer {
     }
 }
 
-impl Pointer {
+impl<I: PartialEq> Pointer<I> {
     /// Returns true if this pointer should be invalidated if the other pointer is updated.
     pub fn has_influence_on_update(&self, update: Self) -> bool {
         assert!(self.query_id == update.query_id);

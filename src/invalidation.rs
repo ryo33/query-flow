@@ -2,20 +2,24 @@ use crate::RevisionPointer;
 
 /// Invalidation is a record why a query is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Invalidation {
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Invalidation<I> {
     /// Source is the pointer that causes this query to be invalidated.
-    pub source: RevisionPointer,
+    pub source: RevisionPointer<I>,
     /// Revision pointer to a dependency that is invalidated.
-    pub dependency: RevisionPointer,
+    pub dependency: RevisionPointer<I>,
     /// Reason is the reason why this query is invalidated.
     pub reason: InvalidationReason,
 }
 
-impl Invalidation {
+impl<I> Invalidation<I> {
     /// Create a new invalidation as source.
-    pub fn new_source(source: RevisionPointer, reason: InvalidationReason) -> Self {
+    pub fn new_source(source: RevisionPointer<I>, reason: InvalidationReason) -> Self
+    where
+        I: Clone,
+    {
         Self {
-            source,
+            source: source.clone(),
             dependency: source,
             reason,
         }
@@ -24,6 +28,7 @@ impl Invalidation {
 
 /// InvalidatedReason is a reason why a query is invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum InvalidationReason {
     /// Invalidated is a reason why a query is invalidated by another query is invalidated.
     DependencyInvalidated,

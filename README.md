@@ -40,16 +40,16 @@ The system seamlessly supports a mixture of:
 
 The main API functionalities are:
 
-- **Get a node**: `runtime.get(query_id: QueryId) -> Option<Node>`
+- **Get a node**: `runtime.get(query_id: K) -> Option<Node>`
   Returns the node of the query. The node contains version, dependencies, dependents, and invalidation states.
 
-- **Iterate over all nodes**: `runtime.keys() -> Vec<QueryId>`
+- **Iterate over all nodes**: `runtime.keys() -> Vec<K>`
   Returns all query IDs in the runtime.
 
-- **Registering Dependencies**: `runtime.register(query_id: QueryId, dependencies: Vec<Pointer>, collector: &mut impl InvalidationCollector) -> QueryRegistrationResult`
+- **Registering Dependencies**: `runtime.register(query_id: K, dependencies: Vec<Pointer>, collector: &mut impl InvalidationCollector) -> QueryRegistrationResult`
   Registers a new version of a query with its dependencies. This effectively manages pairs of query_id and version, and invalidates the dependents of the previous version. Returns both the new and old nodes.
 
-- **Updating Dependencies**: `runtime.update_dependencies(query_id: QueryId, dependencies: Vec<Pointer>, collector: &mut impl InvalidationCollector) -> QueryRegistrationResult`
+- **Updating Dependencies**: `runtime.update_dependencies(query_id: K, dependencies: Vec<Pointer>, collector: &mut impl InvalidationCollector) -> QueryRegistrationResult`
   Similar to `register`, but does not invalidate the dependents of the previous version. Used when a query is invalidated and recalculated with the same result but different dependencies.
 
 - **Uninvalidating a node**: `runtime.uninvalidate(revision_pointer: RevisionPointer, collector: &mut impl InvalidationCollector, uninvalidation_collector: &mut impl UninvalidationCollector)`
@@ -58,13 +58,13 @@ The main API functionalities are:
 - **Removing an invalidator**: `runtime.remove_invalidator(pointer: Pointer, revision_pointer: RevisionPointer, collector: &mut impl InvalidationCollector, uninvalidation_collector: &mut impl UninvalidationCollector)`
   Removes an invalidation reason from a revision state. Used when a query was invalidated by a dependency but confirmed not to need recomputation.
 
-- **Removing a node**: `runtime.remove(query_id: QueryId, collector: &mut impl InvalidationCollector) -> QueryRemovalResult`
+- **Removing a node**: `runtime.remove(query_id: K, collector: &mut impl InvalidationCollector) -> QueryRemovalResult`
   Removes a node from the runtime. If the node has dependents, they will be marked as invalidated.
 
-- **Detecting a cycle**: `runtime.has_cycle(query_id: QueryId) -> bool`
+- **Detecting a cycle**: `runtime.has_cycle(query_id: K) -> bool`
   Detects a cycle in the dependency graph. The system remains functional even with cycles present.
 
-- **Freeing an unused node**: `runtime.remove_if_unused(query_id: QueryId) -> Option<Node>`
+- **Freeing an unused node**: `runtime.remove_if_unused(query_id: K) -> Option<Node>`
   Removes a node from the runtime if it is not depended on by any other queries. Useful for manual garbage collection.
 
 ## Architecture

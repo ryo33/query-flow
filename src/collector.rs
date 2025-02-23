@@ -1,9 +1,13 @@
 use crate::{Invalidation, Pointer, RevisionPointer};
 
 /// A trait for collecting and give strategy for invalidation propagation.
-pub trait InvalidationCollector {
+pub trait InvalidationCollector<I> {
     /// Collect invalidations.
-    fn notify(&mut self, target: Pointer, invalidation: Invalidation) -> InvalidationPropagation;
+    fn notify(
+        &mut self,
+        target: &Pointer<I>,
+        invalidation: &Invalidation<I>,
+    ) -> InvalidationPropagation;
 }
 
 /// InvalidationPropagation is a strategy for invalidation propagation.
@@ -20,8 +24,8 @@ pub enum InvalidationPropagation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NoopInvalidationCollector;
 
-impl InvalidationCollector for NoopInvalidationCollector {
-    fn notify(&mut self, _: Pointer, _: Invalidation) -> InvalidationPropagation {
+impl<I> InvalidationCollector<I> for NoopInvalidationCollector {
+    fn notify(&mut self, _: &Pointer<I>, _: &Invalidation<I>) -> InvalidationPropagation {
         InvalidationPropagation::DoNotPropagate
     }
 }
@@ -30,36 +34,47 @@ impl InvalidationCollector for NoopInvalidationCollector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PropagateInvalidationCollector;
 
-impl InvalidationCollector for PropagateInvalidationCollector {
-    fn notify(&mut self, _: Pointer, _: Invalidation) -> InvalidationPropagation {
+impl<I> InvalidationCollector<I> for PropagateInvalidationCollector {
+    fn notify(&mut self, _: &Pointer<I>, _: &Invalidation<I>) -> InvalidationPropagation {
         InvalidationPropagation::Propagate
     }
 }
 
 /// A collector that collects all invalidations into a Vec.
-pub struct VecInvalidationCollector {
-    invalidations: Vec<Invalidation>,
+pub struct VecInvalidationCollector<I> {
+    invalidations: Vec<Invalidation<I>>,
 }
 
-impl InvalidationCollector for VecInvalidationCollector {
-    fn notify(&mut self, _: Pointer, invalidation: Invalidation) -> InvalidationPropagation {
-        self.invalidations.push(invalidation);
+impl<I> InvalidationCollector<I> for VecInvalidationCollector<I>
+where
+    I: Clone,
+{
+    fn notify(
+        &mut self,
+        _: &Pointer<I>,
+        invalidation: &Invalidation<I>,
+    ) -> InvalidationPropagation {
+        self.invalidations.push(invalidation.clone());
         InvalidationPropagation::Propagate
     }
 }
 
 /// A trait for collecting and give strategy for uninvalidation propagation.
-pub trait UninvalidationCollector {
+pub trait UninvalidationCollector<I> {
     /// Notify about an uninvalidation and decide whether to propagate it.
-    fn notify(&mut self, target: Pointer, source: RevisionPointer) -> InvalidationPropagation;
+    fn notify(
+        &mut self,
+        target: &Pointer<I>,
+        source: &RevisionPointer<I>,
+    ) -> InvalidationPropagation;
 }
 
 /// A noop implementation of UninvalidationCollector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NoopUninvalidationCollector;
 
-impl UninvalidationCollector for NoopUninvalidationCollector {
-    fn notify(&mut self, _: Pointer, _: RevisionPointer) -> InvalidationPropagation {
+impl<I> UninvalidationCollector<I> for NoopUninvalidationCollector {
+    fn notify(&mut self, _: &Pointer<I>, _: &RevisionPointer<I>) -> InvalidationPropagation {
         InvalidationPropagation::DoNotPropagate
     }
 }
@@ -68,20 +83,27 @@ impl UninvalidationCollector for NoopUninvalidationCollector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PropagateUninvalidationCollector;
 
-impl UninvalidationCollector for PropagateUninvalidationCollector {
-    fn notify(&mut self, _: Pointer, _: RevisionPointer) -> InvalidationPropagation {
+impl<I> UninvalidationCollector<I> for PropagateUninvalidationCollector {
+    fn notify(&mut self, _: &Pointer<I>, _: &RevisionPointer<I>) -> InvalidationPropagation {
         InvalidationPropagation::Propagate
     }
 }
 
 /// A collector that collects all uninvalidations into a Vec.
-pub struct VecUninvalidationCollector {
-    uninvalidations: Vec<(Pointer, RevisionPointer)>,
+pub struct VecUninvalidationCollector<I> {
+    uninvalidations: Vec<(Pointer<I>, RevisionPointer<I>)>,
 }
 
-impl UninvalidationCollector for VecUninvalidationCollector {
-    fn notify(&mut self, target: Pointer, source: RevisionPointer) -> InvalidationPropagation {
-        self.uninvalidations.push((target, source));
+impl<I> UninvalidationCollector<I> for VecUninvalidationCollector<I>
+where
+    I: Clone,
+{
+    fn notify(
+        &mut self,
+        target: &Pointer<I>,
+        source: &RevisionPointer<I>,
+    ) -> InvalidationPropagation {
+        self.uninvalidations.push((target.clone(), source.clone()));
         InvalidationPropagation::Propagate
     }
 }

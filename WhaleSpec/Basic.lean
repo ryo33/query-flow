@@ -50,6 +50,7 @@ structure Node where
   deriving Repr
 
 /-- Runtime state: manages the dependency graph -/
+@[ext]
 structure Runtime (N : Nat) where
   nodes : QueryId → Option Node
   revision : Fin N → RevisionCounter

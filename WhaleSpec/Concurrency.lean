@@ -27,10 +27,7 @@ theorem runtime_ext {N : Nat} (rt1 rt2 : Runtime N)
     (hnodes : rt1.nodes = rt2.nodes)
     (hrev : rt1.revision = rt2.revision) :
     rt1 = rt2 := by
-  cases rt1; cases rt2
-  simp only at hnodes hrev
-  subst hnodes hrev
-  rfl
+  ext <;> simp_all
 
 /-- markVerified on different nodes commutes
     This is the key property for lock-free concurrent updates -/
@@ -63,10 +60,8 @@ theorem markVerified_commute {N : Nat} (rt : Runtime N)
         markVerified_other_unchanged rt qid1 q atRev hne'
       exact markVerified_result_eq (markVerified rt qid1 atRev) rt q atRev heq
     · -- q ≠ qid1, q ≠ qid2: both sides equal rt.nodes q
-      rw [markVerified_other_unchanged _ qid2 q atRev hq2]
-      rw [markVerified_other_unchanged _ qid1 q atRev hq1]
-      rw [markVerified_other_unchanged _ qid1 q atRev hq1]
-      rw [markVerified_other_unchanged _ qid2 q atRev hq2]
+      simp only [markVerified_other_unchanged _ qid2 q atRev hq2,
+                 markVerified_other_unchanged _ qid1 q atRev hq1]
   · -- revision equality: markVerified doesn't change revision
     simp only [markVerified_preserves_revision]
 
@@ -136,7 +131,7 @@ def fetchMax (current proposed : Nat) : Nat × Nat :=
 theorem fetchMax_value_idempotent (v1 v2 : Nat) :
     (fetchMax (fetchMax v1 v2).1 v2).1 = (fetchMax v1 v2).1 := by
   unfold fetchMax
-  omega
+  simp only [Nat.max_assoc, Nat.max_self]
 
 /-- fetch_max is monotonic -/
 theorem fetchMax_monotone (current proposed : Nat) :
@@ -152,7 +147,7 @@ theorem fetchMax_preserves_max (current proposed : Nat) :
 theorem fetchMax_comm (a b c : Nat) :
     (fetchMax (fetchMax a b).1 c).1 = (fetchMax (fetchMax a c).1 b).1 := by
   unfold fetchMax
-  omega
+  simp only [Nat.max_comm, Nat.max_left_comm]
 
 /-- Abstract fetch_add operation -/
 def fetchAdd (current delta : Nat) : Nat × Nat :=

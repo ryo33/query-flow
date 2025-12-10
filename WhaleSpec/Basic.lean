@@ -826,8 +826,11 @@ theorem register_preserves_wellFormed {N : Nat} (rt : Runtime N) (qid : QueryId)
     subst hq
     have hwf' := register_wellformed rt qid' dur deps
     cases hreg : (rt.register qid' dur deps).1.nodes qid' with
-    | none => trivial
+    | none =>
+      -- Goal reduces to True via match on none
+      trivial
     | some node' =>
+      -- hwf' has same match structure, reduces to node'.durability < N
       simp only [hreg] at hwf'
       exact hwf'
   · -- qid' ≠ qid: node unchanged
@@ -852,13 +855,13 @@ theorem confirmUnchanged_preserves_wellFormed {N : Nat} (rt : Runtime N)
       simp only [hnode]
     | some node =>
       have hwf_qid := hwf qid'
-      unfold Runtime.wellFormed at hwf
       simp only [hnode] at hwf_qid
       -- The durability must be < N by wellFormed
       unfold confirmUnchanged
       simp only [hnode]
       by_cases hdur : node.durability < N
-      · simp only [hdur, dite_true, ite_true]
+      · -- simp closes goal with hdur : node.durability < N
+        simp only [hdur, dite_true, ite_true]
       · exact absurd hwf_qid hdur
   · -- qid' ≠ qid: node unchanged
     have hother := confirmUnchanged_other_unchanged rt qid qid' newDeps hq
@@ -882,13 +885,13 @@ theorem confirmChanged_preserves_wellFormed {N : Nat} (rt : Runtime N)
       simp only [hnode]
     | some node =>
       have hwf_qid := hwf qid'
-      unfold Runtime.wellFormed at hwf
       simp only [hnode] at hwf_qid
       -- The durability must be < N by wellFormed
       unfold confirmChanged
       simp only [hnode]
       by_cases hdur : node.durability < N
-      · simp only [hdur, dite_true, ite_true]
+      · -- simp closes goal with hdur : node.durability < N
+        simp only [hdur, dite_true, ite_true]
       · exact absurd hwf_qid hdur
   · -- qid' ≠ qid: node unchanged
     have hother := confirmChanged_other_unchanged rt qid qid' newDeps hq
@@ -920,61 +923,59 @@ theorem confirmUnchanged_preserves_dependent_validity {N : Nat}
     (hne : dependentId ≠ qid) -- dependent is not the confirmed node itself
     (hvalid_before : isValidAt rt dependentId atRev = true) :
     isValidAt (confirmUnchanged rt qid newDeps) dependentId atRev = true := by
-  -- Dependent's node is unchanged
+  -- Dependent's node is unchanged by confirmUnchanged
   have hother := confirmUnchanged_other_unchanged rt qid dependentId newDeps hne
-  -- Unfold isValidAt and rewrite with unchanged node
-  unfold isValidAt at *
+  -- Keep original hypothesis for reference
+  have hbefore := hvalid_before
+  -- Unfold goal only, rewrite with unchanged node
+  unfold isValidAt
   simp only [hother]
-  -- Now the goal follows from hvalid_before since the relevant parts are all the same
+  -- Analyze the original validity condition
+  unfold isValidAt at hbefore
   cases hdep : rt.nodes dependentId with
   | none =>
-    simp only [hdep] at hvalid_before
-    -- hvalid_before : false = true is absurd
-    exact absurd hvalid_before Bool.false_ne_true
+    simp only [hdep] at hbefore
+    exact absurd hbefore Bool.false_ne_true
   | some depNode =>
-    simp only [hdep] at hvalid_before ⊢
+    simp only [hdep] at hbefore ⊢
     by_cases hdur : depNode.durability < N
-    · simp only [hdur, dite_true] at hvalid_before ⊢
-      -- Now we need to show the validity condition holds
+    · simp only [hdur, dite_true] at hbefore ⊢
       -- Either verifiedAt >= atRev.counters, or all deps unchanged
       by_cases hverified : depNode.verifiedAt ≥ atRev.counters ⟨depNode.durability, hdur⟩
       · simp only [hverified, ite_true]
       · -- Not verified, so deps check must have passed
-        simp only [hverified, ite_false] at hvalid_before ⊢
-        -- For dependencies check:
-        -- - If dep points to qid: changedAt is preserved (confirmUnchanged_preserves_changedAt)
-        -- - If dep points to other: node unchanged (confirmUnchanged_other_unchanged)
-        rw [List.all_eq_true] at hvalid_before ⊢
+        simp only [hverified, ite_false] at hbefore ⊢
+        -- For each dependency:
+        -- - If points to qid: changedAt preserved (confirmUnchanged_preserves_changedAt)
+        -- - Otherwise: node unchanged (confirmUnchanged_other_unchanged)
+        rw [List.all_eq_true] at hbefore ⊢
         intro dep hdep_mem
-        have hbefore := hvalid_before dep hdep_mem
-        -- dep.queryId may be qid or something else
+        have hdep_before := hbefore dep hdep_mem
         by_cases hdep_qid : dep.queryId = qid
-        · -- dep points to qid
+        · -- dep points to qid: use changedAt preservation
           subst hdep_qid
-          -- qid's changedAt is preserved by confirmUnchanged_preserves_changedAt
           cases hqnode : rt.nodes dep.queryId with
           | none =>
-            simp only [hqnode] at hbefore
-            exact absurd hbefore Bool.false_ne_true
+            simp only [hqnode] at hdep_before
+            exact absurd hdep_before Bool.false_ne_true
           | some qidNode =>
             by_cases hqdur : qidNode.durability < N
             · have ⟨n, hn, hca⟩ :=
                 confirmUnchanged_preserves_changedAt rt dep.queryId newDeps qidNode hqnode hqdur
-              simp only [hqnode] at hbefore
+              simp only [hqnode] at hdep_before
               simp only [hn, hca]
-              exact hbefore
-            · -- qidNode.durability >= N means confirmUnchanged returns rt unchanged at dep.queryId
+              exact hdep_before
+            · -- durability >= N: confirmUnchanged leaves node unchanged
               unfold confirmUnchanged
               simp only [hqnode, hqdur, dite_false]
-              simp only [hqnode] at hbefore
-              exact hbefore
-        · -- dep points to some other node
+              simp only [hqnode] at hdep_before
+              exact hdep_before
+        · -- dep points to other node: use other_unchanged
           have hother' := confirmUnchanged_other_unchanged rt qid dep.queryId newDeps hdep_qid
           simp only [hother']
-          exact hbefore
-    · simp only [hdur, dite_false] at hvalid_before
-      -- hvalid_before : false = true is absurd
-      exact absurd hvalid_before Bool.false_ne_true
+          exact hdep_before
+    · simp only [hdur, dite_false] at hbefore
+      exact absurd hbefore Bool.false_ne_true
 
 /-- Multi-level: If nodes A and B are valid, and we confirmUnchanged on C (distinct from A and B),
     both A and B remain valid -/

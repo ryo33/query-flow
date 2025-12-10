@@ -9,3 +9,7 @@
 !README.md
 
 /target
+/.lake
+
+!lakefile.toml
+!*.lean

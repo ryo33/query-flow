@@ -67,6 +67,22 @@ theorem markVerified_commute {N : Nat} (rt : Runtime N)
 
 end Commutativity
 
+/-! ## Non-interference: confirmUnchanged -/
+
+section ConfirmNonInterference
+
+/-- If `confirmUnchanged` succeeds, it does not change an unrelated node that is not in the new deps list. -/
+theorem confirmUnchanged_preserves_other_node {N : Nat} (rt : Runtime N)
+    (qid other : QueryId) (newDeps : List QueryId)
+    (hne : other ≠ qid) (hnot : other ∉ newDeps) :
+    match confirmUnchanged rt qid newDeps with
+    | .ok rt' => rt'.nodes other = rt.nodes other
+    | .error _ => True := by
+  simpa using (Whale.confirmUnchanged_other_unchanged (rt := rt) (qid := qid) (other := other)
+    (newDeps := newDeps) hne hnot)
+
+end ConfirmNonInterference
+
 /-! ## Level 1: Idempotency -/
 
 section Idempotency
@@ -90,27 +106,16 @@ theorem markVerified_idempotent {N : Nat} (rt : Runtime N)
         rw [markVerified_none (markVerified rt q atRev) q atRev h1]
         exact h1.symm
       | some node =>
-        -- When node exists, check durability
-        by_cases hdur : node.durability < N
-        · -- durability < N
-          have h1 : (markVerified rt q atRev).nodes q = some { node with
-              verifiedAt := max node.verifiedAt (atRev.counters ⟨node.durability, hdur⟩) } := by
-            rw [markVerified_at_target rt q atRev node hnode]; simp only [hdur, dite_true]
-          rw [markVerified_at_target (markVerified rt q atRev) q atRev _ h1]
-          rw [markVerified_at_target rt q atRev node hnode]
-          simp only [hdur, dite_true]
-          -- max (max a b) b = max a b because max a (max b b) = max a b
-          have hmaxeq : max (max node.verifiedAt (atRev.counters ⟨node.durability, hdur⟩))
-              (atRev.counters ⟨node.durability, hdur⟩) =
-              max node.verifiedAt (atRev.counters ⟨node.durability, hdur⟩) := by
-            rw [Nat.max_assoc]; simp only [Nat.max_self]
-          simp only [hmaxeq]
-        · -- durability >= N
-          have h1 : (markVerified rt q atRev).nodes q = some node := by
-            rw [markVerified_at_target rt q atRev node hnode]
-            simp only [hdur, dite_false]
-          rw [markVerified_at_target (markVerified rt q atRev) q atRev node h1]
-          rw [markVerified_at_target rt q atRev node hnode]
+        -- With `durability : Fin N`, there is no "invalid durability" branch.
+        have h1 :
+            (markVerified rt q atRev).nodes q =
+              some { node with verifiedAt := max node.verifiedAt (atRev.counters node.durability) } := by
+          simpa using (markVerified_at_target rt q atRev node hnode)
+        rw [markVerified_at_target (markVerified rt q atRev) q atRev
+              ({ node with verifiedAt := max node.verifiedAt (atRev.counters node.durability) }) h1]
+        rw [markVerified_at_target rt q atRev node hnode]
+        -- max (max a b) b = max a b
+        simp [Nat.max_assoc, Nat.max_self]
     · -- q ≠ qid
       rw [markVerified_other_unchanged _ qid q atRev hq]
   · -- revision

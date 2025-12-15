@@ -433,17 +433,6 @@ abbrev Runtime.registerWithEdges {N : Nat} (rt : Runtime N) (qid : QueryId)
     Except (List QueryId) (Runtime N × RegisterResult) :=
   rt.register qid requestedDurability depIds
 
-/-! ## Well-formedness Conditions -/
-
-/-- Graph well-formedness: all dependency edges have corresponding reverse edges
-    and dependencies must exist (captured by `dependentsConsistent`). -/
-def Runtime.wellFormedGraph {N : Nat} (rt : Runtime N) : Prop :=
-  True
-
-/-- Backwards-compatible alias. -/
-def Runtime.wellFormed {N : Nat} (rt : Runtime N) : Prop :=
-  rt.wellFormedGraph
-
 /-! ## Properties to Prove -/
 
 section BasicProperties
@@ -501,7 +490,8 @@ theorem markVerified_monotone' {N : Nat} (rt : Runtime N) (qid : QueryId)
     ∃ newNode, (markVerified rt qid atRev).nodes qid = some newNode ∧
                node.verifiedAt ≤ newNode.verifiedAt := by
   unfold markVerified
-  simp [hnode, Nat.le_max_left]
+  simp only [hnode, ite_true]
+  exact ⟨_, rfl, Nat.le_max_left _ _⟩
 
 /-- Property: revision counters are non-decreasing after increment -/
 theorem incrementRevision_monotone {N : Nat} (rt : Runtime N) (d : Fin N) (i : Fin N) :
@@ -1465,30 +1455,6 @@ lemma confirmChanged_other_unchanged {N : Nat} (rt : Runtime N)
             = baseNodes other := hupd
         _ = rt.nodes other := hbaseOther
 
-/-- register preserves wellFormed -/
-theorem register_preserves_wellFormed {N : Nat} (rt : Runtime N) (qid : QueryId)
-    (dur : Durability) (deps : List QueryId) (hwf : rt.wellFormed) :
-    match rt.register qid dur deps with
-    | .ok (rt', _) => rt'.wellFormed
-    | .error _ => True := by
-  cases h : rt.register qid dur deps <;> simp [Runtime.wellFormed, Runtime.wellFormedGraph]
-
-/-- confirmUnchanged preserves wellFormed -/
-theorem confirmUnchanged_preserves_wellFormed {N : Nat} (rt : Runtime N)
-    (qid : QueryId) (newDeps : List QueryId) (hwf : rt.wellFormed) :
-    match confirmUnchanged rt qid newDeps with
-    | .ok rt' => rt'.wellFormed
-    | .error _ => True := by
-  cases h : confirmUnchanged rt qid newDeps <;> simp [Runtime.wellFormed, Runtime.wellFormedGraph]
-
-/-- confirmChanged preserves wellFormed -/
-theorem confirmChanged_preserves_wellFormed {N : Nat} (rt : Runtime N)
-    (qid : QueryId) (newDeps : List QueryId) (hwf : rt.wellFormed) :
-    match confirmChanged rt qid newDeps with
-    | .ok (rt', _) => rt'.wellFormed
-    | .error _ => True := by
-  cases h : confirmChanged rt qid newDeps <;> simp [Runtime.wellFormed, Runtime.wellFormedGraph]
-
 end InvariantPreservation
 
 /-! ## Early Cutoff with Dependents -/
@@ -1645,9 +1611,6 @@ end EarlyCutoffDependents
   Global Invariant Preservation (Phase 3):
   - confirmUnchanged_other_unchanged: only modifies target
   - confirmChanged_other_unchanged: only modifies target
-  - register_preserves_wellFormed: register preserves wellFormed
-  - confirmUnchanged_preserves_wellFormed: preserves wellFormed
-  - confirmChanged_preserves_wellFormed: preserves wellFormed
 
   Early Cutoff with Dependents (Phase 4):
   - confirmUnchanged_preserves_changedAt: key early cutoff property

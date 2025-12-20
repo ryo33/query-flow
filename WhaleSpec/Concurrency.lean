@@ -14,6 +14,9 @@
 
 import WhaleSpec.Basic
 
+set_option linter.style.longLine false
+set_option linter.flexible false
+
 namespace Whale.Concurrency
 
 open Whale
@@ -114,8 +117,8 @@ theorem markVerified_idempotent {N : Nat} (rt : Runtime N)
         rw [markVerified_at_target (markVerified rt q atRev) q atRev
               ({ node with verifiedAt := max node.verifiedAt (atRev.counters node.durability) }) h1]
         rw [markVerified_at_target rt q atRev node hnode]
-        -- max (max a b) b = max a b
-        simp [Nat.max_assoc, Nat.max_self]
+        -- max (max a b) b = max a b by associativity and idempotence
+        simp
     · -- q ≠ qid
       rw [markVerified_other_unchanged _ qid q atRev hq]
   · -- revision

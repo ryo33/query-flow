@@ -12,6 +12,9 @@
 import Mathlib.Data.Finset.Basic
 import Mathlib.Tactic
 
+set_option linter.style.longLine false
+set_option linter.flexible false
+
 namespace Whale
 
 /-! ## Basic Types -/
@@ -212,7 +215,6 @@ lemma buildDepRecords_ok_mem_implies_some {N : Nat} (nodes : QueryId → Option 
       match nodes depId with
       | some depNode => (⟨depId, depNode.changedAt⟩ :: acc.1, acc.2)
       | none => (acc.1, depId :: acc.2)
-
   -- Invariant: all deps accumulated so far point to `some` nodes.
   have inv :
       ∀ (ids : List QueryId) (acc : List Dep × List QueryId),
@@ -253,7 +255,6 @@ lemma buildDepRecords_ok_mem_implies_some {N : Nat} (nodes : QueryId → Option 
         have hdep' : dep ∈ (tl.foldl step (step acc depId)).1 := by
           simpa [List.foldl, step, hnode] using hdep
         exact ih (acc := step acc depId) hacc' dep hdep'
-
   -- Unfold `buildDepRecords` and extract that `depRecords = deps.reverse`.
   unfold buildDepRecords at hok
   -- name the fold result
@@ -273,13 +274,13 @@ lemma buildDepRecords_ok_mem_implies_some {N : Nat} (nodes : QueryId → Option 
     have hmemDeps : dep ∈ deps := by simpa using (List.mem_reverse.mp hmemRev)
     -- relate `deps` to the fold result and apply `inv` with empty initial accumulator.
     have hdepsEq : (depIds.foldl step ([], [])).1 = deps := by
-      simpa [hfold] using (congrArg Prod.fst hfold)
+      simp [hfold]
     have hmemFold : dep ∈ (depIds.foldl step ([], [])).1 := by
       simpa [hdepsEq] using hmemDeps
     -- base accumulator has no deps
     have hbase : ∀ dep, dep ∈ ([] : List Dep) → ∃ depNode, nodes dep.queryId = some depNode := by
       intro dep h; cases h
-    exact inv depIds ([], []) (by simpa using hbase) dep hmemFold
+    exact inv depIds ([], []) (by simp) dep hmemFold
 
 /-- If `buildDepRecords` succeeds, every `Dep.queryId` comes from the requested `depIds`. -/
 lemma buildDepRecords_ok_mem_queryId_mem {N : Nat} (nodes : QueryId → Option (Node N))
@@ -349,9 +350,10 @@ lemma buildDepRecords_ok_mem_queryId_mem {N : Nat} (nodes : QueryId → Option (
       intro dep h; cases h
     have hmemFold : dep ∈ (depIds.foldl step ([], [])).1 := by
       have : (depIds.foldl step ([], [])).1 = deps := by
-        simpa [hfold] using (congrArg Prod.fst hfold)
-      simpa [this] using hmemDeps
-    exact inv depIds ([], []) (by intro x hx; exact hx) (by simpa using hbase) dep hmemFold
+        simp [hfold]
+      simp only [this]
+      exact hmemDeps
+    exact inv depIds ([], []) (by intro x hx; exact hx) (by simp) dep hmemFold
 
 /-- Add qid to the dependents list of all its dependencies
     This maintains the bidirectional consistency of the graph structure -/
@@ -445,7 +447,7 @@ theorem markVerified_other_unchanged {N : Nat} (rt : Runtime N) (qid other : Que
   cases hnode : rt.nodes qid with
   | none => rfl
   | some node =>
-    simp [hnode, hne]
+    simp [hne]
 
 /-- Property: markVerified preserves revision counters -/
 theorem markVerified_preserves_revision {N : Nat} (rt : Runtime N) (qid : QueryId)
@@ -455,7 +457,7 @@ theorem markVerified_preserves_revision {N : Nat} (rt : Runtime N) (qid : QueryI
   cases hnode : rt.nodes qid with
   | none => rfl
   | some node =>
-    simp [hnode]
+    simp
 
 /-- Property: markVerified preserves node absence at target -/
 theorem markVerified_none {N : Nat} (rt : Runtime N) (qid : QueryId)
@@ -585,9 +587,9 @@ theorem register_other_unchanged {N : Nat} (rt : Runtime N) (qid other : QueryId
   unfold Runtime.registerCore
   cases hbd : buildDepRecords rt.nodes deps with
   | error missing =>
-    simp [hbd]
+    simp
   | ok depRecords =>
-    simp [hbd, hne, incrementRevision_preserves_nodes]
+    simp [hne, incrementRevision_preserves_nodes]
 
 /-- Register produces well-formed node -/
 theorem register_wellformed {N : Nat} (rt : Runtime N) (qid : QueryId)
@@ -601,9 +603,9 @@ theorem register_wellformed {N : Nat} (rt : Runtime N) (qid : QueryId)
   unfold Runtime.registerCore
   cases hbd : buildDepRecords rt.nodes deps with
   | error missing =>
-    simp [hbd]
+    simp
   | ok depRecords =>
-    simp [hbd]
+    simp
 
 /-! ### updateGraphEdges Properties -/
 
@@ -703,18 +705,17 @@ lemma isValidAt_updateGraphEdgesStep {N : Nat} (rt : Runtime N) (qid : QueryId) 
                   have h := hallTrue dep hmem
                   simpa [hpoint dep] using h
                 have hg : (node.dependencies).all g = true := (List.all_eq_true).2 hallTrue'
-                simp [hf, hg]
+                simp [hg]
               | false =>
                 rcases (List.all_eq_false).1 hf with ⟨dep, hmem, hfail⟩
                 have hfail' : g dep = false := by
                   simpa [hpoint dep] using hfail
                 have hg : (node.dependencies).all g = false :=
-                  (List.all_eq_false).2 ⟨dep, hmem, by simpa [hfail']⟩
-                simp [hf, hg]
+                  (List.all_eq_false).2 ⟨dep, hmem, by simp [hfail']⟩
+                simp [hg]
             simpa [f, g] using hall'
           simp [updateGraphEdgesStep, hd, hmem, hall]
-        ·
-          -- node at `x` is unchanged, but the nodes map at `d.queryId` changes only in `dependents`;
+        · -- node at `x` is unchanged, but the nodes map at `d.queryId` changes only in `dependents`;
           -- `isValidAt` only looks at `changedAt`, so the deps check is unchanged.
           have hall :
               (node.dependencies).all (fun (dep : Dep) =>
@@ -754,14 +755,14 @@ lemma isValidAt_updateGraphEdgesStep {N : Nat} (rt : Runtime N) (qid : QueryId) 
                   have h := hallTrue dep hmem
                   simpa [hpoint dep] using h
                 have hg : (node.dependencies).all g = true := (List.all_eq_true).2 hallTrue'
-                simp [hf, hg]
+                simp [hg]
               | false =>
                 rcases (List.all_eq_false).1 hf with ⟨dep, hmem, hfail⟩
                 have hfail' : g dep = false := by
                   simpa [hpoint dep] using hfail
                 have hg : (node.dependencies).all g = false :=
-                  (List.all_eq_false).2 ⟨dep, hmem, by simpa [hfail']⟩
-                simp [hf, hg]
+                  (List.all_eq_false).2 ⟨dep, hmem, by simp [hfail']⟩
+                simp [hg]
             simpa [f, g] using hall'
           simp [updateGraphEdgesStep, hx, hd, hmem, hxkey, hall]
 
@@ -871,9 +872,7 @@ lemma updateGraphEdgesStep_preserves_dependents_subset {N : Nat} (qid target : Q
   | some depNode =>
     by_cases hmem : qid ∈ depNode.dependents
     · -- no change
-      exact ⟨n, by
-              simp [hns, hmem] at *
-              exact hn,
+      exact ⟨n, by simp_all,
             by intro x hx; exact hx⟩
     · -- adds `qid` at d.queryId
       by_cases htarget : target = d.queryId
@@ -884,13 +883,13 @@ lemma updateGraphEdgesStep_preserves_dependents_subset {N : Nat} (qid target : Q
             exact Eq.trans (by symm; exact hn) hns
           exact Option.some.inj this
         refine ⟨{ n with dependents := qid :: n.dependents }, ?_, ?_⟩
-        · simp [hns, hmem, hn, hnEq]
+        · simp [hmem, hnEq]
         · intro x hx
           -- old members remain after cons
           exact List.mem_cons_of_mem _ hx
       · -- different key, unchanged
         refine ⟨n, ?_, ?_⟩
-        · simp [hns, hmem, htarget, hn]
+        · simp [hmem, htarget, hn]
         · intro x hx; exact hx
 
 /-- foldl of updateGraphEdgesStep preserves all existing dependents (subset) -/
@@ -931,9 +930,7 @@ lemma updateGraphEdgesStep_preserves_dependencies {N : Nat} (qid target : QueryI
     exact ⟨n, by simpa [hns] using hn, rfl⟩
   | some depNode =>
     by_cases hmem : qid ∈ depNode.dependents
-    · exact ⟨n, by
-              simp [hns, hmem] at *
-              exact hn, rfl⟩
+    · exact ⟨n, by simp_all, rfl⟩
     · by_cases htarget : target = d.queryId
       · subst htarget
         have hnEq : n = depNode := by
@@ -941,10 +938,10 @@ lemma updateGraphEdgesStep_preserves_dependencies {N : Nat} (qid target : QueryI
             exact Eq.trans (by symm; exact hn) hns
           exact Option.some.inj this
         refine ⟨{ n with dependents := qid :: n.dependents }, ?_, ?_⟩
-        · simp [hns, hmem, hn, hnEq]
+        · simp [hmem, hnEq]
         · rfl
       · refine ⟨n, ?_, rfl⟩
-        · simp [hns, hmem, htarget, hn]
+        · simp [hmem, htarget, hn]
 
 /-- updateGraphEdges does not change the dependencies list of any existing node. -/
 lemma updateGraphEdges_preserves_dependencies {N : Nat} (qid target : QueryId)
@@ -955,7 +952,7 @@ lemma updateGraphEdges_preserves_dependencies {N : Nat} (qid target : QueryId)
   -- foldl induction
   induction deps generalizing ns n with
   | nil =>
-    simp [List.foldl] at *
+    simp only [List.foldl]
     exact ⟨n, hn, rfl⟩
   | cons hd tl ih =>
     simp only [List.foldl_cons]
@@ -1128,9 +1125,7 @@ theorem isValidAt_false_reason {N : Nat} (rt : Runtime N) (qid : QueryId)
         | none => false
         | some depNode => !decide (depNode.changedAt > dep.observedChangedAt)
     by_cases hverified : node.verifiedAt ≥ atRev.counters node.durability
-    · have : (true : Bool) = false := by
-        simpa [hnode, hverified] using hinvalid
-      cases this
+    · simp [hnode, hverified] at hinvalid
     · have hallFalse : node.dependencies.all f = false := by
         simpa [hnode, hverified, f] using hinvalid
       refine ⟨node, rfl, Nat.lt_of_not_ge hverified, ?_⟩
@@ -1146,16 +1141,14 @@ theorem isValidAt_false_reason {N : Nat} (rt : Runtime N) (qid : QueryId)
         have hdec : decide (depNode.changedAt > dep.observedChangedAt) = true := by
           cases h : decide (depNode.changedAt > dep.observedChangedAt) with
           | false =>
-            have : (true : Bool) = false := by
-              simpa [h] using hcheck'
-            cases this
+            simp [h] at hcheck'
           | true =>
             rfl
         have hgt : depNode.changedAt > dep.observedChangedAt :=
           of_decide_eq_true hdec
         right
         refine ⟨depNode, ?_, hgt⟩
-        simpa [hdepNode]
+        simp
 
 /-- If dependencies haven't changed, node can be valid (original ambiguous version) -/
 theorem isValidAt_deps_unchanged {N : Nat} (rt : Runtime N) (qid : QueryId)
@@ -1254,7 +1247,7 @@ theorem confirmUnchanged_preserves_changedAt {N : Nat}
   simp [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
   | error missing =>
-    simp [hbd]
+    simp
   | ok newDepRecords =>
     -- `updateGraphEdges` may change `dependents`, but never changes `changedAt`.
     -- Build the base node update first.
@@ -1289,7 +1282,7 @@ theorem confirmChanged_updates_changedAt {N : Nat}
   simp [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
   | error missing =>
-    simp [hbd]
+    simp
   | ok newDepRecords =>
     let d : Fin N := node.durability
     let (rt', newRev) := rt.incrementRevision d
@@ -1321,9 +1314,9 @@ theorem confirmChanged_increases_rev {N : Nat}
   unfold confirmChanged
   cases hbd : buildDepRecords rt.nodes newDeps with
   | error missing =>
-    simp [hnode, hbd]
+    simp [hnode]
   | ok newDepRecords =>
-    simp [hnode, hbd, incrementRevision_returns_new]
+    simp [hnode, incrementRevision_returns_new]
 
 /-- Early cutoff theorem: If a node's value doesn't change (confirmUnchanged),
     any dependent that observed the old changedAt will still see the same changedAt,
@@ -1339,7 +1332,7 @@ theorem early_cutoff_preserves_observation {N : Nat}
   simp [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
   | error missing =>
-    simp [hbd]
+    simp
   | ok newDepRecords =>
     let d : Fin N := node.durability
     let currentRev := rt.revision d
@@ -1361,7 +1354,7 @@ theorem early_cutoff_preserves_observation {N : Nat}
       have : n'.changedAt = node.changedAt := by
         -- qidNode.changedAt = node.changedAt by construction
         exact Eq.trans hchg (by simp [qidNode])
-      simpa [hobs, this]
+      simp [hobs, this]
 
 end EarlyCutoff
 
@@ -1382,11 +1375,11 @@ lemma confirmUnchanged_other_unchanged {N : Nat} (rt : Runtime N)
   cases hnode : rt.nodes qid with
   | none =>
     -- `confirmUnchanged` is a no-op
-    simp [hnode]
+    simp
   | some node =>
     cases hbd : buildDepRecords rt.nodes newDeps with
     | error missing =>
-      simp [hnode, hbd]
+      simp
     | ok newDepRecords =>
       let baseNodes : QueryId → Option (Node N) :=
         fun q =>
@@ -1404,7 +1397,6 @@ lemma confirmUnchanged_other_unchanged {N : Nat} (rt : Runtime N)
         exact fun heq => hnot (by simpa [heq] using hqid_mem)
       have hupd : updateGraphEdges baseNodes qid newDepRecords other = baseNodes other :=
         updateGraphEdges_other_unchanged baseNodes qid other newDepRecords hother
-      simp [hnode, hbd, baseNodes]
       -- reduce to the `calc` chain
       calc
         updateGraphEdges baseNodes qid newDepRecords other
@@ -1423,11 +1415,11 @@ lemma confirmChanged_other_unchanged {N : Nat} (rt : Runtime N)
   unfold confirmChanged
   cases hnode : rt.nodes qid with
   | none =>
-    simp [hnode]
+    simp
   | some node =>
     cases hbd : buildDepRecords rt.nodes newDeps with
     | error missing =>
-      simp [hnode, hbd]
+      simp
     | ok newDepRecords =>
       -- For `other ≠ qid`, the baseNodes agrees with `rt'.nodes` at `other`, and `rt'.nodes = rt.nodes`.
       let p := rt.incrementRevision node.durability
@@ -1449,7 +1441,6 @@ lemma confirmChanged_other_unchanged {N : Nat} (rt : Runtime N)
         exact fun heq => hnot (by simpa [heq] using hqid_mem)
       have hupd : updateGraphEdges baseNodes qid newDepRecords other = baseNodes other :=
         updateGraphEdges_other_unchanged baseNodes qid other newDepRecords hother
-      simp [hnode, hbd, p, rt', newRev, baseNodes]
       calc
         updateGraphEdges baseNodes qid newDepRecords other
             = baseNodes other := hupd
@@ -1469,13 +1460,13 @@ lemma confirmUnchanged_preserves_revision {N : Nat} (rt : Runtime N)
     | .error _ => True := by
   unfold confirmUnchanged
   cases hnode : rt.nodes qid with
-  | none => simp [hnode]
+  | none => simp
   | some node =>
     cases hbd : buildDepRecords rt.nodes newDeps with
     | error missing =>
-      simp [hnode, hbd]
+      simp
     | ok newDepRecords =>
-      simp [hnode, hbd]
+      simp
 
 /-- If dependent was valid before confirmUnchanged, it stays valid after -/
 theorem confirmUnchanged_preserves_dependent_validity {N : Nat}
@@ -1494,7 +1485,7 @@ theorem confirmUnchanged_preserves_dependent_validity {N : Nat}
   | some qidNode =>
     cases hbd : buildDepRecords rt.nodes newDeps with
     | error missing =>
-      simp [hqnode, hbd]
+      simp
     | ok newDepRecords =>
       let d : Fin N := qidNode.durability
       let currentRev := rt.revision d
@@ -1502,7 +1493,7 @@ theorem confirmUnchanged_preserves_dependent_validity {N : Nat}
       let baseNodes := fun q => if q = qid then some newNode else rt.nodes q
       let finalNodes := updateGraphEdges baseNodes qid newDepRecords
       -- reduce the top-level `match` to the successful branch
-      simp [hqnode, hbd, d, currentRev, newNode, baseNodes, finalNodes]
+      simp
       -- `isValidAt` is invariant under `updateGraphEdges` (it only touches `dependents`)
       have hvalid_eq :
           isValidAt (rt := ⟨finalNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev =
@@ -1526,7 +1517,7 @@ theorem confirmUnchanged_preserves_dependent_validity {N : Nat}
         -- verified case: immediate
         by_cases hverified : depNode.verifiedAt ≥ atRev.counters depNode.durability
         · simp [hverified]
-        · simp only [hverified, ite_false] at hbefore ⊢
+        · simp only [hverified] at hbefore ⊢
           have hbeforeAll :
               depNode.dependencies.all (fun dep =>
                 match rt.nodes dep.queryId with
@@ -1559,16 +1550,14 @@ theorem multi_level_early_cutoff {N : Nat} (rt : Runtime N)
     | .error _ => True := by
   cases hcu : confirmUnchanged rt c newDeps with
   | error missing =>
-    simp [hcu]
+    simp
   | ok rt' =>
     constructor
-    ·
-      have ha :=
+    · have ha :=
         confirmUnchanged_preserves_dependent_validity
           (rt := rt) (qid := c) (dependentId := a) (newDeps := newDeps) (atRev := atRev) hac hvalid_a
       simpa [hcu] using ha
-    ·
-      have hb :=
+    · have hb :=
         confirmUnchanged_preserves_dependent_validity
           (rt := rt) (qid := c) (dependentId := b) (newDeps := newDeps) (atRev := atRev) hbc hvalid_b
       simpa [hcu] using hb

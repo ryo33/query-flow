@@ -1,174 +1,165 @@
+//! Node and dependency types for the Whale incremental computation system.
+//!
+//! This module defines the core data structures for representing nodes
+//! in the dependency graph, following the Lean4 formal specification.
+
 use std::sync::Arc;
 
-use crate::{Invalidation, InvalidationRevision, Pointer, RevisionPointer, Version};
+use crate::revision::{Durability, RevisionCounter};
 
-/// Node is a data structure that represents a state of a query, and it is managed by the runtime.
+/// Dependency record: tracks which query we depend on and
+/// what its `changed_at` was when we observed it.
 ///
-/// Clone is cheap as vectors are wrapped by `Arc`.
+/// This captures the state of a dependency at the time the observation was made,
+/// allowing us to detect whether the dependency has changed since then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Node<K, T> {
-    /// K is a unique identifier for a query.
-    pub id: K,
-    /// A user-provided data for this node. This should be cheap to clone.
-    pub data: T,
-    /// Version is a monotonically increasing number when a result of a query is changed. Note that this does not increase one by one.
-    pub version: Version,
-    /// InvalidationRevision is a query-local monotonically increasing number.
-    pub invalidation_revision: InvalidationRevision,
-    /// Dependencies is a list of pointers to the queries that this query depends on.
-    pub dependencies: Dependencies<K>,
-    /// Dependents is a list of pointers to the queries that depend on this query.
-    pub dependents: Dependents<K>,
-    /// Invalidations is a list of revision pointers that invalidate this query.
-    pub invalidations: Invalidations<K>,
+pub struct Dep<K> {
+    /// The query ID of the dependency.
+    pub query_id: K,
+    /// The `changed_at` value of the dependency when we observed it.
+    pub observed_changed_at: RevisionCounter,
 }
 
-impl<K, T> Node<K, T>
+/// Node in the dependency graph.
+///
+/// Each node represents a query with its current state, including:
+/// - When it was last verified and changed
+/// - Its durability level
+/// - Its position in the dependency graph (level, dependencies, dependents)
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Node<K, T, const N: usize> {
+    /// Unique identifier for this query.
+    pub id: K,
+    /// User-provided data for this node. Should be cheap to clone.
+    pub data: T,
+    /// Durability level (0 = volatile, N-1 = stable).
+    ///
+    /// A node's durability determines which revision counter is used
+    /// to track its validity. Lower durability means more frequent changes.
+    pub durability: Durability<N>,
+    /// Last revision at which this node was verified.
+    ///
+    /// A node is considered valid if `verified_at >= revision[durability]`,
+    /// meaning it was verified after the last change at its durability level.
+    pub verified_at: RevisionCounter,
+    /// Last revision at which this node's value changed.
+    ///
+    /// Dependents compare this against their `observed_changed_at` to
+    /// determine if they need to recompute.
+    pub changed_at: RevisionCounter,
+    /// Topological level in the dependency graph.
+    ///
+    /// Enforces DAG structure: `level > all(deps.level)`.
+    /// This prevents cycles and enables ordered recomputation.
+    pub level: u32,
+    /// Who this node depends on.
+    pub dependencies: Dependencies<K>,
+    /// Who depends on this node (reverse edges).
+    pub dependents: Dependents<K>,
+}
+
+impl<K, T, const N: usize> Node<K, T, N>
 where
     K: Clone + PartialEq + Eq + std::hash::Hash,
     T: Clone,
 {
-    /// Get a pointer to this query.
-    pub fn pointer(&self) -> Pointer<K> {
-        Pointer {
-            query_id: self.id.clone(),
-            version: self.version,
-        }
-    }
-
-    /// Get a revision pointer to this query.
-    pub fn revision_pointer(&self) -> RevisionPointer<K> {
-        RevisionPointer {
-            pointer: self.pointer(),
-            invalidation_revision: self.invalidation_revision,
-        }
-    }
-
-    /// Returns true if this query is invalidated.
-    pub fn is_invalidated(&self) -> bool {
-        !self.invalidations.is_empty()
-    }
-
-    /// Remove an invalidator from this query.
-    #[must_use]
-    pub fn remove_invalidation(&self, invalidator: RevisionPointer<K>) -> Option<Self> {
-        if self
-            .invalidations
-            .iter()
-            .any(|i| i.dependency.can_restore(&invalidator))
-        {
-            let mut node = self.clone();
-            node.invalidations = node.invalidations.remove_uninvalidated(invalidator);
-            Some(node)
-        } else {
-            None
-        }
-    }
-
-    /// Extend invalidations with a list of revision pointers.
-    pub fn add_invalidations(&mut self, with: Vec<Invalidation<K>>) {
-        let mut invalidations = Vec::clone(&self.invalidations.0);
-        invalidations.extend(with);
-        self.invalidations = Invalidations(Arc::new(invalidations));
-    }
-
-    /// Update the version of a dependency.
-    #[must_use]
-    pub fn update_version_reference(
-        &self,
-        previous: RevisionPointer<K>,
-        new: RevisionPointer<K>,
+    /// Create a new node with the given parameters.
+    pub fn new(
+        id: K,
+        data: T,
+        durability: Durability<N>,
+        verified_at: RevisionCounter,
+        changed_at: RevisionCounter,
+        level: u32,
+        dependencies: Dependencies<K>,
     ) -> Self {
-        let mut dependencies = Vec::clone(&self.dependencies.0);
-        for dependency in dependencies.iter_mut().filter(|p| **p == previous.pointer) {
-            *dependency = new.pointer.clone();
-        }
-        let mut invalidations = Vec::clone(&self.invalidations.0);
-        for invalidation in invalidations
-            .iter_mut()
-            .filter(|i| i.dependency == previous)
-        {
-            invalidation.dependency = new.clone();
-        }
         Self {
-            dependencies: Dependencies(Arc::new(dependencies)),
-            invalidations: Invalidations(Arc::new(invalidations)),
-            ..self.clone()
+            id,
+            data,
+            durability,
+            verified_at,
+            changed_at,
+            level,
+            dependencies,
+            dependents: Dependents::default(),
         }
-    }
-
-    /// Returns true if dependents may be updated from the other old node.
-    pub fn has_updated_version_or_dependents_from(&self, other: &Self) -> bool {
-        // If the version is same and the length of the dependents is same, the dependents are the same because dependents are increasing only and never updated.
-        self.version != other.version || self.dependents.len() != other.dependents.len()
     }
 }
 
-/// Dependencies is a list of pointers to the queries that this query depends on.
+/// Dependencies is a list of dependency records for the queries that this query depends on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Dependencies<K>(Arc<Vec<Pointer<K>>>);
+pub struct Dependencies<K>(Arc<Vec<Dep<K>>>);
 
-impl<K> Dependencies<K>
-where
-    K: Clone + PartialEq,
-{
-    /// New dependencies from a list of pointers.
-    pub fn new(pointers: Vec<Pointer<K>>) -> Self {
-        Dependencies(Arc::new(pointers))
+impl<K> Dependencies<K> {
+    /// Create new dependencies from a list of dependency records.
+    pub fn new(deps: Vec<Dep<K>>) -> Self {
+        Dependencies(Arc::new(deps))
     }
 
-    /// Returns true if this query should be invalidated if the other query is updated.
-    pub fn should_be_invalidated_by(&self, update: Pointer<K>) -> bool {
-        self.0
-            .iter()
-            .any(|p| p.query_id == update.query_id && p.has_influence_on_update(update.clone()))
-    }
-
-    /// Returns true if there are no dependents.
+    /// Returns true if there are no dependencies.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Returns the number of dependents.
+    /// Returns the number of dependencies.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Iterate over the dependents.
-    pub fn iter(&self) -> impl Iterator<Item = &Pointer<K>> + '_ {
+    /// Iterate over the dependencies.
+    pub fn iter(&self) -> impl Iterator<Item = &Dep<K>> + '_ {
         self.0.iter()
     }
 }
 
-impl<K> FromIterator<Pointer<K>> for Dependencies<K> {
-    fn from_iter<T: IntoIterator<Item = Pointer<K>>>(iter: T) -> Self {
+impl<K> FromIterator<Dep<K>> for Dependencies<K> {
+    fn from_iter<I: IntoIterator<Item = Dep<K>>>(iter: I) -> Self {
         Dependencies(Arc::new(iter.into_iter().collect()))
     }
 }
 
-/// Dependents is a list of pointers to the queries that depend on this query.
+/// Dependents is a list of query IDs that depend on this query.
+///
+/// This maintains reverse edges for efficient invalidation propagation
+/// and bidirectional graph consistency.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Dependents<I>(Arc<Vec<Pointer<I>>>);
+pub struct Dependents<K>(Arc<Vec<K>>);
+
+impl<K> Default for Dependents<K> {
+    fn default() -> Self {
+        Dependents(Arc::new(Vec::new()))
+    }
+}
+
+impl<K> Clone for Dependents<K> {
+    fn clone(&self) -> Self {
+        Dependents(self.0.clone())
+    }
+}
 
 impl<K> Dependents<K>
 where
     K: Clone + PartialEq,
 {
+    /// Create new dependents from a list of query IDs.
+    pub fn new(deps: Vec<K>) -> Self {
+        Dependents(Arc::new(deps))
+    }
+
+    /// Returns a new dependents list with the query ID added.
+    ///
+    /// If the query ID already exists, it is not duplicated.
     #[must_use]
-    /// Returns a new dependents with the pointer added.
-    pub(crate) fn added(&self, pointer: Pointer<K>) -> Self {
-        let mut dependents = Vec::clone(&self.0);
-        if let Some(existing) = dependents
-            .iter_mut()
-            .find(|p| p.query_id == pointer.query_id)
-        {
-            existing.version = pointer.version;
-        } else {
-            dependents.push(pointer);
+    pub fn added(&self, qid: K) -> Self {
+        if self.0.contains(&qid) {
+            return self.clone();
         }
+        let mut dependents = Vec::clone(&self.0);
+        dependents.push(qid);
         Dependents(Arc::new(dependents))
     }
 
@@ -183,84 +174,91 @@ where
     }
 
     /// Iterate over the dependents.
-    pub fn iter(&self) -> impl Iterator<Item = &Pointer<K>> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = &K> + '_ {
         self.0.iter()
     }
-}
 
-impl<K> Default for Dependents<K> {
-    fn default() -> Self {
-        Dependents(Default::default())
+    /// Check if the given query ID is in the dependents list.
+    pub fn contains(&self, qid: &K) -> bool {
+        self.0.contains(qid)
     }
 }
 
-impl<K> Clone for Dependents<K> {
-    fn clone(&self) -> Self {
-        Dependents(self.0.clone())
-    }
-}
-
-impl<K> FromIterator<Pointer<K>> for Dependents<K> {
-    fn from_iter<T: IntoIterator<Item = Pointer<K>>>(iter: T) -> Self {
+impl<K> FromIterator<K> for Dependents<K> {
+    fn from_iter<I: IntoIterator<Item = K>>(iter: I) -> Self {
         Dependents(Arc::new(iter.into_iter().collect()))
     }
 }
 
-/// Invalidations is a list of precise pointers that cause this query to be invalidated.
-#[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Invalidations<K>(Arc<Vec<Invalidation<K>>>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl<K> Default for Invalidations<K> {
-    fn default() -> Self {
-        Invalidations(Default::default())
-    }
-}
-
-impl<K> Clone for Invalidations<K> {
-    fn clone(&self) -> Self {
-        Invalidations(self.0.clone())
-    }
-}
-
-impl<K> FromIterator<Invalidation<K>> for Invalidations<K> {
-    fn from_iter<T: IntoIterator<Item = Invalidation<K>>>(iter: T) -> Self {
-        Invalidations(Arc::new(iter.into_iter().collect()))
-    }
-}
-
-impl<K> Invalidations<K>
-where
-    K: Clone + PartialEq,
-{
-    /// Returns true if there are no invalidations.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    #[test]
+    fn test_dep_creation() {
+        let dep: Dep<&str> = Dep {
+            query_id: "test",
+            observed_changed_at: 42,
+        };
+        assert_eq!(dep.query_id, "test");
+        assert_eq!(dep.observed_changed_at, 42);
     }
 
-    /// Returns the number of invalidations.
-    pub fn len(&self) -> usize {
-        self.0.len()
+    #[test]
+    fn test_dependencies() {
+        let deps: Dependencies<&str> = Dependencies::new(vec![
+            Dep {
+                query_id: "a",
+                observed_changed_at: 1,
+            },
+            Dep {
+                query_id: "b",
+                observed_changed_at: 2,
+            },
+        ]);
+
+        assert_eq!(deps.len(), 2);
+        assert!(!deps.is_empty());
+
+        let ids: Vec<_> = deps.iter().map(|d| d.query_id).collect();
+        assert_eq!(ids, vec!["a", "b"]);
     }
 
-    /// Push an invalidation to the list.
-    #[must_use]
-    pub fn pushed(&self, invalidation: Invalidation<K>) -> Self {
-        let mut invalidations = Vec::clone(&self.0);
-        invalidations.push(invalidation);
-        Invalidations(Arc::new(invalidations))
+    #[test]
+    fn test_dependents_added() {
+        let deps: Dependents<&str> = Dependents::default();
+        assert!(deps.is_empty());
+
+        let deps = deps.added("a");
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains(&"a"));
+
+        // Adding same id should not duplicate
+        let deps = deps.added("a");
+        assert_eq!(deps.len(), 1);
+
+        let deps = deps.added("b");
+        assert_eq!(deps.len(), 2);
     }
 
-    /// Remove an invalidator from the invalidations.
-    #[must_use]
-    pub fn remove_uninvalidated(&self, pointer: RevisionPointer<K>) -> Self {
-        let mut invalidations = Vec::clone(&self.0);
-        invalidations.retain(|i| !i.dependency.can_restore(&pointer));
-        Invalidations(Arc::new(invalidations))
-    }
+    #[test]
+    fn test_node_creation() {
+        let node: Node<&str, (), 3> = Node::new(
+            "test",
+            (),
+            Durability::volatile(),
+            1,
+            1,
+            1,
+            Dependencies::default(),
+        );
 
-    /// Iterate over the invalidations.
-    pub fn iter(&self) -> impl Iterator<Item = &Invalidation<K>> + '_ {
-        self.0.iter()
+        assert_eq!(node.id, "test");
+        assert_eq!(node.durability, Durability::volatile());
+        assert_eq!(node.verified_at, 1);
+        assert_eq!(node.changed_at, 1);
+        assert_eq!(node.level, 1);
+        assert!(node.dependencies.is_empty());
+        assert!(node.dependents.is_empty());
     }
 }

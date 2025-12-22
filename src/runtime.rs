@@ -231,6 +231,33 @@ where
         }
     }
 
+    /// Remove `qid` from the dependents list of old dependencies that are no longer in new deps.
+    ///
+    /// This cleans up stale reverse edges when a node's dependencies change.
+    fn cleanup_stale_edges(&self, qid: &K, old_deps: &Dependencies<K>, new_dep_ids: &[K]) {
+        let new_set: ahash::HashSet<&K> = new_dep_ids.iter().collect();
+        let pinned = self.nodes.pin();
+
+        for old_dep in old_deps.iter() {
+            if !new_set.contains(&old_dep.query_id) {
+                // This dependency was removed, clean up the reverse edge
+                let _ = pinned.compute(old_dep.query_id.clone(), |node| {
+                    let Some((_, node)) = node else {
+                        return Operation::Abort(());
+                    };
+
+                    if !node.dependents.contains(qid) {
+                        return Operation::Abort(()); // Already removed
+                    }
+
+                    let mut new_node = node.clone();
+                    new_node.dependents = node.dependents.removed(qid);
+                    Operation::Insert(new_node)
+                });
+            }
+        }
+    }
+
     /// Register a new node or update an existing one.
     ///
     /// This:
@@ -261,8 +288,12 @@ where
         // Increment revision
         let new_rev = self.increment_revision(effective_dur);
 
-        // Preserve existing dependents if updating
-        let old_dependents = self.get(&qid).map(|n| n.dependents).unwrap_or_default();
+        // Get old node state for edge cleanup
+        let old_node = self.get(&qid);
+        let old_dependents = old_node
+            .as_ref()
+            .map(|n| n.dependents.clone())
+            .unwrap_or_default();
 
         // Create new node
         let new_node = Node {
@@ -278,6 +309,11 @@ where
 
         // Insert node
         self.nodes.pin().insert(qid.clone(), new_node);
+
+        // Clean up stale edges from old dependencies
+        if let Some(old) = old_node {
+            self.cleanup_stale_edges(&qid, &old.dependencies, &dep_ids);
+        }
 
         // Update reverse edges
         self.update_graph_edges(&qid, &dep_records);
@@ -296,6 +332,7 @@ where
     /// - **Does NOT update `changed_at`** - this is the essence of early cutoff!
     /// - Dependents who observed the old `changed_at` will still see it,
     ///   so they remain valid with respect to this dependency
+    /// - Recalculates durability and level based on new dependencies
     ///
     /// Returns `Err` with missing dependency IDs if any dependency doesn't exist.
     pub fn confirm_unchanged(&self, qid: &K, new_dep_ids: Vec<K>) -> Result<(), Vec<K>> {
@@ -304,22 +341,28 @@ where
         };
 
         let new_deps = self.build_dep_records(&new_dep_ids)?;
-        let d = node.durability;
-        let current_rev = self.revision.get(d);
+
+        // Recalculate effective durability based on new dependencies
+        let effective_dur = self.calculate_effective_durability(node.durability, &new_deps);
+        let new_level = self.calculate_level(&new_deps);
+        let current_rev = self.revision.get(effective_dur);
 
         // Update node: verified_at changes, changed_at stays the same!
         let new_node = Node {
             id: node.id.clone(),
             data: node.data.clone(),
-            durability: node.durability,
+            durability: effective_dur,
             verified_at: current_rev,
             changed_at: node.changed_at, // Key: unchanged!
-            level: node.level,
+            level: new_level,
             dependencies: Dependencies::new(new_deps.clone()),
-            dependents: node.dependents,
+            dependents: node.dependents.clone(),
         };
 
         self.nodes.pin().insert(qid.clone(), new_node);
+
+        // Clean up stale edges and add new ones
+        self.cleanup_stale_edges(qid, &node.dependencies, &new_dep_ids);
         self.update_graph_edges(qid, &new_deps);
 
         Ok(())
@@ -328,7 +371,8 @@ where
     /// Confirm that a node's value has changed after recomputation.
     ///
     /// This:
-    /// - Increments revision at the node's durability level
+    /// - Recalculates durability and level based on new dependencies
+    /// - Increments revision at the effective durability level
     /// - Updates both `verified_at` and `changed_at` to the new revision
     /// - Dependents will see the increased `changed_at` and know they need to recheck
     ///
@@ -339,23 +383,29 @@ where
         };
 
         let new_deps = self.build_dep_records(&new_dep_ids)?;
-        let d = node.durability;
 
-        // Increment revision at this durability level
-        let new_rev = self.increment_revision(d);
+        // Recalculate effective durability and level based on new dependencies
+        let effective_dur = self.calculate_effective_durability(node.durability, &new_deps);
+        let new_level = self.calculate_level(&new_deps);
+
+        // Increment revision at the effective durability level
+        let new_rev = self.increment_revision(effective_dur);
 
         let new_node = Node {
             id: node.id.clone(),
             data: node.data.clone(),
-            durability: node.durability,
+            durability: effective_dur,
             verified_at: new_rev,
             changed_at: new_rev, // Both updated!
-            level: node.level,
+            level: new_level,
             dependencies: Dependencies::new(new_deps.clone()),
-            dependents: node.dependents,
+            dependents: node.dependents.clone(),
         };
 
         self.nodes.pin().insert(qid.clone(), new_node);
+
+        // Clean up stale edges and add new ones
+        self.cleanup_stale_edges(qid, &node.dependencies, &new_dep_ids);
         self.update_graph_edges(qid, &new_deps);
 
         Ok(new_rev)
@@ -390,25 +440,41 @@ where
     }
 
     /// Detect a cycle in the dependency graph starting from the given query.
+    ///
+    /// Uses iterative DFS to avoid stack overflow on deep graphs.
     pub fn has_cycle(&self, query_id: K) -> bool {
         let mut visited = ahash::HashSet::default();
-        self.has_cycle_with_set(query_id, &mut visited)
-    }
+        let mut in_stack = ahash::HashSet::default();
+        let mut stack = vec![(query_id, false)]; // (node, is_backtracking)
 
-    /// Detect a cycle with an existing visited set.
-    pub fn has_cycle_with_set(&self, query_id: K, visited: &mut ahash::HashSet<K>) -> bool {
-        if visited.contains(&query_id) {
-            return true;
-        }
-        visited.insert(query_id.clone());
+        while let Some((qid, backtracking)) = stack.pop() {
+            if backtracking {
+                in_stack.remove(&qid);
+                continue;
+            }
 
-        if let Some(node) = self.get(&query_id) {
-            for dep in node.dependencies.iter() {
-                if self.has_cycle_with_set(dep.query_id.clone(), visited) {
-                    return true;
+            if in_stack.contains(&qid) {
+                return true; // Cycle detected
+            }
+
+            if visited.contains(&qid) {
+                continue; // Already fully processed
+            }
+
+            visited.insert(qid.clone());
+            in_stack.insert(qid.clone());
+
+            // Push backtrack marker
+            stack.push((qid.clone(), true));
+
+            // Push dependencies
+            if let Some(node) = self.get(&qid) {
+                for dep in node.dependencies.iter() {
+                    stack.push((dep.query_id.clone(), false));
                 }
             }
         }
+
         false
     }
 }

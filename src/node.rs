@@ -182,6 +182,13 @@ where
     pub fn contains(&self, qid: &K) -> bool {
         self.0.contains(qid)
     }
+
+    /// Returns a new dependents list with the query ID removed.
+    #[must_use]
+    pub fn removed(&self, qid: &K) -> Self {
+        let dependents: Vec<_> = self.0.iter().filter(|q| *q != qid).cloned().collect();
+        Dependents(Arc::new(dependents))
+    }
 }
 
 impl<K> FromIterator<K> for Dependents<K> {

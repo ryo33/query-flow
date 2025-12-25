@@ -1,0 +1,18 @@
+[package]
+name = "query-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["reactive", "incremental", "query", "caching"]
+description = "A high-level query framework built on whale for incremental computation."
+categories = ["data-structures", "caching"]
+
+[dependencies]
+whale.workspace = true
+ahash.workspace = true
+papaya.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "whale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["reactive", "incremental", "dependency-tracking"]
+description = "A lock-free, dependency-tracking primitive for incremental computation."
+categories = ["data-structures"]
+readme = "../../README.md"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "papaya/serde", "ahash/serde"]
+
+[dependencies]
+ahash.workspace = true
+papaya.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

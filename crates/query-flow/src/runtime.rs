@@ -603,17 +603,17 @@ mod tests {
             assert_eq!(*result, 14); // (3 + 4) * 2
         }
 
-        #[query(no_output_eq)]
-        fn no_eq_check(ctx: &mut QueryContext, x: i32) -> Result<Vec<i32>, QueryError> {
+        #[query(output_eq)]
+        fn with_output_eq(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
             let _ = ctx;
-            Ok(vec![*x])
+            Ok(*x * 2)
         }
 
         #[test]
-        fn test_macro_no_output_eq() {
+        fn test_macro_output_eq() {
             let runtime = QueryRuntime::new();
-            let result = runtime.query(NoEqCheck::new(5)).unwrap();
-            assert_eq!(*result, vec![5]);
+            let result = runtime.query(WithOutputEq::new(5)).unwrap();
+            assert_eq!(*result, 10);
         }
 
         #[query(never_cache)]

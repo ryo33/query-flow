@@ -13,6 +13,7 @@ categories = ["data-structures", "caching"]
 whale.workspace = true
 ahash.workspace = true
 papaya.workspace = true
+query-flow-macros.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

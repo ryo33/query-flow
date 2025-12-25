@@ -14,27 +14,20 @@
 //! # Example
 //!
 //! ```ignore
-//! use query_flow::{Query, QueryContext, QueryError, QueryRuntime};
+//! use query_flow::{query, QueryContext, QueryError, QueryRuntime};
 //!
-//! struct Add { a: i32, b: i32 }
-//!
-//! impl Query for Add {
-//!     type CacheKey = (i32, i32);
-//!     type Output = i32;
-//!
-//!     fn cache_key(&self) -> Self::CacheKey {
-//!         (self.a, self.b)
-//!     }
-//!
-//!     fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-//!         Ok(self.a + self.b)
-//!     }
+//! #[query]
+//! fn add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+//!     Ok(a + b)
 //! }
 //!
 //! let runtime = QueryRuntime::new();
-//! let result = runtime.query(Add { a: 1, b: 2 }).unwrap();
+//! let result = runtime.query(Add::new(1, 2)).unwrap();
 //! assert_eq!(*result, 3);
 //! ```
+
+// Allow the macro to reference query_flow types when used inside this crate
+extern crate self as query_flow;
 
 mod error;
 mod key;
@@ -47,4 +40,5 @@ pub use error::QueryError;
 pub use key::Key;
 pub use loading::LoadingState;
 pub use query::Query;
+pub use query_flow_macros::query;
 pub use runtime::{QueryContext, QueryRuntime};

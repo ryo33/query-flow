@@ -531,4 +531,119 @@ mod tests {
         assert_eq!(*r2, 1);
         assert_eq!(*r3, 2);
     }
+
+    // Macro tests
+    mod macro_tests {
+        use super::*;
+        use crate::query;
+
+        #[query]
+        fn add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+            let _ = ctx; // silence unused warning
+            Ok(a + b)
+        }
+
+        #[test]
+        fn test_macro_basic() {
+            let runtime = QueryRuntime::new();
+            let result = runtime.query(Add::new(1, 2)).unwrap();
+            assert_eq!(*result, 3);
+        }
+
+        #[query(durability = 2)]
+        fn with_durability(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
+            let _ = ctx;
+            Ok(x * 2)
+        }
+
+        #[test]
+        fn test_macro_durability() {
+            let runtime = QueryRuntime::new();
+            let result = runtime.query(WithDurability::new(5)).unwrap();
+            assert_eq!(*result, 10);
+        }
+
+        #[query(keys(id))]
+        fn with_key_selection(
+            ctx: &mut QueryContext,
+            id: u32,
+            include_extra: bool,
+        ) -> Result<String, QueryError> {
+            let _ = ctx;
+            Ok(format!("id={}, extra={}", id, include_extra))
+        }
+
+        #[test]
+        fn test_macro_key_selection() {
+            let runtime = QueryRuntime::new();
+
+            // Same id, different include_extra - should return cached
+            let r1 = runtime
+                .query(WithKeySelection::new(1, true))
+                .unwrap();
+            let r2 = runtime
+                .query(WithKeySelection::new(1, false))
+                .unwrap();
+
+            // Both should have same value because only `id` is the key
+            assert_eq!(*r1, "id=1, extra=true");
+            assert_eq!(*r2, "id=1, extra=true"); // Cached!
+        }
+
+        #[query]
+        fn dependent(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+            let sum = ctx.query(Add::new(*a, *b))?;
+            Ok(*sum * 2)
+        }
+
+        #[test]
+        fn test_macro_dependencies() {
+            let runtime = QueryRuntime::new();
+            let result = runtime.query(Dependent::new(3, 4)).unwrap();
+            assert_eq!(*result, 14); // (3 + 4) * 2
+        }
+
+        #[query(no_output_eq)]
+        fn no_eq_check(ctx: &mut QueryContext, x: i32) -> Result<Vec<i32>, QueryError> {
+            let _ = ctx;
+            Ok(vec![*x])
+        }
+
+        #[test]
+        fn test_macro_no_output_eq() {
+            let runtime = QueryRuntime::new();
+            let result = runtime.query(NoEqCheck::new(5)).unwrap();
+            assert_eq!(*result, vec![5]);
+        }
+
+        #[query(never_cache)]
+        fn never_cached_macro(ctx: &mut QueryContext) -> Result<u32, QueryError> {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let _ = ctx;
+            Ok(COUNT.fetch_add(1, Ordering::SeqCst))
+        }
+
+        #[test]
+        fn test_macro_never_cache() {
+            let runtime = QueryRuntime::new();
+            let r1 = runtime.query(NeverCachedMacro::new()).unwrap();
+            let r2 = runtime.query(NeverCachedMacro::new()).unwrap();
+            // Should increment each time
+            assert!(*r1 < *r2);
+        }
+
+        #[query(name = "CustomName")]
+        fn original_name(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
+            let _ = ctx;
+            Ok(*x)
+        }
+
+        #[test]
+        fn test_macro_custom_name() {
+            let runtime = QueryRuntime::new();
+            let result = runtime.query(CustomName::new(42)).unwrap();
+            assert_eq!(*result, 42);
+        }
+    }
 }

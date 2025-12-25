@@ -12,7 +12,13 @@ repository = "https://github.com/ryo33/whale"
 [workspace.dependencies]
 whale = { path = "crates/whale" }
 query-flow = { path = "crates/query-flow" }
+query-flow-macros = { path = "crates/query-flow-macros" }
 ahash = "0.8"
 papaya = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
 tokio = { version = "1", features = ["full"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+darling = "0.20"
+heck = "0.5"

@@ -95,10 +95,6 @@ struct QueryAttr {
     #[darling(default)]
     durability: Option<u8>,
 
-    /// Skip caching for this query.
-    #[darling(default)]
-    never_cache: bool,
-
     /// Output equality for early cutoff optimization.
     /// Default: uses PartialEq (`old == new`).
     /// `output_eq = path`: uses custom function for types without PartialEq.
@@ -134,7 +130,6 @@ struct ParsedFn {
 /// # Attributes
 ///
 /// - `durability = N`: Set durability level (0-255, default 0)
-/// - `never_cache`: Skip caching this query
 /// - `output_eq = path`: Custom equality function (default: PartialEq)
 /// - `keys(a, b, ...)`: Specify which params form the cache key
 /// - `name = "Name"`: Override generated struct name
@@ -441,16 +436,6 @@ fn generate_query_impl(
         }
     });
 
-    let never_cache_impl = if attr.never_cache {
-        Some(quote! {
-            fn never_cache(&self) -> bool {
-                true
-            }
-        })
-    } else {
-        None
-    };
-
     let output_eq_impl = match &attr.output_eq {
         // Default: use PartialEq
         OutputEq::None | OutputEq::PartialEq => quote! {
@@ -481,7 +466,6 @@ fn generate_query_impl(
             }
 
             #durability_impl
-            #never_cache_impl
             #output_eq_impl
         }
     })

@@ -161,37 +161,29 @@ impl QueryRuntime {
         let output = query.query(&mut ctx)?;
         let output = Arc::new(output);
 
-        // Cache the result unless never_cache is set
-        if !query.never_cache() {
-            // Get collected dependencies
-            let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
+        // Get collected dependencies
+        let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
 
-            // Check if output changed (for early cutoff)
-            let output_changed = if let Some(old) = self.cache.get::<Q>(full_key) {
-                !Q::output_eq(&old, &output)
-            } else {
-                true // No previous value, so "changed"
-            };
+        // Check if output changed (for early cutoff)
+        let output_changed = if let Some(old) = self.cache.get::<Q>(full_key) {
+            !Q::output_eq(&old, &output)
+        } else {
+            true // No previous value, so "changed"
+        };
 
-            // Update cache
-            self.cache.insert::<Q>(full_key.clone(), output.clone());
+        // Update cache
+        self.cache.insert::<Q>(full_key.clone(), output.clone());
 
-            // Update whale dependency tracking
-            let durability = Durability::new(query.durability() as usize)
-                .unwrap_or(Durability::volatile());
+        // Update whale dependency tracking
+        let durability =
+            Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
 
-            if output_changed {
-                // Register with new changed_at
-                let _ = self.whale.register(
-                    full_key.clone(),
-                    (),
-                    durability,
-                    deps,
-                );
-            } else {
-                // Early cutoff: keep old changed_at
-                let _ = self.whale.confirm_unchanged(full_key, deps);
-            }
+        if output_changed {
+            // Register with new changed_at
+            let _ = self.whale.register(full_key.clone(), (), durability, deps);
+        } else {
+            // Early cutoff: keep old changed_at
+            let _ = self.whale.confirm_unchanged(full_key, deps);
         }
 
         Ok(output)
@@ -521,45 +513,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_never_cache() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
-
-        struct NeverCached;
-
-        impl Query for NeverCached {
-            type CacheKey = ();
-            type Output = u32;
-
-            fn cache_key(&self) -> Self::CacheKey {}
-
-            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-                Ok(CALL_COUNT.fetch_add(1, Ordering::SeqCst))
-            }
-
-            fn never_cache(&self) -> bool {
-                true
-            }
-
-            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
-                old == new
-            }
-        }
-
-        let runtime = QueryRuntime::new();
-
-        let r1 = runtime.query(NeverCached).unwrap();
-        let r2 = runtime.query(NeverCached).unwrap();
-        let r3 = runtime.query(NeverCached).unwrap();
-
-        // Each call should execute the query
-        assert_eq!(*r1, 0);
-        assert_eq!(*r2, 1);
-        assert_eq!(*r3, 2);
-    }
-
     // Macro tests
     mod macro_tests {
         use super::*;
@@ -642,23 +595,6 @@ mod tests {
             let runtime = QueryRuntime::new();
             let result = runtime.query(WithOutputEq::new(5)).unwrap();
             assert_eq!(*result, 10);
-        }
-
-        #[query(never_cache)]
-        fn never_cached_macro(ctx: &mut QueryContext) -> Result<u32, QueryError> {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static COUNT: AtomicU32 = AtomicU32::new(0);
-            let _ = ctx;
-            Ok(COUNT.fetch_add(1, Ordering::SeqCst))
-        }
-
-        #[test]
-        fn test_macro_never_cache() {
-            let runtime = QueryRuntime::new();
-            let r1 = runtime.query(NeverCachedMacro::new()).unwrap();
-            let r2 = runtime.query(NeverCachedMacro::new()).unwrap();
-            // Should increment each time
-            assert!(*r1 < *r2);
         }
 
         #[query(name = "CustomName")]

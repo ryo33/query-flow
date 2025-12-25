@@ -90,20 +90,6 @@ pub trait Query: Send + Sync + 'static {
     /// * `Err(QueryError::Cycle)` - Dependency cycle detected
     fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError>;
 
-    /// Whether this query should never be cached.
-    ///
-    /// If true, this query will always be re-executed. However, downstream
-    /// queries that depend on this one can still be cached.
-    ///
-    /// Use cases:
-    /// - Queries that read external state that changes frequently
-    /// - Queries where caching overhead exceeds computation cost
-    ///
-    /// Default: `false` (queries are cached)
-    fn never_cache(&self) -> bool {
-        false
-    }
-
     /// Durability hint for this query.
     ///
     /// Higher values indicate the query's output changes less frequently.

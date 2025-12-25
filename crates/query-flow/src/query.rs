@@ -122,12 +122,7 @@ pub trait Query: Send + Sync + 'static {
     /// When a query is recomputed and the output is equal to the previous
     /// output, downstream queries can skip recomputation (early cutoff).
     ///
-    /// Default: `false` (always propagate changes)
-    ///
-    /// Override this for queries where:
-    /// - Output comparison is cheap
-    /// - Output often doesn't change even when dependencies do
-    fn output_eq(_old: &Self::Output, _new: &Self::Output) -> bool {
-        false
-    }
+    /// The `#[query]` macro generates this using `PartialEq` by default.
+    /// Use `output_eq = custom_fn` for types without `PartialEq`.
+    fn output_eq(old: &Self::Output, new: &Self::Output) -> bool;
 }

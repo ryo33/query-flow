@@ -125,6 +125,10 @@ mod tests {
             ) -> Result<Self::Output, crate::QueryError> {
                 Ok("hello".to_string())
             }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
         }
 
         let storage = CacheStorage::new();

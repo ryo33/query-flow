@@ -99,10 +99,9 @@ struct QueryAttr {
     #[darling(default)]
     never_cache: bool,
 
-    /// Enable output equality check for early cutoff optimization.
-    /// - `output_eq`: uses PartialEq (`old == new`)
-    /// - `output_eq = path`: uses custom function
-    /// Default: no early cutoff (trait default returns false).
+    /// Output equality for early cutoff optimization.
+    /// Default: uses PartialEq (`old == new`).
+    /// `output_eq = path`: uses custom function for types without PartialEq.
     #[darling(default)]
     output_eq: OutputEq,
 
@@ -136,8 +135,7 @@ struct ParsedFn {
 ///
 /// - `durability = N`: Set durability level (0-255, default 0)
 /// - `never_cache`: Skip caching this query
-/// - `output_eq`: Enable early cutoff using PartialEq
-/// - `output_eq = path`: Enable early cutoff with custom function
+/// - `output_eq = path`: Custom equality function (default: PartialEq)
 /// - `keys(a, b, ...)`: Specify which params form the cache key
 /// - `name = "Name"`: Override generated struct name
 ///
@@ -454,20 +452,18 @@ fn generate_query_impl(
     };
 
     let output_eq_impl = match &attr.output_eq {
-        // Not specified: use trait default (no early cutoff)
-        OutputEq::None => None,
-        // `output_eq` alone: use PartialEq
-        OutputEq::PartialEq => Some(quote! {
+        // Default: use PartialEq
+        OutputEq::None | OutputEq::PartialEq => quote! {
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
                 old == new
             }
-        }),
+        },
         // `output_eq = path`: use custom function
-        OutputEq::Custom(custom_fn) => Some(quote! {
+        OutputEq::Custom(custom_fn) => quote! {
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
                 #custom_fn(old, new)
             }
-        }),
+        },
     };
 
     Ok(quote! {

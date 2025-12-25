@@ -358,6 +358,10 @@ mod tests {
             fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.a + self.b)
             }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
         }
 
         let runtime = QueryRuntime::new();
@@ -387,6 +391,10 @@ mod tests {
             fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.value * 2)
             }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
         }
 
         struct Derived {
@@ -406,6 +414,10 @@ mod tests {
                     value: self.base_value,
                 })?;
                 Ok(*base + 10)
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
             }
         }
 
@@ -437,6 +449,10 @@ mod tests {
                 let b = ctx.query(CycleB { id: self.id })?;
                 Ok(*b + 1)
             }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
         }
 
         impl Query for CycleB {
@@ -450,6 +466,10 @@ mod tests {
             fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 let a = ctx.query(CycleA { id: self.id })?;
                 Ok(*a + 1)
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
             }
         }
 
@@ -475,6 +495,10 @@ mod tests {
 
             fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.input.parse())
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
             }
         }
 
@@ -517,6 +541,10 @@ mod tests {
 
             fn never_cache(&self) -> bool {
                 true
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
             }
         }
 

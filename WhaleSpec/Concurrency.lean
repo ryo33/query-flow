@@ -74,15 +74,18 @@ end Commutativity
 
 section ConfirmNonInterference
 
-/-- If `confirmUnchanged` succeeds, it does not change an unrelated node that is not in the new deps list. -/
+/-- If `confirmUnchanged` succeeds, it does not change an unrelated node that is not in the new deps list
+    and not in the old deps list. -/
 theorem confirmUnchanged_preserves_other_node {N : Nat} (rt : Runtime N)
     (qid other : QueryId) (newDeps : List QueryId)
-    (hne : other ≠ qid) (hnot : other ∉ newDeps) :
+    (node : Node N) (hnode : rt.nodes qid = some node)
+    (hne : other ≠ qid) (hnot : other ∉ newDeps)
+    (hnotold : ∀ dep ∈ node.dependencies, dep.queryId ≠ other) :
     match confirmUnchanged rt qid newDeps with
     | .ok rt' => rt'.nodes other = rt.nodes other
     | .error _ => True := by
   simpa using (Whale.confirmUnchanged_other_unchanged (rt := rt) (qid := qid) (other := other)
-    (newDeps := newDeps) hne hnot)
+    (newDeps := newDeps) (node := node) (hnode := hnode) hne hnot hnotold)
 
 end ConfirmNonInterference
 

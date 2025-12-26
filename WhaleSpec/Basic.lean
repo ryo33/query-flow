@@ -121,6 +121,15 @@ def dependentsConsistent {N : Nat} (nodes : QueryId → Option (Node N)) : Prop 
         | some depNode => qid ∈ depNode.dependents
         | none => False
 
+/-- No self-dependency: a node cannot depend on itself.
+    This is a fundamental DAG property and is required for cycle detection. -/
+def noSelfDependency {N : Nat} (nodes : QueryId → Option (Node N)) : Prop :=
+  ∀ qid node, nodes qid = some node → ∀ dep ∈ node.dependencies, dep.queryId ≠ qid
+
+/-- Local version: a specific node has no self-dependency -/
+def nodeNoSelfDep (qid : QueryId) (node : Node N) : Prop :=
+  ∀ dep ∈ node.dependencies, dep.queryId ≠ qid
+
 /-! ## Helper Functions -/
 
 /-- Get minimum durability among dependencies -/
@@ -368,6 +377,26 @@ def updateGraphEdges {N : Nat} (nodes : QueryId → Option (Node N)) (qid : Quer
         let newDependents := qid :: depNode.dependents
         fun q => if q = dep.queryId then some { depNode with dependents := newDependents }
                  else ns q
+  ) nodes
+
+/-- Remove qid from the dependents list of old dependencies that are no longer in new deps.
+    This cleans up stale reverse edges when a node's dependencies change.
+    Matches Rust: `cleanup_stale_edges` in runtime.rs -/
+def cleanupStaleEdges {N : Nat} (nodes : QueryId → Option (Node N)) (qid : QueryId)
+    (oldDeps : List Dep) (newDepIds : List QueryId) : QueryId → Option (Node N) :=
+  oldDeps.foldl (fun ns oldDep =>
+    -- Only process if this dependency was removed (not in newDepIds)
+    if oldDep.queryId ∈ newDepIds then ns
+    else
+      match ns oldDep.queryId with
+      | none => ns
+      | some depNode =>
+        -- Remove qid from dependents list if present
+        if qid ∈ depNode.dependents then
+          let newDependents := depNode.dependents.filter (· ≠ qid)
+          fun q => if q = oldDep.queryId then some { depNode with dependents := newDependents }
+                   else ns q
+        else ns
   ) nodes
 
 /-- Register result -/
@@ -812,6 +841,234 @@ theorem updateGraphEdges_other_unchanged {N : Nat} (nodes : QueryId → Option (
     rw [ih (updateGraphEdgesStep qid nodes hd) htl]
     exact updateGraphEdgesStep_other_unchanged qid other nodes hd hhd
 
+/-! ### cleanupStaleEdges properties -/
+
+/-- cleanupStaleEdges preserves nodes not in oldDeps -/
+theorem cleanupStaleEdges_other_unchanged {N : Nat} (nodes : QueryId → Option (Node N))
+    (qid other : QueryId) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (hother : ∀ dep ∈ oldDeps, dep.queryId ≠ other) :
+    (cleanupStaleEdges nodes qid oldDeps newDepIds) other = nodes other := by
+  unfold cleanupStaleEdges
+  induction oldDeps generalizing nodes with
+  | nil => simp [List.foldl]
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    have hhd : hd.queryId ≠ other := hother hd (by simp)
+    have htl : ∀ dep ∈ tl, dep.queryId ≠ other := fun dep hdep => hother dep (by simp [hdep])
+    -- The step function with explicit type
+    let stepFn : (QueryId → Option (Node N)) → Dep → (QueryId → Option (Node N)) :=
+      fun ns (oldDep : Dep) =>
+        if oldDep.queryId ∈ newDepIds then ns
+        else match ns oldDep.queryId with
+             | none => ns
+             | some depNode =>
+               if qid ∈ depNode.dependents then
+                 let newDependents := depNode.dependents.filter (· ≠ qid)
+                 fun q => if q = oldDep.queryId then some { depNode with dependents := newDependents }
+                          else ns q
+               else ns
+    have hstep : (stepFn nodes hd) other = nodes other := by
+      simp only [stepFn]
+      split_ifs with hmem
+      · rfl
+      · cases hdq : nodes hd.queryId with
+        | none => rfl
+        | some depNode =>
+          simp only
+          split_ifs with hmem'
+          · simp only [hhd.symm, ite_false]
+          · rfl
+    rw [ih (stepFn nodes hd) htl]
+    exact hstep
+
+/-- Helper: The step function in cleanupStaleEdges preserves Some/None structure and changedAt -/
+private lemma cleanupStaleEdges_step_preserves {N : Nat} (nodes : QueryId → Option (Node N))
+    (qid target : QueryId) (hd : Dep) (newDepIds : List QueryId)
+    (node : Node N) (hnode : nodes target = some node) :
+    let step := if hd.queryId ∈ newDepIds then nodes
+                else match nodes hd.queryId with
+                     | none => nodes
+                     | some depNode =>
+                       if qid ∈ depNode.dependents then
+                         fun q => if q = hd.queryId then some { depNode with dependents := depNode.dependents.filter (· ≠ qid) }
+                                  else nodes q
+                       else nodes
+    ∃ n', step target = some n' ∧ n'.changedAt = node.changedAt ∧
+          n'.durability = node.durability ∧ n'.verifiedAt = node.verifiedAt ∧
+          n'.dependencies = node.dependencies := by
+  simp only
+  split_ifs with hmem
+  · exact ⟨node, hnode, rfl, rfl, rfl, rfl⟩
+  · cases hdq : nodes hd.queryId with
+    | none => exact ⟨node, hnode, rfl, rfl, rfl, rfl⟩
+    | some depNode =>
+      simp only
+      split_ifs with hmem'
+      · by_cases heq : target = hd.queryId
+        · subst heq
+          simp only [ite_true]
+          rw [hnode] at hdq
+          injection hdq with heq'
+          subst heq'
+          exact ⟨_, rfl, rfl, rfl, rfl, rfl⟩
+        · simp only [heq, ite_false]
+          exact ⟨node, hnode, rfl, rfl, rfl, rfl⟩
+      · exact ⟨node, hnode, rfl, rfl, rfl, rfl⟩
+
+/-- cleanupStaleEdges preserves node existence and key properties -/
+theorem cleanupStaleEdges_preserves_node {N : Nat} (nodes : QueryId → Option (Node N))
+    (qid target : QueryId) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (node : Node N) (hnode : nodes target = some node) :
+    ∃ n', (cleanupStaleEdges nodes qid oldDeps newDepIds) target = some n' ∧
+          n'.changedAt = node.changedAt ∧ n'.durability = node.durability ∧
+          n'.verifiedAt = node.verifiedAt ∧ n'.dependencies = node.dependencies := by
+  unfold cleanupStaleEdges
+  induction oldDeps generalizing nodes node with
+  | nil =>
+    simp only [List.foldl_nil]
+    exact ⟨node, hnode, rfl, rfl, rfl, rfl⟩
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    have hstep := cleanupStaleEdges_step_preserves nodes qid target hd newDepIds node hnode
+    rcases hstep with ⟨n', hn', hchg, hdur, hver, hdeps⟩
+    have := ih _ n' hn'
+    rcases this with ⟨n'', hn'', hchg', hdur', hver', hdeps'⟩
+    exact ⟨n'', hn'', by simp_all, by simp_all, by simp_all, by simp_all⟩
+
+/-- cleanupStaleEdges preserves None nodes -/
+theorem cleanupStaleEdges_preserves_none {N : Nat} (nodes : QueryId → Option (Node N))
+    (qid target : QueryId) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (hnode : nodes target = none) :
+    (cleanupStaleEdges nodes qid oldDeps newDepIds) target = none := by
+  unfold cleanupStaleEdges
+  induction oldDeps generalizing nodes with
+  | nil => simp only [List.foldl_nil]; exact hnode
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    apply ih
+    -- Show the step preserves None
+    split_ifs with hmem
+    · exact hnode
+    · cases hdq : nodes hd.queryId with
+      | none => exact hnode
+      | some depNode =>
+        simp only
+        split_ifs with hmem'
+        · -- qid ∈ depNode.dependents case
+          by_cases heq : target = hd.queryId
+          · -- Contradiction: nodes target = none but nodes hd.queryId = some depNode
+            subst heq
+            rw [hnode] at hdq
+            exact absurd hdq (by simp)
+          · simp only [heq, ite_false]; exact hnode
+        · exact hnode
+
+/-- cleanupStaleEdges does not change changedAt of any node.
+    This is important for early cutoff correctness. -/
+theorem cleanupStaleEdges_preserves_changedAt {N : Nat} (nodes : QueryId → Option (Node N))
+    (qid target : QueryId) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (node : Node N) (hnode : nodes target = some node) :
+    match (cleanupStaleEdges nodes qid oldDeps newDepIds) target with
+    | some n => n.changedAt = node.changedAt
+    | none => False := by
+  have ⟨n', hn', hchg, _, _, _⟩ := cleanupStaleEdges_preserves_node nodes qid target oldDeps newDepIds node hnode
+  simp only [hn']
+  exact hchg
+
+/-- cleanupStaleEdges does not affect isValidAt (since isValidAt only uses changedAt, not dependents) -/
+theorem isValidAt_cleanupStaleEdges {N : Nat} (rt : Runtime N)
+    (qid target : QueryId) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (atRev : Revision N) :
+    let newNodes := cleanupStaleEdges rt.nodes qid oldDeps newDepIds
+    isValidAt (rt := ⟨newNodes, rt.revision, rt.numDurabilityLevels⟩) target atRev =
+    isValidAt rt target atRev := by
+  unfold isValidAt
+  simp only
+  cases hnode : rt.nodes target with
+  | none =>
+    have hclean := cleanupStaleEdges_preserves_none rt.nodes qid target oldDeps newDepIds hnode
+    simp [hclean]
+  | some node =>
+    have ⟨n', hn', hchg, hdur, hver, hdeps⟩ := cleanupStaleEdges_preserves_node rt.nodes qid target oldDeps newDepIds node hnode
+    simp only [hn', hdur, hver]
+    -- Now we need to show the dependencies check is the same
+    -- After simp, we should have equality of the List.all expressions
+    -- Use congrArg to focus on the List.all part
+    congr 1
+    rw [hdeps]
+    -- Now prove the List.all gives the same value
+    congr 1
+    funext dep
+    cases hdepNode : rt.nodes dep.queryId with
+    | none =>
+      have hcleanDep := cleanupStaleEdges_preserves_none rt.nodes qid dep.queryId oldDeps newDepIds hdepNode
+      simp [hcleanDep]
+    | some depNode =>
+      have ⟨n'', hn'', hchg', _, _, _⟩ := cleanupStaleEdges_preserves_node rt.nodes qid dep.queryId oldDeps newDepIds depNode hdepNode
+      simp [hn'', hchg']
+
+/-- cleanupStaleEdges preserves the node at qid when no old dependency points to qid itself.
+    This is needed because a node should not depend on itself. -/
+theorem cleanupStaleEdges_preserves_at_qid {N : Nat} (nodes : QueryId → Option (Node N))
+    (qid : QueryId) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (hnoself : ∀ dep ∈ oldDeps, dep.queryId ≠ qid) :
+    (cleanupStaleEdges nodes qid oldDeps newDepIds) qid = nodes qid :=
+  cleanupStaleEdges_other_unchanged nodes qid qid oldDeps newDepIds hnoself
+
+/-- Helper: the step function in cleanupStaleEdges doesn't create new nodes -/
+private lemma cleanupStaleEdges_step_some_implies_some {N : Nat} (qid target : QueryId)
+    (nodes : QueryId → Option (Node N)) (oldDep : Dep) (newDepIds : List QueryId)
+    (n' : Node N)
+    (hstep : (if oldDep.queryId ∈ newDepIds then nodes
+              else match nodes oldDep.queryId with
+                   | none => nodes
+                   | some depNode =>
+                     if qid ∈ depNode.dependents then
+                       fun q => if q = oldDep.queryId then some { depNode with dependents := depNode.dependents.filter (· ≠ qid) }
+                                else nodes q
+                     else nodes) target = some n') :
+    ∃ n, nodes target = some n := by
+  split_ifs at hstep with hmem
+  · exact ⟨n', hstep⟩
+  · cases hdep : nodes oldDep.queryId with
+    | none =>
+      simp only [hdep] at hstep
+      exact ⟨n', hstep⟩
+    | some depNode =>
+      simp only [hdep] at hstep
+      split_ifs at hstep with hmem'
+      · by_cases htarget : target = oldDep.queryId
+        · subst htarget
+          exact ⟨depNode, hdep⟩
+        · simp only [htarget, ite_false] at hstep
+          exact ⟨n', hstep⟩
+      · exact ⟨n', hstep⟩
+
+/-- cleanupStaleEdges never creates a node: if the result is `some`, the input was `some`. -/
+lemma cleanupStaleEdges_some_implies_some {N : Nat} (qid target : QueryId)
+    (nodes : QueryId → Option (Node N)) (oldDeps : List Dep) (newDepIds : List QueryId)
+    (n' : Node N) (hout : cleanupStaleEdges nodes qid oldDeps newDepIds target = some n') :
+    ∃ n, nodes target = some n := by
+  unfold cleanupStaleEdges at hout
+  induction oldDeps generalizing nodes with
+  | nil =>
+    simp only [List.foldl_nil] at hout
+    exact ⟨n', hout⟩
+  | cons hd tl ih =>
+    simp only [List.foldl_cons] at hout
+    let stepFn := if hd.queryId ∈ newDepIds then nodes
+                  else match nodes hd.queryId with
+                       | none => nodes
+                       | some depNode =>
+                         if qid ∈ depNode.dependents then
+                           fun q => if q = hd.queryId then some { depNode with dependents := depNode.dependents.filter (· ≠ qid) }
+                                    else nodes q
+                         else nodes
+    -- Get node from tail fold
+    obtain ⟨n1, hn1⟩ := ih stepFn hout
+    -- Get node from step
+    exact cleanupStaleEdges_step_some_implies_some qid target nodes hd newDepIds n1 hn1
+
 /-- updateGraphEdgesStep at target adds qid to dependents -/
 lemma updateGraphEdgesStep_target {N : Nat} (qid : QueryId) (ns : QueryId → Option (Node N))
     (d : Dep) (depNode : Node N) (hdepNode : ns d.queryId = some depNode) :
@@ -1071,6 +1328,84 @@ theorem updateGraphEdges_adds_dependent {N : Nat} (nodes : QueryId → Option (N
         rw [← hpres] at hdepNode
         exact ih (updateGraphEdgesStep qid nodes hd) hmem depNode hdepNode
 
+/-! ### noSelfDependency preservation -/
+
+/-- If qid is not in depIds, then no Dep in the result of buildDepRecords has queryId = qid -/
+lemma buildDepRecords_ok_no_self {N : Nat} (nodes : QueryId → Option (Node N))
+    (depIds : List QueryId) (depRecords : List Dep) (qid : QueryId)
+    (hok : buildDepRecords nodes depIds = Except.ok depRecords)
+    (hnotIn : qid ∉ depIds) :
+    ∀ dep ∈ depRecords, dep.queryId ≠ qid := by
+  intro dep hmem
+  have hmemIds := buildDepRecords_ok_mem_queryId_mem nodes depIds depRecords hok dep hmem
+  exact fun heq => hnotIn (heq ▸ hmemIds)
+
+/-- register preserves noSelfDependency when qid is not in its own deps -/
+theorem register_preserves_noSelfDependency {N : Nat} (rt : Runtime N)
+    (qid : QueryId) (dur : Durability) (depIds : List QueryId)
+    (hinv : noSelfDependency rt.nodes)
+    (hnotIn : qid ∉ depIds) :
+    match rt.register qid dur depIds with
+    | .ok (rt', _) => noSelfDependency rt'.nodes
+    | .error _ => True := by
+  unfold Runtime.register Runtime.registerCore
+  cases hbd : buildDepRecords rt.nodes depIds with
+  | error missing => simp
+  | ok depRecords =>
+    simp only []
+    -- Define the intermediate nodes map for clarity
+    have hN : N > 0 := rt.numDurabilityLevels
+    let effectiveDur := calculateEffectiveDurability rt.nodes dur depRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    let incResult := rt.incrementRevision durFin
+    let rt' := incResult.1
+    let newRev := incResult.2
+    let newLevel := calculateLevel rt.nodes depRecords
+    let oldDependents : List QueryId := match rt'.nodes qid with
+      | none => []
+      | some oldNode => oldNode.dependents
+    let newNode : Node N := {
+      durability := durFin
+      verifiedAt := newRev
+      changedAt := newRev
+      level := newLevel
+      dependencies := depRecords
+      dependents := oldDependents
+    }
+    let baseNodes : QueryId → Option (Node N) := fun q => if q = qid then some newNode else rt'.nodes q
+    let finalNodes := updateGraphEdges baseNodes qid depRecords
+    -- Show noSelfDependency for finalNodes
+    intro other otherNode hotherNode dep hdep
+    by_cases heq : other = qid
+    · -- Case: other = qid, so otherNode is the newly registered node (with deps = depRecords)
+      have hbaseQid : baseNodes qid = some newNode := by simp only [baseNodes, ite_true]
+      obtain ⟨n', hn', hdepsEq⟩ := updateGraphEdges_preserves_dependencies qid qid baseNodes depRecords newNode hbaseQid
+      rw [heq] at hotherNode
+      rw [hn'] at hotherNode
+      injection hotherNode with heq'
+      have : otherNode.dependencies = newNode.dependencies := by rw [← heq']; exact hdepsEq
+      rw [this] at hdep
+      -- newNode.dependencies = depRecords, and qid ∉ depIds → no dep has queryId = qid
+      have hdepRecordsNoSelf := buildDepRecords_ok_no_self rt.nodes depIds depRecords qid hbd hnotIn
+      rw [heq]
+      exact hdepRecordsNoSelf dep hdep
+    · -- Case: other ≠ qid, so otherNode's dependencies come from rt.nodes
+      obtain ⟨origNode, horigNode⟩ := updateGraphEdges_some_implies_some qid other baseNodes depRecords otherNode hotherNode
+      -- origNode is from baseNodes at other, and other ≠ qid, so from rt'.nodes = rt.nodes
+      have hbaseOther : baseNodes other = rt'.nodes other := by simp only [baseNodes, heq, ite_false]
+      rw [hbaseOther] at horigNode
+      have hrtNodes : rt'.nodes = rt.nodes := incrementRevision_preserves_nodes rt durFin
+      rw [hrtNodes] at horigNode
+      -- updateGraphEdges preserves dependencies
+      obtain ⟨n', hn', hdepsEq⟩ := updateGraphEdges_preserves_dependencies qid other baseNodes depRecords origNode (by rw [hbaseOther, hrtNodes, horigNode])
+      rw [hn'] at hotherNode
+      injection hotherNode with heq'
+      have : otherNode.dependencies = origNode.dependencies := by rw [← heq']; exact hdepsEq
+      rw [this] at hdep
+      exact hinv other origNode horigNode dep hdep
+
 end InvariantPreservation
 
 /-! ## Phase 3: Validity Correctness -/
@@ -1194,7 +1529,8 @@ end ValidityCorrectness
 
 section EarlyCutoff
 
-/-- Confirm unchanged operation - value same after recompute -/
+/-- Confirm unchanged operation - value same after recompute.
+    Recalculates durability and level based on new dependencies (matching Rust impl). -/
 def confirmUnchanged {N : Nat} (rt : Runtime N) (qid : QueryId)
     (newDeps : List QueryId) : Except (List QueryId) (Runtime N) :=
   match rt.nodes qid with
@@ -1203,18 +1539,31 @@ def confirmUnchanged {N : Nat} (rt : Runtime N) (qid : QueryId)
     match buildDepRecords rt.nodes newDeps with
     | .error missing => .error missing
     | .ok newDepRecords =>
-      let d : Fin N := node.durability
-      let currentRev := rt.revision d
-      let newNode := { node with
+      -- Recalculate effective durability based on new dependencies (like Rust does)
+      let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+      let finalDur := min effectiveDur (N - 1)
+      have hN : N > 0 := rt.numDurabilityLevels
+      have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+      let durFin : Fin N := ⟨finalDur, hfin⟩
+      -- Recalculate level based on new dependencies
+      let newLevel := calculateLevel rt.nodes newDepRecords
+      let currentRev := rt.revision durFin
+      let newNode : Node N := {
+        durability := durFin
         verifiedAt := currentRev  -- Update verified_at
-        -- changedAt unchanged! This is key for early cutoff
+        changedAt := node.changedAt  -- changedAt unchanged! This is key for early cutoff
+        level := newLevel
         dependencies := newDepRecords
+        dependents := node.dependents
       }
       let baseNodes := fun q => if q = qid then some newNode else rt.nodes q
-      let newNodes := updateGraphEdges baseNodes qid newDepRecords
+      -- Clean up stale edges from old dependencies (matching Rust impl)
+      let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+      let newNodes := updateGraphEdges cleanedNodes qid newDepRecords
       .ok ⟨newNodes, rt.revision, rt.numDurabilityLevels⟩
 
-/-- Confirm changed operation - value different after recompute -/
+/-- Confirm changed operation - value different after recompute.
+    Recalculates durability and level based on new dependencies (matching Rust impl). -/
 def confirmChanged {N : Nat} (rt : Runtime N) (qid : QueryId)
     (newDeps : List QueryId) : Except (List QueryId) (Runtime N × RevisionCounter) :=
   match rt.nodes qid with
@@ -1223,100 +1572,151 @@ def confirmChanged {N : Nat} (rt : Runtime N) (qid : QueryId)
     match buildDepRecords rt.nodes newDeps with
     | .error missing => .error missing
     | .ok newDepRecords =>
-      let d : Fin N := node.durability
-      let (rt', newRev) := rt.incrementRevision d
-      let newNode := { node with
+      -- Recalculate effective durability based on new dependencies (like Rust does)
+      let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+      let finalDur := min effectiveDur (N - 1)
+      have hN : N > 0 := rt.numDurabilityLevels
+      have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+      let durFin : Fin N := ⟨finalDur, hfin⟩
+      -- Recalculate level based on new dependencies
+      let newLevel := calculateLevel rt.nodes newDepRecords
+      let (rt', newRev) := rt.incrementRevision durFin
+      let newNode : Node N := {
+        durability := durFin
         verifiedAt := newRev
         changedAt := newRev  -- Update changed_at! Dependents will see this
+        level := newLevel
         dependencies := newDepRecords
+        dependents := node.dependents
       }
       let baseNodes := fun q => if q = qid then some newNode else rt'.nodes q
-      let newNodes := updateGraphEdges baseNodes qid newDepRecords
+      -- Clean up stale edges from old dependencies (matching Rust impl)
+      let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+      let newNodes := updateGraphEdges cleanedNodes qid newDepRecords
       .ok (⟨newNodes, rt'.revision, rt'.numDurabilityLevels⟩, newRev)
 
 /-- Key theorem: After confirmUnchanged, changedAt is preserved
     This is the essence of early cutoff -/
 theorem confirmUnchanged_preserves_changedAt {N : Nat}
     (rt : Runtime N) (qid : QueryId) (newDeps : List QueryId)
-    (node : Node N) (hnode : rt.nodes qid = some node) :
+    (node : Node N) (hnode : rt.nodes qid = some node)
+    (hnoself : ∀ dep ∈ node.dependencies, dep.queryId ≠ qid) :
     match confirmUnchanged rt qid newDeps with
     | .ok rt' => ∃ n, rt'.nodes qid = some n ∧ n.changedAt = node.changedAt
     | .error _ => True := by
   unfold confirmUnchanged
-  -- reduce the outer match on `rt.nodes qid`
   simp [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
   | error missing =>
     simp
   | ok newDepRecords =>
-    -- `updateGraphEdges` may change `dependents`, but never changes `changedAt`.
-    -- Build the base node update first.
-    let d : Fin N := node.durability
-    let currentRev := rt.revision d
-    let qidNode : Node N := { node with
+    -- Recalculate durability and level (matching the new definition)
+    let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hN : N > 0 := rt.numDurabilityLevels
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    let newLevel := calculateLevel rt.nodes newDepRecords
+    let currentRev := rt.revision durFin
+    let qidNode : Node N := {
+      durability := durFin
       verifiedAt := currentRev
+      changedAt := node.changedAt
+      level := newLevel
       dependencies := newDepRecords
+      dependents := node.dependents
     }
     let baseNodes : QueryId → Option (Node N) :=
       fun q => if q = qid then some qidNode else rt.nodes q
+    -- cleanupStaleEdges preserves baseNodes at qid (no self-dependency)
+    let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+    have hclean_qid : cleanedNodes qid = baseNodes qid :=
+      cleanupStaleEdges_preserves_at_qid baseNodes qid node.dependencies newDeps hnoself
     have hbase : baseNodes qid = some qidNode := by simp [baseNodes]
+    have hclean_base : cleanedNodes qid = some qidNode := by rw [hclean_qid, hbase]
     have hfold :
-        ∃ n', updateGraphEdges baseNodes qid newDepRecords qid = some n' ∧ n'.changedAt = qidNode.changedAt := by
+        ∃ n', updateGraphEdges cleanedNodes qid newDepRecords qid = some n' ∧ n'.changedAt = qidNode.changedAt := by
       rw [updateGraphEdges_eq]
-      simpa using foldl_updateGraphEdgesStep_preserves_changedAt qid qid baseNodes newDepRecords qidNode hbase
+      simpa using foldl_updateGraphEdgesStep_preserves_changedAt qid qid cleanedNodes newDepRecords qidNode hclean_base
     rcases hfold with ⟨n', hn', hchg⟩
     refine ⟨n', ?_, ?_⟩
     · -- identify the runtime's nodes map
-      simpa [baseNodes, confirmUnchanged, hnode, hbd] using hn'
+      convert hn' using 2
     · -- `qidNode.changedAt = node.changedAt` by construction
       exact Eq.trans hchg (by simp [qidNode])
 
 /-- After confirmChanged, changedAt is updated -/
 theorem confirmChanged_updates_changedAt {N : Nat}
     (rt : Runtime N) (qid : QueryId) (newDeps : List QueryId)
-    (node : Node N) (hnode : rt.nodes qid = some node) :
+    (node : Node N) (hnode : rt.nodes qid = some node)
+    (hnoself : ∀ dep ∈ node.dependencies, dep.queryId ≠ qid) :
     match confirmChanged rt qid newDeps with
     | .ok (rt', newRev) => ∃ n, rt'.nodes qid = some n ∧ n.changedAt = newRev
     | .error _ => True := by
   unfold confirmChanged
-  simp [hnode]
+  simp only [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
   | error missing =>
     simp
   | ok newDepRecords =>
-    let d : Fin N := node.durability
-    let (rt', newRev) := rt.incrementRevision d
-    let qidNode : Node N := { node with
+    simp only
+    -- The key observation: updateGraphEdges preserves changedAt
+    have hN : N > 0 := rt.numDurabilityLevels
+    let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    let newLevel := calculateLevel rt.nodes newDepRecords
+    let incResult := rt.incrementRevision durFin
+    let rt' := incResult.1
+    let newRev := incResult.2
+    let qidNode : Node N := {
+      durability := durFin
       verifiedAt := newRev
       changedAt := newRev
+      level := newLevel
       dependencies := newDepRecords
+      dependents := node.dependents
     }
     let baseNodes : QueryId → Option (Node N) :=
       fun q => if q = qid then some qidNode else rt'.nodes q
+    -- cleanupStaleEdges preserves baseNodes at qid (no self-dependency)
+    let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+    have hclean_qid : cleanedNodes qid = baseNodes qid :=
+      cleanupStaleEdges_preserves_at_qid baseNodes qid node.dependencies newDeps hnoself
     have hbase : baseNodes qid = some qidNode := by simp [baseNodes]
+    have hclean_base : cleanedNodes qid = some qidNode := by rw [hclean_qid, hbase]
     have hfold :
-        ∃ n', updateGraphEdges baseNodes qid newDepRecords qid = some n' ∧ n'.changedAt = qidNode.changedAt := by
+        ∃ n', updateGraphEdges cleanedNodes qid newDepRecords qid = some n' ∧ n'.changedAt = qidNode.changedAt := by
       rw [updateGraphEdges_eq]
-      simpa using foldl_updateGraphEdgesStep_preserves_changedAt qid qid baseNodes newDepRecords qidNode hbase
+      simpa using foldl_updateGraphEdgesStep_preserves_changedAt qid qid cleanedNodes newDepRecords qidNode hclean_base
     rcases hfold with ⟨n', hn', hchg⟩
     refine ⟨n', ?_, ?_⟩
-    · simpa [baseNodes, confirmChanged, hnode, hbd] using hn'
-    · -- qidNode.changedAt = newRev
-      simpa [qidNode] using hchg
+    · convert hn' using 2
+    · simp only [qidNode, newRev] at hchg
+      exact hchg
 
-/-- The new revision from confirmChanged is greater than current -/
+/-- The new revision from confirmChanged is greater than 0 -/
 theorem confirmChanged_increases_rev {N : Nat}
     (rt : Runtime N) (qid : QueryId) (newDeps : List QueryId)
     (node : Node N) (hnode : rt.nodes qid = some node) :
     match confirmChanged rt qid newDeps with
-    | .ok (_, newRev) => newRev = rt.revision node.durability + 1
+    | .ok (_, newRev) => newRev > 0
     | .error _ => True := by
   unfold confirmChanged
+  simp only [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
-  | error missing =>
-    simp [hnode]
+  | error missing => simp
   | ok newDepRecords =>
-    simp [hnode, incrementRevision_returns_new]
+    simp only
+    have hN : N > 0 := rt.numDurabilityLevels
+    let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    have hinc : (rt.incrementRevision durFin).2 = rt.revision durFin + 1 := incrementRevision_returns_new rt durFin
+    have : (rt.incrementRevision durFin).2 > 0 := by rw [hinc]; exact Nat.succ_pos _
+    convert this using 2
 
 /-- Early cutoff theorem: If a node's value doesn't change (confirmUnchanged),
     any dependent that observed the old changedAt will still see the same changedAt,
@@ -1324,36 +1724,48 @@ theorem confirmChanged_increases_rev {N : Nat}
 theorem early_cutoff_preserves_observation {N : Nat}
     (rt : Runtime N) (qid : QueryId) (newDeps : List QueryId)
     (node : Node N) (hnode : rt.nodes qid = some node)
+    (hnoself : ∀ dep ∈ node.dependencies, dep.queryId ≠ qid)
     (observedAt : RevisionCounter) (hobs : observedAt = node.changedAt) :
     match confirmUnchanged rt qid newDeps with
     | .ok rt' => ∃ n, rt'.nodes qid = some n ∧ n.changedAt ≤ observedAt
     | .error _ => True := by
   unfold confirmUnchanged
-  simp [hnode]
+  simp only [hnode]
   cases hbd : buildDepRecords rt.nodes newDeps with
-  | error missing =>
-    simp
+  | error missing => simp
   | ok newDepRecords =>
-    let d : Fin N := node.durability
-    let currentRev := rt.revision d
-    let qidNode : Node N := { node with
+    simp only
+    have hN : N > 0 := rt.numDurabilityLevels
+    let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    let newLevel := calculateLevel rt.nodes newDepRecords
+    let currentRev := rt.revision durFin
+    let qidNode : Node N := {
+      durability := durFin
       verifiedAt := currentRev
+      changedAt := node.changedAt
+      level := newLevel
       dependencies := newDepRecords
+      dependents := node.dependents
     }
     let baseNodes : QueryId → Option (Node N) :=
       fun q => if q = qid then some qidNode else rt.nodes q
+    -- cleanupStaleEdges preserves baseNodes at qid (no self-dependency)
+    let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+    have hclean_qid : cleanedNodes qid = baseNodes qid :=
+      cleanupStaleEdges_preserves_at_qid baseNodes qid node.dependencies newDeps hnoself
     have hbase : baseNodes qid = some qidNode := by simp [baseNodes]
+    have hclean_base : cleanedNodes qid = some qidNode := by rw [hclean_qid, hbase]
     have hfold :
-        ∃ n', updateGraphEdges baseNodes qid newDepRecords qid = some n' ∧ n'.changedAt = qidNode.changedAt := by
+        ∃ n', updateGraphEdges cleanedNodes qid newDepRecords qid = some n' ∧ n'.changedAt = qidNode.changedAt := by
       rw [updateGraphEdges_eq]
-      simpa using foldl_updateGraphEdgesStep_preserves_changedAt qid qid baseNodes newDepRecords qidNode hbase
+      simpa using foldl_updateGraphEdgesStep_preserves_changedAt qid qid cleanedNodes newDepRecords qidNode hclean_base
     rcases hfold with ⟨n', hn', hchg⟩
     refine ⟨n', ?_, ?_⟩
-    · simpa [baseNodes, confirmUnchanged, hnode, hbd] using hn'
-    · -- changedAt unchanged, so ≤ observedAt
-      have : n'.changedAt = node.changedAt := by
-        -- qidNode.changedAt = node.changedAt by construction
-        exact Eq.trans hchg (by simp [qidNode])
+    · convert hn' using 2
+    · have : n'.changedAt = node.changedAt := Eq.trans hchg (by simp [qidNode])
       simp [hobs, this]
 
 end EarlyCutoff
@@ -1364,87 +1776,247 @@ section InvariantPreservation
 
 /-- `confirmUnchanged` does not change an unrelated node.
 
-If `other ≠ qid` and `other ∉ newDeps`, then neither the target update nor the reverse-edge updates touch `other`. -/
+If `other ≠ qid`, `other ∉ newDeps`, and `other` is not in the old dependencies,
+then neither the target update, cleanup, nor the reverse-edge updates touch `other`. -/
 lemma confirmUnchanged_other_unchanged {N : Nat} (rt : Runtime N)
     (qid other : QueryId) (newDeps : List QueryId)
-    (hne : other ≠ qid) (hnot : other ∉ newDeps) :
+    (node : Node N) (hnode : rt.nodes qid = some node)
+    (hne : other ≠ qid) (hnot : other ∉ newDeps)
+    (hnotold : ∀ dep ∈ node.dependencies, dep.queryId ≠ other) :
     match confirmUnchanged rt qid newDeps with
     | .ok rt' => rt'.nodes other = rt.nodes other
     | .error _ => True := by
   unfold confirmUnchanged
-  cases hnode : rt.nodes qid with
-  | none =>
-    -- `confirmUnchanged` is a no-op
-    simp
-  | some node =>
-    cases hbd : buildDepRecords rt.nodes newDeps with
-    | error missing =>
-      simp
-    | ok newDepRecords =>
-      let baseNodes : QueryId → Option (Node N) :=
-        fun q =>
-          if q = qid then
-            some { node with verifiedAt := rt.revision node.durability, dependencies := newDepRecords }
-          else rt.nodes q
-      -- The resulting nodes map is `updateGraphEdges baseNodes qid newDepRecords`.
-      -- First, `baseNodes other = rt.nodes other` since `other ≠ qid`.
-      have hbaseOther : baseNodes other = rt.nodes other := by simp [baseNodes, hne]
-      -- Next, `updateGraphEdges` does not touch `other` because `other ∉ newDeps` implies `dep.queryId ≠ other`.
-      have hother : ∀ dep ∈ newDepRecords, dep.queryId ≠ other := by
-        intro dep hmem
-        have hqid_mem : dep.queryId ∈ newDeps :=
-          buildDepRecords_ok_mem_queryId_mem (nodes := rt.nodes) (depIds := newDeps) (depRecords := newDepRecords) hbd dep hmem
-        exact fun heq => hnot (by simpa [heq] using hqid_mem)
-      have hupd : updateGraphEdges baseNodes qid newDepRecords other = baseNodes other :=
-        updateGraphEdges_other_unchanged baseNodes qid other newDepRecords hother
-      -- reduce to the `calc` chain
-      calc
-        updateGraphEdges baseNodes qid newDepRecords other
-            = baseNodes other := hupd
-        _ = rt.nodes other := hbaseOther
+  simp only [hnode]
+  cases hbd : buildDepRecords rt.nodes newDeps with
+  | error missing => simp
+  | ok newDepRecords =>
+    simp only
+    have hN : N > 0 := rt.numDurabilityLevels
+    let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    let newLevel := calculateLevel rt.nodes newDepRecords
+    let currentRev := rt.revision durFin
+    let newNode' : Node N := {
+      durability := durFin
+      verifiedAt := currentRev
+      changedAt := node.changedAt
+      level := newLevel
+      dependencies := newDepRecords
+      dependents := node.dependents
+    }
+    let baseNodes : QueryId → Option (Node N) :=
+      fun q => if q = qid then some newNode' else rt.nodes q
+    -- cleanupStaleEdges preserves other (not in old deps)
+    let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+    have hclean_other : cleanedNodes other = baseNodes other :=
+      cleanupStaleEdges_other_unchanged baseNodes qid other node.dependencies newDeps hnotold
+    have hbaseOther : baseNodes other = rt.nodes other := by simp [baseNodes, hne]
+    have hother : ∀ dep ∈ newDepRecords, dep.queryId ≠ other := by
+      intro dep hmem
+      have hqid_mem : dep.queryId ∈ newDeps :=
+        buildDepRecords_ok_mem_queryId_mem (nodes := rt.nodes) (depIds := newDeps) (depRecords := newDepRecords) hbd dep hmem
+      exact fun heq => hnot (by simpa [heq] using hqid_mem)
+    have hupd : updateGraphEdges cleanedNodes qid newDepRecords other = cleanedNodes other :=
+      updateGraphEdges_other_unchanged cleanedNodes qid other newDepRecords hother
+    calc
+      updateGraphEdges cleanedNodes qid newDepRecords other
+          = cleanedNodes other := hupd
+      _ = baseNodes other := hclean_other
+      _ = rt.nodes other := hbaseOther
 
 /-- `confirmChanged` does not change an unrelated node.
 
-If `other ≠ qid` and `other ∉ newDeps`, then neither the target update nor the reverse-edge updates touch `other`. -/
+If `other ≠ qid`, `other ∉ newDeps`, and `other` is not in the old dependencies,
+then neither the target update, cleanup, nor the reverse-edge updates touch `other`. -/
 lemma confirmChanged_other_unchanged {N : Nat} (rt : Runtime N)
     (qid other : QueryId) (newDeps : List QueryId)
-    (hne : other ≠ qid) (hnot : other ∉ newDeps) :
+    (node : Node N) (hnode : rt.nodes qid = some node)
+    (hne : other ≠ qid) (hnot : other ∉ newDeps)
+    (hnotold : ∀ dep ∈ node.dependencies, dep.queryId ≠ other) :
     match confirmChanged rt qid newDeps with
     | .ok (rt', _newRev) => rt'.nodes other = rt.nodes other
     | .error _ => True := by
   unfold confirmChanged
+  simp only [hnode]
+  cases hbd : buildDepRecords rt.nodes newDeps with
+  | error missing => simp
+  | ok newDepRecords =>
+    simp only
+    have hN : N > 0 := rt.numDurabilityLevels
+    let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+    let finalDur := min effectiveDur (N - 1)
+    have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+    let durFin : Fin N := ⟨finalDur, hfin⟩
+    let newLevel := calculateLevel rt.nodes newDepRecords
+    let incResult := rt.incrementRevision durFin
+    let rt' := incResult.1
+    let newRev := incResult.2
+    have hpresNodes : rt'.nodes = rt.nodes := by
+      simpa [rt', incResult] using (incrementRevision_preserves_nodes (rt := rt) (d := durFin))
+    let newNode' : Node N := {
+      durability := durFin
+      verifiedAt := newRev
+      changedAt := newRev
+      level := newLevel
+      dependencies := newDepRecords
+      dependents := node.dependents
+    }
+    let baseNodes : QueryId → Option (Node N) :=
+      fun q => if q = qid then some newNode' else rt'.nodes q
+    -- cleanupStaleEdges preserves other (not in old deps)
+    let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+    have hclean_other : cleanedNodes other = baseNodes other :=
+      cleanupStaleEdges_other_unchanged baseNodes qid other node.dependencies newDeps hnotold
+    have hbaseOther : baseNodes other = rt.nodes other := by
+      simp [baseNodes, hne, hpresNodes]
+    have hother : ∀ dep ∈ newDepRecords, dep.queryId ≠ other := by
+      intro dep hmem
+      have hqid_mem : dep.queryId ∈ newDeps :=
+        buildDepRecords_ok_mem_queryId_mem (nodes := rt.nodes) (depIds := newDeps) (depRecords := newDepRecords) hbd dep hmem
+      exact fun heq => hnot (by simpa [heq] using hqid_mem)
+    have hupd : updateGraphEdges cleanedNodes qid newDepRecords other = cleanedNodes other :=
+      updateGraphEdges_other_unchanged cleanedNodes qid other newDepRecords hother
+    calc
+      updateGraphEdges cleanedNodes qid newDepRecords other
+          = cleanedNodes other := hupd
+      _ = baseNodes other := hclean_other
+      _ = rt.nodes other := hbaseOther
+
+/-! ### noSelfDependency preservation for confirm operations -/
+
+/-- confirmUnchanged preserves noSelfDependency when qid is not in newDeps -/
+theorem confirmUnchanged_preserves_noSelfDependency {N : Nat} (rt : Runtime N)
+    (qid : QueryId) (newDeps : List QueryId)
+    (hinv : noSelfDependency rt.nodes)
+    (hnotIn : qid ∉ newDeps) :
+    match confirmUnchanged rt qid newDeps with
+    | .ok rt' => noSelfDependency rt'.nodes
+    | .error _ => True := by
+  unfold confirmUnchanged
   cases hnode : rt.nodes qid with
-  | none =>
-    simp
+  | none => trivial
   | some node =>
     cases hbd : buildDepRecords rt.nodes newDeps with
-    | error missing =>
-      simp
+    | error missing => trivial
     | ok newDepRecords =>
-      -- For `other ≠ qid`, the baseNodes agrees with `rt'.nodes` at `other`, and `rt'.nodes = rt.nodes`.
-      let p := rt.incrementRevision node.durability
-      let rt' : Runtime N := p.1
-      let newRev : RevisionCounter := p.2
-      have hpresNodes : rt'.nodes = rt.nodes := by
-        simpa [rt', p] using (incrementRevision_preserves_nodes (rt := rt) (d := node.durability))
-      let baseNodes : QueryId → Option (Node N) :=
-        fun q =>
-          if q = qid then
-            some { node with verifiedAt := newRev, changedAt := newRev, dependencies := newDepRecords }
-          else rt'.nodes q
-      have hbaseOther : baseNodes other = rt.nodes other := by
-        simp [baseNodes, hne, hpresNodes]
-      have hother : ∀ dep ∈ newDepRecords, dep.queryId ≠ other := by
-        intro dep hmem
-        have hqid_mem : dep.queryId ∈ newDeps :=
-          buildDepRecords_ok_mem_queryId_mem (nodes := rt.nodes) (depIds := newDeps) (depRecords := newDepRecords) hbd dep hmem
-        exact fun heq => hnot (by simpa [heq] using hqid_mem)
-      have hupd : updateGraphEdges baseNodes qid newDepRecords other = baseNodes other :=
-        updateGraphEdges_other_unchanged baseNodes qid other newDepRecords hother
-      calc
-        updateGraphEdges baseNodes qid newDepRecords other
-            = baseNodes other := hupd
-        _ = rt.nodes other := hbaseOther
+      simp only []
+      -- Define intermediate structures explicitly (matching confirmUnchanged definition)
+      have hN : N > 0 := rt.numDurabilityLevels
+      let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+      let finalDur := min effectiveDur (N - 1)
+      have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+      let durFin : Fin N := ⟨finalDur, hfin⟩
+      let newLevel := calculateLevel rt.nodes newDepRecords
+      let currentRev := rt.revision durFin
+      let newNode' : Node N := {
+        durability := durFin
+        verifiedAt := currentRev
+        changedAt := node.changedAt
+        level := newLevel
+        dependencies := newDepRecords
+        dependents := node.dependents
+      }
+      let baseNodes : QueryId → Option (Node N) := fun q => if q = qid then some newNode' else rt.nodes q
+      let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+      let finalNodes := updateGraphEdges cleanedNodes qid newDepRecords
+      intro other otherNode hotherNode dep hdep
+      by_cases heq : other = qid
+      · -- Case: other = qid
+        have hbaseQid : baseNodes qid = some newNode' := by simp only [baseNodes, ite_true]
+        have ⟨n1, hn1, _, _, _, hdeps1⟩ := cleanupStaleEdges_preserves_node baseNodes qid qid node.dependencies newDeps newNode' hbaseQid
+        have ⟨n2, hn2, hdeps2⟩ := updateGraphEdges_preserves_dependencies qid qid cleanedNodes newDepRecords n1 hn1
+        rw [heq] at hotherNode
+        rw [hn2] at hotherNode
+        injection hotherNode with heq'
+        have hdepsOther : otherNode.dependencies = newDepRecords := by
+          rw [← heq', hdeps2, hdeps1]
+        rw [hdepsOther] at hdep
+        rw [heq]
+        exact buildDepRecords_ok_no_self rt.nodes newDeps newDepRecords qid hbd hnotIn dep hdep
+      · -- Case: other ≠ qid
+        have hbaseOther : baseNodes other = rt.nodes other := by simp only [baseNodes, heq, ite_false]
+        obtain ⟨origNode, horigNode⟩ := updateGraphEdges_some_implies_some qid other cleanedNodes newDepRecords otherNode hotherNode
+        -- Work backward: origNode is from cleanedNodes, which preserves nodes from baseNodes
+        obtain ⟨n1, hn1⟩ := cleanupStaleEdges_some_implies_some qid other baseNodes node.dependencies newDeps origNode horigNode
+        simp only [baseNodes, heq, ite_false] at hn1
+        have ⟨n1', hn1', _, _, _, hdeps1⟩ := cleanupStaleEdges_preserves_node baseNodes qid other node.dependencies newDeps n1 (by simp [baseNodes, heq, hn1])
+        have ⟨n2', hn2', hdeps2⟩ := updateGraphEdges_preserves_dependencies qid other cleanedNodes newDepRecords n1' hn1'
+        rw [hn2'] at hotherNode
+        injection hotherNode with heq'
+        have hdepsOther : otherNode.dependencies = n1.dependencies := by
+          rw [← heq', hdeps2, hdeps1]
+        rw [hdepsOther] at hdep
+        exact hinv other n1 hn1 dep hdep
+
+/-- confirmChanged preserves noSelfDependency when qid is not in newDeps -/
+theorem confirmChanged_preserves_noSelfDependency {N : Nat} (rt : Runtime N)
+    (qid : QueryId) (newDeps : List QueryId)
+    (hinv : noSelfDependency rt.nodes)
+    (hnotIn : qid ∉ newDeps) :
+    match confirmChanged rt qid newDeps with
+    | .ok (rt', _) => noSelfDependency rt'.nodes
+    | .error _ => True := by
+  unfold confirmChanged
+  cases hnode : rt.nodes qid with
+  | none => trivial
+  | some node =>
+    cases hbd : buildDepRecords rt.nodes newDeps with
+    | error missing => trivial
+    | ok newDepRecords =>
+      simp only []
+      -- Define intermediate structures explicitly (matching confirmChanged definition)
+      have hN : N > 0 := rt.numDurabilityLevels
+      let effectiveDur := calculateEffectiveDurability rt.nodes node.durability.val newDepRecords (N - 1)
+      let finalDur := min effectiveDur (N - 1)
+      have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+      let durFin : Fin N := ⟨finalDur, hfin⟩
+      let newLevel := calculateLevel rt.nodes newDepRecords
+      let incResult := rt.incrementRevision durFin
+      let rt' := incResult.1
+      let newRev := incResult.2
+      have hrtNodes : rt'.nodes = rt.nodes := incrementRevision_preserves_nodes rt durFin
+      let newNode' : Node N := {
+        durability := durFin
+        verifiedAt := newRev
+        changedAt := newRev
+        level := newLevel
+        dependencies := newDepRecords
+        dependents := node.dependents
+      }
+      let baseNodes : QueryId → Option (Node N) := fun q => if q = qid then some newNode' else rt'.nodes q
+      let cleanedNodes := cleanupStaleEdges baseNodes qid node.dependencies newDeps
+      let finalNodes := updateGraphEdges cleanedNodes qid newDepRecords
+      intro other otherNode hotherNode dep hdep
+      by_cases heq : other = qid
+      · -- Case: other = qid
+        have hbaseQid : baseNodes qid = some newNode' := by simp only [baseNodes, ite_true]
+        have ⟨n1, hn1, _, _, _, hdeps1⟩ := cleanupStaleEdges_preserves_node baseNodes qid qid node.dependencies newDeps newNode' hbaseQid
+        have ⟨n2, hn2, hdeps2⟩ := updateGraphEdges_preserves_dependencies qid qid cleanedNodes newDepRecords n1 hn1
+        rw [heq] at hotherNode
+        rw [hn2] at hotherNode
+        injection hotherNode with heq'
+        have hdepsOther : otherNode.dependencies = newDepRecords := by
+          rw [← heq', hdeps2, hdeps1]
+        rw [hdepsOther] at hdep
+        rw [heq]
+        exact buildDepRecords_ok_no_self rt.nodes newDeps newDepRecords qid hbd hnotIn dep hdep
+      · -- Case: other ≠ qid
+        have hbaseOther : baseNodes other = rt'.nodes other := by simp only [baseNodes, heq, ite_false]
+        obtain ⟨origNode, horigNode⟩ := updateGraphEdges_some_implies_some qid other cleanedNodes newDepRecords otherNode hotherNode
+        obtain ⟨n1, hn1⟩ := cleanupStaleEdges_some_implies_some qid other baseNodes node.dependencies newDeps origNode horigNode
+        simp only [baseNodes, heq, ite_false] at hn1
+        rw [hrtNodes] at hn1
+        have ⟨n1', hn1', _, _, _, hdeps1⟩ := cleanupStaleEdges_preserves_node baseNodes qid other node.dependencies newDeps n1 (by simp [baseNodes, heq, hrtNodes, hn1])
+        have ⟨n2', hn2', hdeps2⟩ := updateGraphEdges_preserves_dependencies qid other cleanedNodes newDepRecords n1' hn1'
+        rw [hn2'] at hotherNode
+        injection hotherNode with heq'
+        have hdepsOther : otherNode.dependencies = n1.dependencies := by
+          rw [← heq', hdeps2, hdeps1]
+        rw [hdepsOther] at hdep
+        exact hinv other n1 hn1 dep hdep
 
 end InvariantPreservation
 
@@ -1480,63 +2052,88 @@ theorem confirmUnchanged_preserves_dependent_validity {N : Nat}
   unfold confirmUnchanged
   cases hqnode : rt.nodes qid with
   | none =>
-    -- `.ok rt`
     simpa [hqnode] using hvalid_before
   | some qidNode =>
     cases hbd : buildDepRecords rt.nodes newDeps with
-    | error missing =>
-      simp
+    | error missing => simp
     | ok newDepRecords =>
-      let d : Fin N := qidNode.durability
-      let currentRev := rt.revision d
-      let newNode : Node N := { qidNode with verifiedAt := currentRev, dependencies := newDepRecords }
+      simp only
+      have hN : N > 0 := rt.numDurabilityLevels
+      let effectiveDur := calculateEffectiveDurability rt.nodes qidNode.durability.val newDepRecords (N - 1)
+      let finalDur := min effectiveDur (N - 1)
+      have hfin : finalDur < N := Nat.lt_of_le_of_lt (Nat.min_le_right _ _) (Nat.sub_lt hN Nat.one_pos)
+      let durFin : Fin N := ⟨finalDur, hfin⟩
+      let newLevel := calculateLevel rt.nodes newDepRecords
+      let currentRev := rt.revision durFin
+      let newNode : Node N := {
+        durability := durFin
+        verifiedAt := currentRev
+        changedAt := qidNode.changedAt  -- Key: unchanged!
+        level := newLevel
+        dependencies := newDepRecords
+        dependents := qidNode.dependents
+      }
       let baseNodes := fun q => if q = qid then some newNode else rt.nodes q
-      let finalNodes := updateGraphEdges baseNodes qid newDepRecords
-      -- reduce the top-level `match` to the successful branch
-      simp
-      -- `isValidAt` is invariant under `updateGraphEdges` (it only touches `dependents`)
+      -- Now we have cleanedNodes in the definition
+      let cleanedNodes := cleanupStaleEdges baseNodes qid qidNode.dependencies newDeps
+      let finalNodes := updateGraphEdges cleanedNodes qid newDepRecords
+      -- Show that cleanupStaleEdges doesn't affect isValidAt
+      have hclean_valid :
+          isValidAt (rt := ⟨cleanedNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev =
+            isValidAt (rt := ⟨baseNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev := by
+        exact isValidAt_cleanupStaleEdges (rt := ⟨baseNodes, rt.revision, rt.numDurabilityLevels⟩)
+          qid dependentId qidNode.dependencies newDeps atRev
       have hvalid_eq :
           isValidAt (rt := ⟨finalNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev =
-            isValidAt (rt := ⟨baseNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev := by
+            isValidAt (rt := ⟨cleanedNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev := by
         simpa [finalNodes] using
-          (isValidAt_updateGraphEdges (rt := ⟨baseNodes, rt.revision, rt.numDurabilityLevels⟩)
+          (isValidAt_updateGraphEdges (rt := ⟨cleanedNodes, rt.revision, rt.numDurabilityLevels⟩)
             qid newDepRecords dependentId atRev)
-      -- switch the goal to the `baseNodes` runtime
-      rw [hvalid_eq]
+      -- First, show the goal matches finalNodes
+      suffices h : isValidAt (rt := ⟨finalNodes, rt.revision, rt.numDurabilityLevels⟩) dependentId atRev = true by
+        convert h using 2
+      rw [hvalid_eq, hclean_valid]
+      -- Now we work with baseNodes instead of cleanedNodes
       have hbefore := hvalid_before
-      -- Goal: dependent node is unchanged, so reuse original proof, except for the dependency = qid case
       unfold isValidAt
-      simp [baseNodes, hne]
+      simp only
       unfold isValidAt at hbefore
       cases hdep : rt.nodes dependentId with
       | none =>
         simp only [hdep] at hbefore
         exact absurd hbefore Bool.false_ne_true
       | some depNode =>
-        simp [hdep] at hbefore ⊢
-        -- verified case: immediate
+        -- Show baseNodes dependentId = some depNode since dependentId ≠ qid
+        have hbase_dep : baseNodes dependentId = some depNode := by simp [baseNodes, hne, hdep]
+        simp only [hbase_dep]
+        simp only [hdep] at hbefore
         by_cases hverified : depNode.verifiedAt ≥ atRev.counters depNode.durability
         · simp [hverified]
-        · simp only [hverified] at hbefore ⊢
+        · simp only [hverified, ite_false] at hbefore ⊢
           have hbeforeAll :
               depNode.dependencies.all (fun dep =>
                 match rt.nodes dep.queryId with
                 | none => false
-                | some dn => !decide (dep.observedChangedAt < dn.changedAt)) = true := by
-            simpa using hbefore
+                | some dn => !decide (dep.observedChangedAt < dn.changedAt)) = true := hbefore
           suffices
               depNode.dependencies.all (fun dep =>
-                match if dep.queryId = qid then some newNode else rt.nodes dep.queryId with
+                match baseNodes dep.queryId with
                 | none => false
                 | some dn => !decide (dep.observedChangedAt < dn.changedAt)) = true by
-            simpa using this
+            exact this
           rw [List.all_eq_true] at hbeforeAll ⊢
           intro dep hdep_mem
           have hdep_before := hbeforeAll dep hdep_mem
           by_cases hdep_qid : dep.queryId = qid
           · subst hdep_qid
+            -- newNode.changedAt = qidNode.changedAt, so the comparison is the same
+            simp only [baseNodes]
+            simp only [ite_true]
             simpa [hqnode, newNode] using hdep_before
-          · simpa [hdep_qid] using hdep_before
+          · -- dep.queryId ≠ qid, so baseNodes dep.queryId = rt.nodes dep.queryId
+            have hbase_eq : baseNodes dep.queryId = rt.nodes dep.queryId := by simp [baseNodes, hdep_qid]
+            simp only [hbase_eq]
+            exact hdep_before
 
 /-- Multi-level: If nodes A and B are valid, and we confirmUnchanged on C (distinct from A and B),
     both A and B remain valid -/

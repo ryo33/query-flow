@@ -1,9 +1,9 @@
 //! Procedural macros for query-flow.
 //!
-//! This crate provides the `#[query]` attribute macro for defining queries
+//! This crate provides attribute macros for defining queries and asset keys
 //! with minimal boilerplate.
 //!
-//! # Example
+//! # Query Example
 //!
 //! ```ignore
 //! use query_flow::{query, QueryContext, QueryError};
@@ -17,6 +17,21 @@
 //! // pub struct Add { pub a: i32, pub b: i32 }
 //! // impl Query for Add { ... }
 //! ```
+//!
+//! # Asset Key Example
+//!
+//! ```ignore
+//! use query_flow::asset_key;
+//!
+//! #[asset_key(asset = String)]
+//! pub struct ConfigFile(pub PathBuf);
+//!
+//! #[asset_key(asset = String, durability = constant)]
+//! pub struct BundledAsset(pub PathBuf);
+//!
+//! // Generates:
+//! // impl AssetKey for ConfigFile { type Asset = String; ... }
+//! ```
 
 use darling::{ast::NestedMeta, FromMeta};
 use heck::ToUpperCamelCase;
@@ -24,8 +39,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, spanned::Spanned, Error, FnArg, Ident, ItemFn, Pat, PatType, ReturnType,
-    Type, Visibility,
+    parse_macro_input, spanned::Spanned, Error, FnArg, Ident, ItemFn, ItemStruct, Pat, PatType,
+    ReturnType, Type, Visibility,
 };
 
 /// Wrapper for parsing a list of identifiers: `keys(a, b, c)`
@@ -467,6 +482,181 @@ fn generate_query_impl(
 
             #durability_impl
             #output_eq_impl
+        }
+    })
+}
+
+// ============================================================================
+// Asset Key Macro
+// ============================================================================
+
+/// Named durability levels for assets.
+#[derive(Debug, Clone, Copy, Default)]
+enum DurabilityAttr {
+    #[default]
+    Volatile,
+    Session,
+    Stable,
+    Constant,
+}
+
+impl FromMeta for DurabilityAttr {
+    fn from_string(value: &str) -> darling::Result<Self> {
+        Self::parse_str(value)
+    }
+
+    fn from_expr(expr: &syn::Expr) -> darling::Result<Self> {
+        // Handle identifier like `constant` without quotes
+        if let syn::Expr::Path(expr_path) = expr {
+            if let Some(ident) = expr_path.path.get_ident() {
+                return Self::parse_str(&ident.to_string());
+            }
+        }
+        Err(darling::Error::custom("expected durability level: volatile, session, stable, or constant"))
+    }
+}
+
+impl DurabilityAttr {
+    fn parse_str(value: &str) -> darling::Result<Self> {
+        match value.to_lowercase().as_str() {
+            "volatile" => Ok(DurabilityAttr::Volatile),
+            "session" => Ok(DurabilityAttr::Session),
+            "stable" => Ok(DurabilityAttr::Stable),
+            "constant" => Ok(DurabilityAttr::Constant),
+            _ => Err(darling::Error::unknown_value(value)),
+        }
+    }
+}
+
+/// Wrapper for parsing a type from attribute: `asset = String` or `asset = Vec<u8>`
+#[derive(Debug)]
+struct TypeWrapper(syn::Type);
+
+impl FromMeta for TypeWrapper {
+    fn from_expr(expr: &syn::Expr) -> darling::Result<Self> {
+        // Convert expression to token stream and parse as type
+        let tokens = quote! { #expr };
+        syn::parse2::<syn::Type>(tokens)
+            .map(TypeWrapper)
+            .map_err(|e| darling::Error::custom(format!("invalid type: {}", e)))
+    }
+}
+
+/// Options for the `#[asset_key]` attribute.
+#[derive(Debug, FromMeta)]
+struct AssetKeyAttr {
+    /// The asset type this key loads (required).
+    asset: TypeWrapper,
+
+    /// Durability level. Default: volatile.
+    #[darling(default)]
+    durability: DurabilityAttr,
+
+    /// Asset equality for early cutoff optimization.
+    /// Default: uses PartialEq (`old == new`).
+    /// `asset_eq = path`: uses custom function for types without PartialEq.
+    #[darling(default)]
+    asset_eq: OutputEq,
+}
+
+/// Define an asset key type.
+///
+/// # Attributes
+///
+/// - `asset = Type`: The asset type this key loads (required)
+/// - `durability = volatile|session|stable|constant`: Durability level (default: volatile)
+/// - `asset_eq`: Use PartialEq for asset comparison (default)
+/// - `asset_eq = path`: Use custom function for asset comparison
+///
+/// # Example
+///
+/// ```ignore
+/// use query_flow::asset_key;
+/// use std::path::PathBuf;
+///
+/// // Default: volatile durability
+/// #[asset_key(asset = String)]
+/// pub struct ConfigFile(pub PathBuf);
+///
+/// // Explicit constant durability for bundled assets
+/// #[asset_key(asset = String, durability = constant)]
+/// pub struct BundledFile(pub PathBuf);
+///
+/// // Custom equality
+/// #[asset_key(asset = ImageData, asset_eq = image_bytes_eq)]
+/// pub struct TexturePath(pub String);
+/// ```
+#[proc_macro_attribute]
+pub fn asset_key(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr_args = match NestedMeta::parse_meta_list(attr.into()) {
+        Ok(v) => v,
+        Err(e) => return TokenStream::from(e.to_compile_error()),
+    };
+
+    let attr = match AssetKeyAttr::from_list(&attr_args) {
+        Ok(v) => v,
+        Err(e) => return TokenStream::from(e.write_errors()),
+    };
+
+    let input_struct = parse_macro_input!(item as ItemStruct);
+
+    match generate_asset_key(attr, input_struct) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn generate_asset_key(attr: AssetKeyAttr, input_struct: ItemStruct) -> Result<TokenStream2, Error> {
+    let struct_name = &input_struct.ident;
+    let asset_ty = &attr.asset.0;
+
+    // Generate durability method
+    let durability_impl = match attr.durability {
+        DurabilityAttr::Volatile => quote! {
+            fn durability(&self) -> ::query_flow::DurabilityLevel {
+                ::query_flow::DurabilityLevel::Volatile
+            }
+        },
+        DurabilityAttr::Session => quote! {
+            fn durability(&self) -> ::query_flow::DurabilityLevel {
+                ::query_flow::DurabilityLevel::Session
+            }
+        },
+        DurabilityAttr::Stable => quote! {
+            fn durability(&self) -> ::query_flow::DurabilityLevel {
+                ::query_flow::DurabilityLevel::Stable
+            }
+        },
+        DurabilityAttr::Constant => quote! {
+            fn durability(&self) -> ::query_flow::DurabilityLevel {
+                ::query_flow::DurabilityLevel::Constant
+            }
+        },
+    };
+
+    // Generate asset_eq method
+    let asset_eq_impl = match &attr.asset_eq {
+        OutputEq::None | OutputEq::PartialEq => quote! {
+            fn asset_eq(old: &Self::Asset, new: &Self::Asset) -> bool {
+                old == new
+            }
+        },
+        OutputEq::Custom(custom_fn) => quote! {
+            fn asset_eq(old: &Self::Asset, new: &Self::Asset) -> bool {
+                #custom_fn(old, new)
+            }
+        },
+    };
+
+    Ok(quote! {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        #input_struct
+
+        impl ::query_flow::AssetKey for #struct_name {
+            type Asset = #asset_ty;
+
+            #asset_eq_impl
+            #durability_impl
         }
     })
 }

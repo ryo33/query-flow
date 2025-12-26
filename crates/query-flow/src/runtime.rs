@@ -2,14 +2,15 @@
 
 use std::any::TypeId;
 use std::cell::RefCell;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use whale::{Durability, Runtime as WhaleRuntime};
 
+use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
 use crate::key::FullCacheKey;
+use crate::loading::LoadingState;
 use crate::query::Query;
-use crate::storage::{CacheStorage, LoadedStorage};
+use crate::storage::{AssetState, AssetStorage, CacheStorage, LocatorStorage, PendingStorage};
 use crate::QueryError;
 
 /// Number of durability levels (matches whale's default).
@@ -17,7 +18,7 @@ const DURABILITY_LEVELS: usize = 4;
 
 // Thread-local query execution stack for cycle detection.
 thread_local! {
-    static QUERY_STACK: RefCell<Vec<FullCacheKey>> = RefCell::new(Vec::new());
+    static QUERY_STACK: RefCell<Vec<FullCacheKey>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The query runtime manages query execution, caching, and dependency tracking.
@@ -40,33 +41,12 @@ pub struct QueryRuntime {
     whale: WhaleRuntime<FullCacheKey, (), DURABILITY_LEVELS>,
     /// Cache for query outputs
     cache: Arc<CacheStorage>,
-    /// Storage for values loaded by background tasks
-    loaded: Arc<LoadedStorage>,
-    /// Sender for notifying when loaded values are ready
-    notify: Arc<Notify>,
-}
-
-/// Simple notification mechanism for background task completion.
-///
-/// This is a placeholder for now - real async support would use
-/// tokio::sync::Notify or similar.
-struct Notify;
-
-impl Default for Notify {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Notify {
-    fn new() -> Self {
-        Self
-    }
-
-    #[allow(dead_code)]
-    fn notify_waiters(&self) {
-        // TODO: Implement proper notification when async feature is added
-    }
+    /// Asset cache and state storage
+    assets: Arc<AssetStorage>,
+    /// Registered asset locators
+    locators: Arc<LocatorStorage>,
+    /// Pending asset requests
+    pending: Arc<PendingStorage>,
 }
 
 impl Default for QueryRuntime {
@@ -80,8 +60,9 @@ impl Clone for QueryRuntime {
         Self {
             whale: self.whale.clone(),
             cache: self.cache.clone(),
-            loaded: self.loaded.clone(),
-            notify: self.notify.clone(),
+            assets: self.assets.clone(),
+            locators: self.locators.clone(),
+            pending: self.pending.clone(),
         }
     }
 }
@@ -92,8 +73,9 @@ impl QueryRuntime {
         Self {
             whale: WhaleRuntime::new(),
             cache: Arc::new(CacheStorage::new()),
-            loaded: Arc::new(LoadedStorage::new()),
-            notify: Arc::new(Notify::new()),
+            assets: Arc::new(AssetStorage::new()),
+            locators: Arc::new(LocatorStorage::new()),
+            pending: Arc::new(PendingStorage::new()),
         }
     }
 
@@ -200,32 +182,6 @@ impl QueryRuntime {
         self.cache.get::<Q>(full_key)
     }
 
-    /// Get a loaded value from background task storage.
-    pub(crate) fn get_loaded<T: Send + Sync + 'static, K: Hash>(
-        &self,
-        type_id: TypeId,
-        key: &K,
-    ) -> Option<Arc<T>> {
-        let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
-        let key_hash = hasher.finish();
-        self.loaded.get::<T>(type_id, key_hash)
-    }
-
-    /// Store a loaded value and notify waiters.
-    pub(crate) fn set_loaded<T: Send + Sync + 'static, K: Hash>(
-        &self,
-        type_id: TypeId,
-        key: &K,
-        value: T,
-    ) {
-        let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
-        let key_hash = hasher.finish();
-        self.loaded.insert::<T>(type_id, key_hash, Arc::new(value));
-        self.notify.notify_waiters();
-    }
-
     /// Invalidate a query, forcing recomputation on next access.
     pub fn invalidate<Q: Query>(&self, key: &Q::CacheKey) {
         let full_key = FullCacheKey::new::<Q, _>(key);
@@ -236,6 +192,245 @@ impl QueryRuntime {
     /// Clear all cached values.
     pub fn clear_cache(&self) {
         self.cache.clear();
+    }
+}
+
+// ============================================================================
+// Asset API
+// ============================================================================
+
+impl QueryRuntime {
+    /// Register an asset locator for a specific asset key type.
+    ///
+    /// Only one locator can be registered per key type. Later registrations
+    /// replace earlier ones.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let runtime = QueryRuntime::new();
+    /// runtime.register_asset_locator(FileSystemLocator::new("/assets"));
+    /// ```
+    pub fn register_asset_locator<K, L>(&self, locator: L)
+    where
+        K: AssetKey,
+        L: AssetLocator<K>,
+    {
+        self.locators.insert::<K, L>(locator);
+    }
+
+    /// Get an iterator over pending asset requests.
+    ///
+    /// Returns assets that have been requested but not yet resolved.
+    /// The user should fetch these externally and call `resolve_asset()`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// for pending in runtime.pending_assets() {
+    ///     if let Some(path) = pending.key::<FilePath>() {
+    ///         let content = fetch_file(path);
+    ///         runtime.resolve_asset(path.clone(), content);
+    ///     }
+    /// }
+    /// ```
+    pub fn pending_assets(&self) -> Vec<PendingAsset> {
+        self.pending.get_all()
+    }
+
+    /// Get pending assets filtered by key type.
+    pub fn pending_assets_of<K: AssetKey>(&self) -> Vec<K> {
+        self.pending.get_of_type::<K>()
+    }
+
+    /// Check if there are any pending assets.
+    pub fn has_pending_assets(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Resolve an asset with its loaded value.
+    ///
+    /// This marks the asset as ready and invalidates any queries that
+    /// depend on it (if the value changed), triggering recomputation on next access.
+    ///
+    /// This method is idempotent - resolving with the same value (via `asset_eq`)
+    /// will not trigger downstream recomputation.
+    ///
+    /// Uses the asset key's default durability.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let content = std::fs::read_to_string(&path)?;
+    /// runtime.resolve_asset(FilePath(path), content);
+    /// ```
+    pub fn resolve_asset<K: AssetKey>(&self, key: K, value: K::Asset) {
+        let durability = key.durability();
+        self.resolve_asset_internal(key, value, durability);
+    }
+
+    /// Resolve an asset with a specific durability level.
+    ///
+    /// Use this to override the asset key's default durability.
+    pub fn resolve_asset_with_durability<K: AssetKey>(
+        &self,
+        key: K,
+        value: K::Asset,
+        durability: DurabilityLevel,
+    ) {
+        self.resolve_asset_internal(key, value, durability);
+    }
+
+    fn resolve_asset_internal<K: AssetKey>(
+        &self,
+        key: K,
+        value: K::Asset,
+        durability_level: DurabilityLevel,
+    ) {
+        let full_asset_key = FullAssetKey::new(&key);
+        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Check for early cutoff
+        let changed = if let Some(old_value) = self.assets.get_ready::<K>(&full_asset_key) {
+            !K::asset_eq(&old_value, &value)
+        } else {
+            true // Loading or NotFound -> Ready is a change
+        };
+
+        // Store the new value
+        self.assets.insert_ready::<K>(full_asset_key.clone(), Arc::new(value));
+
+        // Remove from pending
+        self.pending.remove(&full_asset_key);
+
+        // Update whale dependency tracking
+        let durability = Durability::new(durability_level.as_u8() as usize)
+            .unwrap_or(Durability::volatile());
+
+        if changed {
+            // Register with new changed_at to invalidate dependents
+            let _ = self.whale.register(full_cache_key, (), durability, vec![]);
+        } else {
+            // Early cutoff - keep old changed_at
+            let _ = self.whale.confirm_unchanged(&full_cache_key, vec![]);
+        }
+    }
+
+    /// Invalidate an asset, forcing queries to re-request it.
+    ///
+    /// The asset will be marked as loading and added to pending assets.
+    /// Dependent queries will suspend until the asset is resolved again.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // File was modified externally
+    /// runtime.invalidate_asset(&FilePath("config.json".into()));
+    /// // Queries depending on this asset will now suspend
+    /// // User should fetch the new value and call resolve_asset
+    /// ```
+    pub fn invalidate_asset<K: AssetKey>(&self, key: &K) {
+        let full_asset_key = FullAssetKey::new(key);
+        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Mark as loading
+        self.assets.insert(full_asset_key.clone(), AssetState::Loading);
+
+        // Add to pending
+        self.pending.insert::<K>(full_asset_key, key.clone());
+
+        // Update whale to invalidate dependents (use volatile during loading)
+        let _ = self.whale.register(full_cache_key, (), Durability::volatile(), vec![]);
+    }
+
+    /// Remove an asset from the cache entirely.
+    ///
+    /// Unlike `invalidate_asset`, this removes all traces of the asset.
+    /// Dependent queries will go through the locator again on next access.
+    pub fn remove_asset<K: AssetKey>(&self, key: &K) {
+        let full_asset_key = FullAssetKey::new(key);
+        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // First, register a change to invalidate dependents
+        // This ensures queries that depend on this asset will recompute
+        let _ = self.whale.register(full_cache_key.clone(), (), Durability::volatile(), vec![]);
+
+        // Then remove the asset from storage
+        self.assets.remove(&full_asset_key);
+        self.pending.remove(&full_asset_key);
+
+        // Finally remove from whale tracking
+        self.whale.remove(&full_cache_key);
+    }
+
+    /// Internal: Get asset state, checking cache and locator.
+    fn get_asset_internal<K: AssetKey>(
+        &self,
+        key: &K,
+    ) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
+        let full_asset_key = FullAssetKey::new(key);
+        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Check cache first
+        if let Some(state) = self.assets.get(&full_asset_key) {
+            // Check if whale thinks it's valid
+            if self.whale.is_valid(&full_cache_key) {
+                return match state {
+                    AssetState::Loading => Ok(LoadingState::Loading),
+                    AssetState::Ready(arc) => {
+                        match arc.downcast::<K::Asset>() {
+                            Ok(value) => Ok(LoadingState::Ready(value)),
+                            Err(_) => Err(QueryError::MissingDependency {
+                                description: format!("Asset type mismatch: {:?}", key),
+                            }),
+                        }
+                    }
+                    AssetState::NotFound => Err(QueryError::MissingDependency {
+                        description: format!("Asset not found: {:?}", key),
+                    }),
+                };
+            }
+        }
+
+        // Check if there's a registered locator
+        if let Some(locator) = self.locators.get(TypeId::of::<K>()) {
+            if let Some(state) = locator.locate_any(key) {
+                // Store the state
+                self.assets.insert(full_asset_key.clone(), state.clone());
+
+                match state {
+                    AssetState::Ready(arc) => {
+                        // Register with whale
+                        let durability = Durability::new(key.durability().as_u8() as usize)
+                            .unwrap_or(Durability::volatile());
+                        let _ = self.whale.register(full_cache_key, (), durability, vec![]);
+
+                        match arc.downcast::<K::Asset>() {
+                            Ok(value) => return Ok(LoadingState::Ready(value)),
+                            Err(_) => {
+                                return Err(QueryError::MissingDependency {
+                                    description: format!("Asset type mismatch: {:?}", key),
+                                })
+                            }
+                        }
+                    }
+                    AssetState::Loading => {
+                        self.pending.insert::<K>(full_asset_key, key.clone());
+                        return Ok(LoadingState::Loading);
+                    }
+                    AssetState::NotFound => {
+                        return Err(QueryError::MissingDependency {
+                            description: format!("Asset not found: {:?}", key),
+                        });
+                    }
+                }
+            }
+        }
+
+        // No locator registered or locator returned None - mark as pending
+        self.assets.insert(full_asset_key.clone(), AssetState::Loading);
+        self.pending.insert::<K>(full_asset_key, key.clone());
+        Ok(LoadingState::Loading)
     }
 }
 
@@ -273,58 +468,35 @@ impl<'a> QueryContext<'a> {
         self.runtime.query(query)
     }
 
-    /// Get a previously loaded value from a background task.
+    /// Access an asset, tracking it as a dependency.
     ///
-    /// Returns `None` if the value hasn't been loaded yet.
-    pub fn get_loaded<T: Send + Sync + 'static, K: Hash>(&self, key: &K) -> Option<Arc<T>> {
-        self.runtime.get_loaded::<T, K>(TypeId::of::<T>(), key)
-    }
-
-    /// Get access to the runtime for spawning background tasks.
-    pub fn runtime(&self) -> &QueryRuntime {
-        self.runtime
-    }
-}
-
-/// Handle for spawning background loading tasks.
-impl QueryRuntime {
-    /// Spawn a background task that will load a value using a thread.
-    ///
-    /// When the task completes, the value will be stored and any suspended
-    /// queries will be able to proceed on their next execution.
+    /// Returns `LoadingState<Arc<K::Asset>>`:
+    /// - `LoadingState::Loading` if the asset is still being loaded
+    /// - `LoadingState::Ready(value)` if the asset is available
     ///
     /// # Example
     ///
     /// ```ignore
-    /// fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-    ///     // Check if already loaded
-    ///     if let Some(content) = ctx.get_loaded::<String, _>(&self.path) {
-    ///         return Ok((*content).clone());
-    ///     }
-    ///
-    ///     // Spawn background loader
-    ///     let runtime = ctx.runtime().clone();
-    ///     let path = self.path.clone();
-    ///     runtime.spawn_loader(&path, move || {
-    ///         std::fs::read_to_string(&path).unwrap()
-    ///     });
-    ///
-    ///     Err(QueryError::Suspend)
+    /// #[query]
+    /// fn process_file(ctx: &mut QueryContext, path: FilePath) -> Result<Output, QueryError> {
+    ///     let content = ctx.asset(&path)?.suspend()?;
+    ///     // Process content...
+    ///     Ok(output)
     /// }
     /// ```
-    pub fn spawn_loader<T, K, F>(&self, key: &K, loader: F)
-    where
-        T: Send + Sync + 'static,
-        K: Hash + Clone + Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        let runtime = self.clone();
-        let type_id = TypeId::of::<T>();
-        let key = key.clone();
-        std::thread::spawn(move || {
-            let value = loader();
-            runtime.set_loaded::<T, K>(type_id, &key, value);
-        });
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
+    pub fn asset<K: AssetKey>(&mut self, key: &K) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
+        let full_asset_key = FullAssetKey::new(key);
+        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Record dependency on this asset
+        self.deps.borrow_mut().push(full_cache_key);
+
+        // Get asset from runtime
+        self.runtime.get_asset_internal(key)
     }
 }
 

@@ -29,6 +29,7 @@
 // Allow the macro to reference query_flow types when used inside this crate
 extern crate self as query_flow;
 
+mod asset;
 mod error;
 mod key;
 mod loading;
@@ -36,9 +37,10 @@ mod query;
 mod runtime;
 mod storage;
 
+pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
 pub use error::QueryError;
 pub use key::Key;
 pub use loading::LoadingState;
 pub use query::Query;
-pub use query_flow_macros::query;
+pub use query_flow_macros::{asset_key, query};
 pub use runtime::{QueryContext, QueryRuntime};

@@ -31,9 +31,10 @@ use crate::QueryError;
 ///     }
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LoadingState<T> {
     /// Resource is still loading.
+    #[default]
     Loading,
     /// Resource is ready with the given value.
     Ready(T),
@@ -108,12 +109,6 @@ impl<T> LoadingState<T> {
             LoadingState::Loading => LoadingState::Loading,
             LoadingState::Ready(t) => f(t),
         }
-    }
-}
-
-impl<T> Default for LoadingState<T> {
-    fn default() -> Self {
-        LoadingState::Loading
     }
 }
 

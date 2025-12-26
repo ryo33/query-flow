@@ -1,14 +1,12 @@
 //! Calc example: A simple expression evaluator demonstrating query-flow.
 //!
 //! This example is inspired by salsa-rs's calc example, showing:
-//! - Input queries (source text)
+//! - Asset-based inputs (source text, variables)
 //! - Derived queries (parsing, evaluation)
 //! - Incremental recomputation
 //! - Early cutoff optimization
 
-use query_flow::{query, Query, QueryContext, QueryError, QueryRuntime};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use query_flow::{asset_key, query, Query, QueryContext, QueryError, QueryRuntime};
 
 // ============================================================================
 // Expression AST
@@ -34,93 +32,30 @@ pub enum BinOp {
 }
 
 // ============================================================================
-// Input Storage (simulates external inputs like file contents)
+// Asset Keys (external inputs)
 // ============================================================================
 
-/// Storage for input values that can change between queries.
-/// In a real application, this might be file contents, user input, etc.
-#[derive(Default)]
-pub struct InputStorage {
-    /// Source text for each "file" (identified by name)
-    sources: RwLock<HashMap<String, String>>,
-    /// Variable bindings
-    variables: RwLock<HashMap<String, i64>>,
-}
+/// Asset key for source file content.
+#[asset_key(asset = String, durability = stable)]
+pub struct SourceFile(pub String);
 
-impl InputStorage {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_source(&self, name: &str, source: &str) {
-        self.sources
-            .write()
-            .unwrap()
-            .insert(name.to_string(), source.to_string());
-    }
-
-    pub fn get_source(&self, name: &str) -> Option<String> {
-        self.sources.read().unwrap().get(name).cloned()
-    }
-
-    pub fn set_variable(&self, name: &str, value: i64) {
-        self.variables
-            .write()
-            .unwrap()
-            .insert(name.to_string(), value);
-    }
-
-    pub fn get_variable(&self, name: &str) -> Option<i64> {
-        self.variables.read().unwrap().get(name).copied()
-    }
-}
-
-// We'll use a thread-local to access inputs from queries
-thread_local! {
-    static INPUTS: std::cell::RefCell<Option<Arc<InputStorage>>> = const { std::cell::RefCell::new(None) };
-}
-
-fn with_inputs<R>(f: impl FnOnce(&InputStorage) -> R) -> R {
-    INPUTS.with(|inputs| {
-        let inputs = inputs.borrow();
-        let inputs = inputs.as_ref().expect("InputStorage not set");
-        f(inputs)
-    })
-}
-
-fn set_inputs(storage: Arc<InputStorage>) {
-    INPUTS.with(|inputs| {
-        *inputs.borrow_mut() = Some(storage);
-    });
-}
+/// Asset key for variable bindings.
+#[asset_key(asset = i64, durability = stable)]
+pub struct Variable(pub String);
 
 // ============================================================================
 // Queries
 // ============================================================================
 
-/// Query to get source text for a file.
-/// This is an "input" query - its value comes from external storage.
-#[query(durability = 1)]
-fn source_text(ctx: &mut QueryContext, file_name: String) -> Result<String, QueryError> {
-    let _ = ctx;
-    Ok(with_inputs(|inputs| {
-        inputs
-            .get_source(&file_name)
-            .unwrap_or_else(|| String::new())
-    }))
-}
-
-/// Query to get a variable's value.
-#[query(durability = 1)]
-fn variable_value(ctx: &mut QueryContext, var_name: String) -> Result<i64, QueryError> {
-    let _ = ctx;
-    Ok(with_inputs(|inputs| inputs.get_variable(&var_name).unwrap_or(0)))
-}
-
 /// Parse source text into an expression.
 #[query]
 fn parse_expr(ctx: &mut QueryContext, file_name: String) -> Result<Expr, QueryError> {
-    let source = ctx.query(SourceText::new(file_name.clone()))?;
+    // Get source from asset, default to empty string if not found
+    let source = ctx
+        .asset(&SourceFile(file_name.clone()))?
+        .map(|s| (*s).clone())
+        .suspend()
+        .unwrap_or_default();
     Ok(parse(&source))
 }
 
@@ -240,8 +175,13 @@ fn eval_expr(ctx: &mut QueryContext, expr: &Expr) -> Result<i64, QueryError> {
     match expr {
         Expr::Number(n) => Ok(*n),
         Expr::Variable(name) => {
-            let value = ctx.query(VariableValue::new(name.clone()))?;
-            Ok(*value)
+            // Get variable from asset, default to 0 if not found
+            let value = ctx
+                .asset(&Variable(name.clone()))?
+                .map(|v| *v)
+                .suspend()
+                .unwrap_or(0);
+            Ok(value)
         }
         Expr::BinOp { op, lhs, rhs } => {
             let lhs_val = eval_expr(ctx, lhs)?;
@@ -268,15 +208,10 @@ fn eval_expr(ctx: &mut QueryContext, expr: &Expr) -> Result<i64, QueryError> {
 
 #[test]
 fn test_simple_expression() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "1 + 2 * 3");
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("main".to_string()))
-        .unwrap();
+    runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2 * 3".to_string());
+
+    let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // 1 + (2 * 3) = 7
     assert_eq!(*result, 7);
@@ -284,17 +219,12 @@ fn test_simple_expression() {
 
 #[test]
 fn test_with_variables() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "x + y * 2");
-    inputs.set_variable("x", 10);
-    inputs.set_variable("y", 5);
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("main".to_string()))
-        .unwrap();
+    runtime.resolve_asset(SourceFile("main".to_string()), "x + y * 2".to_string());
+    runtime.resolve_asset(Variable("x".to_string()), 10);
+    runtime.resolve_asset(Variable("y".to_string()), 5);
+
+    let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // 10 + (5 * 2) = 20
     assert_eq!(*result, 20);
@@ -302,15 +232,10 @@ fn test_with_variables() {
 
 #[test]
 fn test_parentheses() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "(1 + 2) * 3");
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("main".to_string()))
-        .unwrap();
+    runtime.resolve_asset(SourceFile("main".to_string()), "(1 + 2) * 3".to_string());
+
+    let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // (1 + 2) * 3 = 9
     assert_eq!(*result, 9);
@@ -337,7 +262,11 @@ fn test_caching() {
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
-            let source = ctx.query(SourceText::new(self.file_name.clone()))?;
+            let source = ctx
+                .asset(&SourceFile(self.file_name.clone()))?
+                .map(|s| (*s).clone())
+                .suspend()
+                .unwrap_or_default();
             Ok(parse(&source))
         }
 
@@ -346,12 +275,8 @@ fn test_caching() {
         }
     }
 
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "1 + 2");
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
+    runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2".to_string());
 
     // First query - should parse
     let _ = runtime
@@ -372,15 +297,13 @@ fn test_caching() {
 
 #[test]
 fn test_complex_expression() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "((2 + 3) * 4 - 5) / 3");
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("main".to_string()))
-        .unwrap();
+    runtime.resolve_asset(
+        SourceFile("main".to_string()),
+        "((2 + 3) * 4 - 5) / 3".to_string(),
+    );
+
+    let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // ((2 + 3) * 4 - 5) / 3 = (5 * 4 - 5) / 3 = (20 - 5) / 3 = 15 / 3 = 5
     assert_eq!(*result, 5);
@@ -388,14 +311,10 @@ fn test_complex_expression() {
 
 #[test]
 fn test_multiple_files() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("a", "10");
-    inputs.set_source("b", "20 + 5");
-    inputs.set_source("c", "3 * 3");
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
+    runtime.resolve_asset(SourceFile("a".to_string()), "10".to_string());
+    runtime.resolve_asset(SourceFile("b".to_string()), "20 + 5".to_string());
+    runtime.resolve_asset(SourceFile("c".to_string()), "3 * 3".to_string());
 
     let a = runtime.query(EvalFile::new("a".to_string())).unwrap();
     let b = runtime.query(EvalFile::new("b".to_string())).unwrap();
@@ -408,21 +327,17 @@ fn test_multiple_files() {
 
 #[test]
 fn test_dependency_chain() {
-    // This test demonstrates a chain of queries:
-    // source_text -> parse_expr -> eval_file
-
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("expr", "a * b + c");
-    inputs.set_variable("a", 2);
-    inputs.set_variable("b", 3);
-    inputs.set_variable("c", 4);
-
-    set_inputs(inputs);
+    // This test demonstrates a chain of dependencies:
+    // SourceFile asset -> parse_expr query -> eval_file query
+    // Variable assets -> eval_file query
 
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("expr".to_string()))
-        .unwrap();
+    runtime.resolve_asset(SourceFile("expr".to_string()), "a * b + c".to_string());
+    runtime.resolve_asset(Variable("a".to_string()), 2);
+    runtime.resolve_asset(Variable("b".to_string()), 3);
+    runtime.resolve_asset(Variable("c".to_string()), 4);
+
+    let result = runtime.query(EvalFile::new("expr".to_string())).unwrap();
 
     // 2 * 3 + 4 = 10
     assert_eq!(*result, 10);
@@ -430,15 +345,10 @@ fn test_dependency_chain() {
 
 #[test]
 fn test_subtraction_and_division() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "100 - 50 / 2");
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("main".to_string()))
-        .unwrap();
+    runtime.resolve_asset(SourceFile("main".to_string()), "100 - 50 / 2".to_string());
+
+    let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // 100 - (50 / 2) = 100 - 25 = 75
     assert_eq!(*result, 75);
@@ -446,28 +356,20 @@ fn test_subtraction_and_division() {
 
 #[test]
 fn test_variable_only() {
-    let inputs = Arc::new(InputStorage::new());
-    inputs.set_source("main", "answer");
-    inputs.set_variable("answer", 42);
-
-    set_inputs(inputs);
-
     let runtime = QueryRuntime::new();
-    let result = runtime
-        .query(EvalFile::new("main".to_string()))
-        .unwrap();
+    runtime.resolve_asset(SourceFile("main".to_string()), "answer".to_string());
+    runtime.resolve_asset(Variable("answer".to_string()), 42);
+
+    let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     assert_eq!(*result, 42);
 }
 
 #[test]
 fn test_empty_source() {
-    let inputs = Arc::new(InputStorage::new());
+    let runtime = QueryRuntime::new();
     // Don't set any source - should get empty string -> 0
 
-    set_inputs(inputs);
-
-    let runtime = QueryRuntime::new();
     let result = runtime
         .query(EvalFile::new("nonexistent".to_string()))
         .unwrap();

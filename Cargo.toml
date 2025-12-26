@@ -1,23 +1,24 @@
-[package]
-name = "whale"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-keywords = ["reactive", "incremental", "dependency-tracking"]
-description = "A lock-free, dependency-tracking primitive for incremental computation."
-categories = ["data-structures"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/ryo33/whale"
 repository = "https://github.com/ryo33/whale"
-readme = "README.md"
 
-[features]
-default = ["serde"]
-serde = ["dep:serde", "papaya/serde", "ahash/serde"]
-
-[dependencies]
+[workspace.dependencies]
+whale = { path = "crates/whale" }
+query-flow = { path = "crates/query-flow" }
+query-flow-macros = { path = "crates/query-flow-macros" }
 ahash = "0.8"
-papaya = { version = "0.2" }
-serde = { version = "1", features = ["derive", "rc"], optional = true }
-
-[dev-dependencies]
+papaya = "0.2"
+serde = { version = "1", features = ["derive", "rc"] }
 tokio = { version = "1", features = ["full"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+darling = "0.20"
+heck = "0.5"

@@ -4,6 +4,7 @@
 
 !Cargo.toml
 !src/**/*.rs
+!crates/**/*.rs
 
 !.gitignore
 !README.md

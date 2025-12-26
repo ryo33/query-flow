@@ -1,5 +1,5 @@
 #![deny(missing_docs)]
-#![doc = include_str!("../README.md")]
+#![doc = include_str!("../../../README.md")]
 
 //! Whale is a lock-free incremental computation dependency tracking library.
 //!

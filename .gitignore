@@ -14,3 +14,5 @@
 
 !lakefile.toml
 !*.lean
+!/lake-manifest.json
+!/lean-toolchain

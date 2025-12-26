@@ -31,6 +31,7 @@ extern crate self as query_flow;
 
 mod asset;
 mod error;
+mod inspector;
 mod key;
 mod loading;
 mod query;

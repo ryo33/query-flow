@@ -13,6 +13,9 @@ use crate::query::Query;
 use crate::storage::{AssetState, AssetStorage, CacheStorage, LocatorStorage, PendingStorage};
 use crate::QueryError;
 
+#[cfg(feature = "inspector")]
+use query_flow_inspector::{EventSink, FlowEvent, SpanId};
+
 /// Number of durability levels (matches whale's default).
 const DURABILITY_LEVELS: usize = 4;
 
@@ -47,6 +50,9 @@ pub struct QueryRuntime {
     locators: Arc<LocatorStorage>,
     /// Pending asset requests
     pending: Arc<PendingStorage>,
+    /// Event sink for inspector/tracing
+    #[cfg(feature = "inspector")]
+    sink: Arc<parking_lot::RwLock<Option<Arc<dyn EventSink>>>>,
 }
 
 impl Default for QueryRuntime {
@@ -63,6 +69,8 @@ impl Clone for QueryRuntime {
             assets: self.assets.clone(),
             locators: self.locators.clone(),
             pending: self.pending.clone(),
+            #[cfg(feature = "inspector")]
+            sink: self.sink.clone(),
         }
     }
 }
@@ -76,6 +84,44 @@ impl QueryRuntime {
             assets: Arc::new(AssetStorage::new()),
             locators: Arc::new(LocatorStorage::new()),
             pending: Arc::new(PendingStorage::new()),
+            #[cfg(feature = "inspector")]
+            sink: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    /// Set the event sink for tracing/inspection.
+    ///
+    /// Pass `Some(sink)` to enable event collection, or `None` to disable.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use query_flow_inspector::EventCollector;
+    /// use std::sync::Arc;
+    ///
+    /// let collector = Arc::new(EventCollector::new());
+    /// runtime.set_sink(Some(collector.clone()));
+    /// runtime.query(MyQuery::new());
+    /// let trace = collector.trace();
+    /// ```
+    #[cfg(feature = "inspector")]
+    pub fn set_sink(&self, sink: Option<Arc<dyn EventSink>>) {
+        *self.sink.write() = sink;
+    }
+
+    /// Get the current event sink.
+    #[cfg(feature = "inspector")]
+    pub fn sink(&self) -> Option<Arc<dyn EventSink>> {
+        self.sink.read().clone()
+    }
+
+    /// Emit an event to the sink if one is set.
+    #[cfg(feature = "inspector")]
+    #[inline]
+    fn emit<F: FnOnce() -> FlowEvent>(&self, event: F) {
+        let guard = self.sink.read();
+        if let Some(ref sink) = *guard {
+            sink.emit(event());
         }
     }
 
@@ -91,6 +137,23 @@ impl QueryRuntime {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
+        // Generate span ID and emit start event
+        #[cfg(feature = "inspector")]
+        let span_id = query_flow_inspector::new_span_id();
+        #[cfg(feature = "inspector")]
+        let start_time = std::time::Instant::now();
+        #[cfg(feature = "inspector")]
+        let query_key = query_flow_inspector::QueryKey::new(
+            std::any::type_name::<Q>(),
+            full_key.debug_repr(),
+        );
+
+        #[cfg(feature = "inspector")]
+        self.emit(|| FlowEvent::QueryStart {
+            span_id,
+            query: query_key.clone(),
+        });
+
         // Check for cycles using thread-local stack
         let cycle_detected = QUERY_STACK.with(|stack| {
             let stack = stack.borrow();
@@ -100,38 +163,167 @@ impl QueryRuntime {
         if cycle_detected {
             let path = QUERY_STACK.with(|stack| {
                 let stack = stack.borrow();
-                let mut path: Vec<String> = stack.iter().map(|k| k.debug_repr().to_string()).collect();
+                let mut path: Vec<String> =
+                    stack.iter().map(|k| k.debug_repr().to_string()).collect();
                 path.push(full_key.debug_repr().to_string());
                 path
             });
+
+            #[cfg(feature = "inspector")]
+            self.emit(|| FlowEvent::CycleDetected {
+                path: path
+                    .iter()
+                    .map(|s| query_flow_inspector::QueryKey::new("", s.clone()))
+                    .collect(),
+            });
+
+            #[cfg(feature = "inspector")]
+            self.emit(|| FlowEvent::QueryEnd {
+                span_id,
+                query: query_key.clone(),
+                result: query_flow_inspector::ExecutionResult::CycleDetected,
+                duration: start_time.elapsed(),
+            });
+
             return Err(QueryError::Cycle { path });
         }
 
         // Check if cached and valid
         if let Some(cached) = self.get_cached_if_valid::<Q>(&full_key) {
+            #[cfg(feature = "inspector")]
+            self.emit(|| FlowEvent::CacheCheck {
+                span_id,
+                query: query_key.clone(),
+                valid: true,
+            });
+
+            #[cfg(feature = "inspector")]
+            self.emit(|| FlowEvent::QueryEnd {
+                span_id,
+                query: query_key.clone(),
+                result: query_flow_inspector::ExecutionResult::CacheHit,
+                duration: start_time.elapsed(),
+            });
+
             return Ok(cached);
         }
+
+        #[cfg(feature = "inspector")]
+        self.emit(|| FlowEvent::CacheCheck {
+            span_id,
+            query: query_key.clone(),
+            valid: false,
+        });
 
         // Execute the query with cycle tracking
         QUERY_STACK.with(|stack| {
             stack.borrow_mut().push(full_key.clone());
         });
 
-        let result = self.execute_query(&query, &full_key);
+        #[cfg(feature = "inspector")]
+        let result = self.execute_query::<Q>(&query, &full_key, span_id);
+        #[cfg(not(feature = "inspector"))]
+        let result = self.execute_query::<Q>(&query, &full_key);
 
         QUERY_STACK.with(|stack| {
             stack.borrow_mut().pop();
         });
 
-        result
+        // Emit end event
+        #[cfg(feature = "inspector")]
+        {
+            let exec_result = match &result {
+                Ok((_, true)) => query_flow_inspector::ExecutionResult::Changed,
+                Ok((_, false)) => query_flow_inspector::ExecutionResult::Unchanged,
+                Err(QueryError::Suspend) => query_flow_inspector::ExecutionResult::Suspended,
+                Err(QueryError::Cycle { .. }) => {
+                    query_flow_inspector::ExecutionResult::CycleDetected
+                }
+                Err(e) => query_flow_inspector::ExecutionResult::Error {
+                    message: format!("{:?}", e),
+                },
+            };
+            self.emit(|| FlowEvent::QueryEnd {
+                span_id,
+                query: query_key.clone(),
+                result: exec_result,
+                duration: start_time.elapsed(),
+            });
+        }
+
+        result.map(|(output, _)| output)
     }
 
     /// Execute a query, caching the result if appropriate.
+    ///
+    /// Returns (output, output_changed) tuple for instrumentation.
+    #[cfg(feature = "inspector")]
     fn execute_query<Q: Query>(
         &self,
         query: &Q,
         full_key: &FullCacheKey,
-    ) -> Result<Arc<Q::Output>, QueryError> {
+        span_id: SpanId,
+    ) -> Result<(Arc<Q::Output>, bool), QueryError> {
+        // Create context for this query execution
+        let mut ctx = QueryContext {
+            runtime: self,
+            current_key: full_key.clone(),
+            parent_query_type: std::any::type_name::<Q>(),
+            span_id,
+            deps: RefCell::new(Vec::new()),
+        };
+
+        // Execute the query
+        let output = query.query(&mut ctx)?;
+        let output = Arc::new(output);
+
+        // Get collected dependencies
+        let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
+
+        // Check if output changed (for early cutoff)
+        let output_changed = if let Some(old) = self.cache.get::<Q>(full_key) {
+            !Q::output_eq(&old, &output)
+        } else {
+            true // No previous value, so "changed"
+        };
+
+        // Emit early cutoff check event
+        self.emit(|| FlowEvent::EarlyCutoffCheck {
+            span_id,
+            query: query_flow_inspector::QueryKey::new(
+                std::any::type_name::<Q>(),
+                full_key.debug_repr(),
+            ),
+            output_changed,
+        });
+
+        // Update cache
+        self.cache.insert::<Q>(full_key.clone(), output.clone());
+
+        // Update whale dependency tracking
+        let durability =
+            Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
+
+        if output_changed {
+            // Register with new changed_at
+            let _ = self.whale.register(full_key.clone(), (), durability, deps);
+        } else {
+            // Early cutoff: keep old changed_at
+            let _ = self.whale.confirm_unchanged(full_key, deps);
+        }
+
+        Ok((output, output_changed))
+    }
+
+    /// Execute a query, caching the result if appropriate.
+    ///
+    /// Returns (output, output_changed) tuple for instrumentation.
+    #[cfg(not(feature = "inspector"))]
+    fn execute_query<Q: Query>(
+        &self,
+        query: &Q,
+        full_key: &FullCacheKey,
+    ) -> Result<(Arc<Q::Output>, bool), QueryError> {
         // Create context for this query execution
         let mut ctx = QueryContext {
             runtime: self,
@@ -168,7 +360,7 @@ impl QueryRuntime {
             let _ = self.whale.confirm_unchanged(full_key, deps);
         }
 
-        Ok(output)
+        Ok((output, output_changed))
     }
 
     /// Get cached value if it's still valid.
@@ -185,6 +377,16 @@ impl QueryRuntime {
     /// Invalidate a query, forcing recomputation on next access.
     pub fn invalidate<Q: Query>(&self, key: &Q::CacheKey) {
         let full_key = FullCacheKey::new::<Q, _>(key);
+
+        #[cfg(feature = "inspector")]
+        self.emit(|| FlowEvent::QueryInvalidated {
+            query: query_flow_inspector::QueryKey::new(
+                std::any::type_name::<Q>(),
+                full_key.debug_repr(),
+            ),
+            reason: query_flow_inspector::InvalidationReason::ManualInvalidation,
+        });
+
         self.cache.remove(&full_key);
         // Whale will detect invalidity via is_valid check
     }
@@ -297,6 +499,16 @@ impl QueryRuntime {
             true // Loading or NotFound -> Ready is a change
         };
 
+        // Emit asset resolved event
+        #[cfg(feature = "inspector")]
+        self.emit(|| FlowEvent::AssetResolved {
+            asset: query_flow_inspector::AssetKey::new(
+                std::any::type_name::<K>(),
+                format!("{:?}", key),
+            ),
+            changed,
+        });
+
         // Store the new value
         self.assets.insert_ready::<K>(full_asset_key.clone(), Arc::new(value));
 
@@ -332,6 +544,15 @@ impl QueryRuntime {
     pub fn invalidate_asset<K: AssetKey>(&self, key: &K) {
         let full_asset_key = FullAssetKey::new(key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Emit asset invalidated event
+        #[cfg(feature = "inspector")]
+        self.emit(|| FlowEvent::AssetInvalidated {
+            asset: query_flow_inspector::AssetKey::new(
+                std::any::type_name::<K>(),
+                format!("{:?}", key),
+            ),
+        });
 
         // Mark as loading
         self.assets.insert(full_asset_key.clone(), AssetState::Loading);
@@ -371,13 +592,31 @@ impl QueryRuntime {
         let full_asset_key = FullAssetKey::new(key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
+        // Helper to emit AssetRequested event
+        #[cfg(feature = "inspector")]
+        let emit_requested = |runtime: &Self, state: query_flow_inspector::AssetState| {
+            runtime.emit(|| FlowEvent::AssetRequested {
+                asset: query_flow_inspector::AssetKey::new(
+                    std::any::type_name::<K>(),
+                    format!("{:?}", key),
+                ),
+                state,
+            });
+        };
+
         // Check cache first
         if let Some(state) = self.assets.get(&full_asset_key) {
             // Check if whale thinks it's valid
             if self.whale.is_valid(&full_cache_key) {
                 return match state {
-                    AssetState::Loading => Ok(LoadingState::Loading),
+                    AssetState::Loading => {
+                        #[cfg(feature = "inspector")]
+                        emit_requested(self, query_flow_inspector::AssetState::Loading);
+                        Ok(LoadingState::Loading)
+                    }
                     AssetState::Ready(arc) => {
+                        #[cfg(feature = "inspector")]
+                        emit_requested(self, query_flow_inspector::AssetState::Ready);
                         match arc.downcast::<K::Asset>() {
                             Ok(value) => Ok(LoadingState::Ready(value)),
                             Err(_) => Err(QueryError::MissingDependency {
@@ -385,9 +624,13 @@ impl QueryRuntime {
                             }),
                         }
                     }
-                    AssetState::NotFound => Err(QueryError::MissingDependency {
-                        description: format!("Asset not found: {:?}", key),
-                    }),
+                    AssetState::NotFound => {
+                        #[cfg(feature = "inspector")]
+                        emit_requested(self, query_flow_inspector::AssetState::NotFound);
+                        Err(QueryError::MissingDependency {
+                            description: format!("Asset not found: {:?}", key),
+                        })
+                    }
                 };
             }
         }
@@ -400,6 +643,9 @@ impl QueryRuntime {
 
                 match state {
                     AssetState::Ready(arc) => {
+                        #[cfg(feature = "inspector")]
+                        emit_requested(self, query_flow_inspector::AssetState::Ready);
+
                         // Register with whale
                         let durability = Durability::new(key.durability().as_u8() as usize)
                             .unwrap_or(Durability::volatile());
@@ -415,10 +661,14 @@ impl QueryRuntime {
                         }
                     }
                     AssetState::Loading => {
+                        #[cfg(feature = "inspector")]
+                        emit_requested(self, query_flow_inspector::AssetState::Loading);
                         self.pending.insert::<K>(full_asset_key, key.clone());
                         return Ok(LoadingState::Loading);
                     }
                     AssetState::NotFound => {
+                        #[cfg(feature = "inspector")]
+                        emit_requested(self, query_flow_inspector::AssetState::NotFound);
                         return Err(QueryError::MissingDependency {
                             description: format!("Asset not found: {:?}", key),
                         });
@@ -428,6 +678,8 @@ impl QueryRuntime {
         }
 
         // No locator registered or locator returned None - mark as pending
+        #[cfg(feature = "inspector")]
+        emit_requested(self, query_flow_inspector::AssetState::Loading);
         self.assets.insert(full_asset_key.clone(), AssetState::Loading);
         self.pending.insert::<K>(full_asset_key, key.clone());
         Ok(LoadingState::Loading)
@@ -437,9 +689,22 @@ impl QueryRuntime {
 /// Context provided to queries during execution.
 ///
 /// Use this to access dependencies via `query()`.
+#[cfg(feature = "inspector")]
 pub struct QueryContext<'a> {
     runtime: &'a QueryRuntime,
-    #[allow(dead_code)] // Reserved for future use (e.g., for debugging, tracing)
+    current_key: FullCacheKey,
+    parent_query_type: &'static str,
+    span_id: SpanId,
+    deps: RefCell<Vec<FullCacheKey>>,
+}
+
+/// Context provided to queries during execution.
+///
+/// Use this to access dependencies via `query()`.
+#[cfg(not(feature = "inspector"))]
+pub struct QueryContext<'a> {
+    runtime: &'a QueryRuntime,
+    #[allow(dead_code)]
     current_key: FullCacheKey,
     deps: RefCell<Vec<FullCacheKey>>,
 }
@@ -460,6 +725,20 @@ impl<'a> QueryContext<'a> {
     pub fn query<Q: Query>(&mut self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
+
+        // Emit dependency registered event
+        #[cfg(feature = "inspector")]
+        self.runtime.emit(|| FlowEvent::DependencyRegistered {
+            span_id: self.span_id,
+            parent: query_flow_inspector::QueryKey::new(
+                self.parent_query_type,
+                self.current_key.debug_repr(),
+            ),
+            dependency: query_flow_inspector::QueryKey::new(
+                std::any::type_name::<Q>(),
+                full_key.debug_repr(),
+            ),
+        });
 
         // Record this as a dependency
         self.deps.borrow_mut().push(full_key.clone());
@@ -488,15 +767,46 @@ impl<'a> QueryContext<'a> {
     /// # Errors
     ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
-    pub fn asset<K: AssetKey>(&mut self, key: &K) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
+    pub fn asset<K: AssetKey>(
+        &mut self,
+        key: &K,
+    ) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
         let full_asset_key = FullAssetKey::new(key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Emit asset dependency registered event
+        #[cfg(feature = "inspector")]
+        self.runtime.emit(|| FlowEvent::AssetDependencyRegistered {
+            span_id: self.span_id,
+            parent: query_flow_inspector::QueryKey::new(
+                self.parent_query_type,
+                self.current_key.debug_repr(),
+            ),
+            asset: query_flow_inspector::AssetKey::new(
+                std::any::type_name::<K>(),
+                format!("{:?}", key),
+            ),
+        });
 
         // Record dependency on this asset
         self.deps.borrow_mut().push(full_cache_key);
 
         // Get asset from runtime
-        self.runtime.get_asset_internal(key)
+        let result = self.runtime.get_asset_internal(key);
+
+        // Emit missing dependency event on error
+        #[cfg(feature = "inspector")]
+        if let Err(QueryError::MissingDependency { ref description }) = result {
+            self.runtime.emit(|| FlowEvent::MissingDependency {
+                query: query_flow_inspector::QueryKey::new(
+                    self.parent_query_type,
+                    self.current_key.debug_repr(),
+                ),
+                dependency_description: description.clone(),
+            });
+        }
+
+        result
     }
 }
 

@@ -13,6 +13,7 @@ repository = "https://github.com/ryo33/whale"
 whale = { path = "crates/whale" }
 query-flow = { path = "crates/query-flow" }
 query-flow-macros = { path = "crates/query-flow-macros" }
+query-flow-inspector = { path = "crates/query-flow-inspector" }
 ahash = "0.8"
 papaya = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }

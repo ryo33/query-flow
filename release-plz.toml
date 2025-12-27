@@ -1,5 +1,5 @@
 [workspace]
-semver_check = true
+semver_check = false
 
 [[package]]
 name = "whale"

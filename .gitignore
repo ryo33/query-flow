@@ -21,4 +21,3 @@
 !.github/workflows/**/*.yml
 !Makefile
 
-!release-plz.toml

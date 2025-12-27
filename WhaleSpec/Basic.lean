@@ -406,7 +406,7 @@ structure RegisterResult where
 
 /-- Register a new node or update existing one (internal core step).
     This does **not** update reverse edges; prefer `Runtime.register`. -/
-private def Runtime.registerCore {N : Nat} (rt : Runtime N) (qid : QueryId)
+protected def Runtime.registerCore {N : Nat} (rt : Runtime N) (qid : QueryId)
     (requestedDurability : Durability) (depIds : List QueryId) : Except (List QueryId) (Runtime N × RegisterResult) :=
   -- Build dependency records with current changed_at snapshots
   match buildDepRecords rt.nodes depIds with

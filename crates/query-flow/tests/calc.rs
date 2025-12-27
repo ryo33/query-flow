@@ -487,6 +487,7 @@ fn test_caching() {
     static PARSE_COUNT: AtomicU32 = AtomicU32::new(0);
 
     // Custom parse query that tracks call count
+    #[derive(Clone)]
     struct TrackedParse {
         file_name: String,
     }

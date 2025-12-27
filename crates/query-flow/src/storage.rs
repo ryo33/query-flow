@@ -1,6 +1,7 @@
 //! Type-erased cache storage for query results and assets.
 
 use std::any::{Any, TypeId};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use papaya::HashMap;
@@ -266,12 +267,181 @@ impl PendingStorage {
     }
 }
 
+/// Thread-safe registry for tracking query instances by type.
+///
+/// Used by `list_queries` to enumerate all registered queries of a specific type.
+pub(crate) struct QueryRegistry {
+    /// Map from Query TypeId to per-type registry
+    entries: HashMap<TypeId, QueryTypeRegistry, ahash::RandomState>,
+}
+
+/// Per-type registry for queries.
+struct QueryTypeRegistry {
+    /// Map from key_hash to type-erased query instance
+    queries: HashMap<u64, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+}
+
+impl Default for QueryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueryRegistry {
+    /// Create a new empty query registry.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
+
+    /// Register a query instance. Returns `true` if this was a new entry.
+    pub fn register<Q: Query>(&self, query: &Q) -> bool {
+        let type_id = TypeId::of::<Q>();
+        let key = query.cache_key();
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+
+        let entries_pinned = self.entries.pin();
+
+        // Get or create the per-type registry
+        if let Some(type_registry) = entries_pinned.get(&type_id) {
+            let queries_pinned = type_registry.queries.pin();
+            if queries_pinned.contains_key(&key_hash) {
+                return false; // Already registered
+            }
+            queries_pinned.insert(key_hash, Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>);
+            true
+        } else {
+            // Create new per-type registry
+            let type_registry = QueryTypeRegistry {
+                queries: HashMap::with_hasher(ahash::RandomState::new()),
+            };
+            type_registry
+                .queries
+                .pin()
+                .insert(key_hash, Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>);
+            entries_pinned.insert(type_id, type_registry);
+            true
+        }
+    }
+
+    /// Get all query instances of type Q.
+    pub fn get_all<Q: Query>(&self) -> Vec<Q> {
+        let type_id = TypeId::of::<Q>();
+        let entries_pinned = self.entries.pin();
+
+        if let Some(type_registry) = entries_pinned.get(&type_id) {
+            let queries_pinned = type_registry.queries.pin();
+            queries_pinned
+                .iter()
+                .filter_map(|(_, arc)| arc.downcast_ref::<Q>().cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Thread-safe registry for tracking asset keys by type.
+///
+/// Used by `list_asset_keys` to enumerate all registered asset keys of a specific type.
+pub(crate) struct AssetKeyRegistry {
+    /// Map from AssetKey TypeId to per-type registry
+    entries: HashMap<TypeId, AssetKeyTypeRegistry, ahash::RandomState>,
+}
+
+/// Per-type registry for asset keys.
+struct AssetKeyTypeRegistry {
+    /// Map from key_hash to type-erased asset key instance
+    keys: HashMap<u64, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+}
+
+impl Default for AssetKeyRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AssetKeyRegistry {
+    /// Create a new empty asset key registry.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
+
+    /// Register an asset key. Returns `true` if this was a new entry.
+    pub fn register<K: AssetKey>(&self, key: &K) -> bool {
+        let type_id = TypeId::of::<K>();
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+
+        let entries_pinned = self.entries.pin();
+
+        if let Some(type_registry) = entries_pinned.get(&type_id) {
+            let keys_pinned = type_registry.keys.pin();
+            if keys_pinned.contains_key(&key_hash) {
+                return false; // Already registered
+            }
+            keys_pinned.insert(key_hash, Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>);
+            true
+        } else {
+            let type_registry = AssetKeyTypeRegistry {
+                keys: HashMap::with_hasher(ahash::RandomState::new()),
+            };
+            type_registry
+                .keys
+                .pin()
+                .insert(key_hash, Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>);
+            entries_pinned.insert(type_id, type_registry);
+            true
+        }
+    }
+
+    /// Get all asset keys of type K.
+    pub fn get_all<K: AssetKey>(&self) -> Vec<K> {
+        let type_id = TypeId::of::<K>();
+        let entries_pinned = self.entries.pin();
+
+        if let Some(type_registry) = entries_pinned.get(&type_id) {
+            let keys_pinned = type_registry.keys.pin();
+            keys_pinned
+                .iter()
+                .filter_map(|(_, arc)| arc.downcast_ref::<K>().cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remove an asset key. Returns `true` if it was present.
+    pub fn remove<K: AssetKey>(&self, key: &K) -> bool {
+        let type_id = TypeId::of::<K>();
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+
+        let entries_pinned = self.entries.pin();
+
+        if let Some(type_registry) = entries_pinned.get(&type_id) {
+            let keys_pinned = type_registry.keys.pin();
+            keys_pinned.remove(&key_hash).is_some()
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_cache_storage_basic() {
+        #[derive(Clone)]
         struct TestQuery;
         impl Query for TestQuery {
             type CacheKey = u32;

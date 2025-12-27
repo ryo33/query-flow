@@ -10,7 +10,10 @@ use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, Pendin
 use crate::key::FullCacheKey;
 use crate::loading::LoadingState;
 use crate::query::Query;
-use crate::storage::{AssetState, AssetStorage, CacheStorage, LocatorStorage, PendingStorage};
+use crate::storage::{
+    AssetKeyRegistry, AssetState, AssetStorage, CacheStorage, LocatorStorage, PendingStorage,
+    QueryRegistry,
+};
 use crate::QueryError;
 
 #[cfg(feature = "inspector")]
@@ -50,6 +53,10 @@ pub struct QueryRuntime {
     locators: Arc<LocatorStorage>,
     /// Pending asset requests
     pending: Arc<PendingStorage>,
+    /// Registry for tracking query instances (for list_queries)
+    query_registry: Arc<QueryRegistry>,
+    /// Registry for tracking asset keys (for list_asset_keys)
+    asset_key_registry: Arc<AssetKeyRegistry>,
     /// Event sink for inspector/tracing
     #[cfg(feature = "inspector")]
     sink: Arc<parking_lot::RwLock<Option<Arc<dyn EventSink>>>>,
@@ -69,6 +76,8 @@ impl Clone for QueryRuntime {
             assets: self.assets.clone(),
             locators: self.locators.clone(),
             pending: self.pending.clone(),
+            query_registry: self.query_registry.clone(),
+            asset_key_registry: self.asset_key_registry.clone(),
             #[cfg(feature = "inspector")]
             sink: self.sink.clone(),
         }
@@ -84,6 +93,8 @@ impl QueryRuntime {
             assets: Arc::new(AssetStorage::new()),
             locators: Arc::new(LocatorStorage::new()),
             pending: Arc::new(PendingStorage::new()),
+            query_registry: Arc::new(QueryRegistry::new()),
+            asset_key_registry: Arc::new(AssetKeyRegistry::new()),
             #[cfg(feature = "inspector")]
             sink: Arc::new(parking_lot::RwLock::new(None)),
         }
@@ -310,6 +321,16 @@ impl QueryRuntime {
             let _ = self.whale.confirm_unchanged(full_key, deps);
         }
 
+        // Register query in registry for list_queries
+        let is_new_query = self.query_registry.register(query);
+        if is_new_query {
+            // Update sentinel to invalidate list_queries dependents
+            let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+            let _ = self
+                .whale
+                .register(sentinel, (), Durability::volatile(), vec![]);
+        }
+
         Ok((output, output_changed))
     }
 
@@ -356,6 +377,16 @@ impl QueryRuntime {
         } else {
             // Early cutoff: keep old changed_at
             let _ = self.whale.confirm_unchanged(full_key, deps);
+        }
+
+        // Register query in registry for list_queries
+        let is_new_query = self.query_registry.register(query);
+        if is_new_query {
+            // Update sentinel to invalidate list_queries dependents
+            let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+            let _ = self
+                .whale
+                .register(sentinel, (), Durability::volatile(), vec![]);
         }
 
         Ok((output, output_changed))
@@ -520,10 +551,22 @@ impl QueryRuntime {
 
         if changed {
             // Register with new changed_at to invalidate dependents
-            let _ = self.whale.register(full_cache_key, (), durability, vec![]);
+            let _ = self
+                .whale
+                .register(full_cache_key, (), durability, vec![]);
         } else {
             // Early cutoff - keep old changed_at
             let _ = self.whale.confirm_unchanged(&full_cache_key, vec![]);
+        }
+
+        // Register asset key in registry for list_asset_keys
+        let is_new_asset = self.asset_key_registry.register(&key);
+        if is_new_asset {
+            // Update sentinel to invalidate list_asset_keys dependents
+            let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+            let _ = self
+                .whale
+                .register(sentinel, (), Durability::volatile(), vec![]);
         }
     }
 
@@ -586,6 +629,14 @@ impl QueryRuntime {
 
         // Finally remove from whale tracking
         self.whale.remove(&full_cache_key);
+
+        // Remove from registry and update sentinel for list_asset_keys
+        if self.asset_key_registry.remove::<K>(key) {
+            let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+            let _ = self
+                .whale
+                .register(sentinel, (), Durability::volatile(), vec![]);
+        }
     }
 
     /// Internal: Get asset state, checking cache and locator.
@@ -813,6 +864,92 @@ impl<'a> QueryContext<'a> {
 
         result
     }
+
+    /// List all query instances of type Q that have been registered.
+    ///
+    /// This method establishes a dependency on the "set" of queries of type Q.
+    /// The calling query will be invalidated when:
+    /// - A new query of type Q is first executed (added to set)
+    ///
+    /// The calling query will NOT be invalidated when:
+    /// - An individual query of type Q has its value change
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[query]
+    /// fn all_results(ctx: &mut QueryContext) -> Result<Vec<i32>, QueryError> {
+    ///     let queries = ctx.list_queries::<MyQuery>();
+    ///     let mut results = Vec::new();
+    ///     for q in queries {
+    ///         results.push(*ctx.query(q)?);
+    ///     }
+    ///     Ok(results)
+    /// }
+    /// ```
+    pub fn list_queries<Q: Query>(&mut self) -> Vec<Q> {
+        // Record dependency on the sentinel (set-level dependency)
+        let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+
+        #[cfg(feature = "inspector")]
+        self.runtime.emit(|| FlowEvent::DependencyRegistered {
+            span_id: self.span_id,
+            parent: query_flow_inspector::QueryKey::new(
+                self.parent_query_type,
+                self.current_key.debug_repr(),
+            ),
+            dependency: query_flow_inspector::QueryKey::new("QuerySet", sentinel.debug_repr()),
+        });
+
+        self.deps.borrow_mut().push(sentinel);
+
+        // Return all registered queries
+        self.runtime.query_registry.get_all::<Q>()
+    }
+
+    /// List all asset keys of type K that have been registered.
+    ///
+    /// This method establishes a dependency on the "set" of asset keys of type K.
+    /// The calling query will be invalidated when:
+    /// - A new asset of type K is resolved for the first time (added to set)
+    /// - An asset of type K is removed via remove_asset
+    ///
+    /// The calling query will NOT be invalidated when:
+    /// - An individual asset's value changes (use `ctx.asset()` for that)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[query]
+    /// fn all_configs(ctx: &mut QueryContext) -> Result<Vec<String>, QueryError> {
+    ///     let keys = ctx.list_asset_keys::<ConfigFile>();
+    ///     let mut contents = Vec::new();
+    ///     for key in keys {
+    ///         let content = ctx.asset(&key)?.suspend()?;
+    ///         contents.push((*content).clone());
+    ///     }
+    ///     Ok(contents)
+    /// }
+    /// ```
+    pub fn list_asset_keys<K: AssetKey>(&mut self) -> Vec<K> {
+        // Record dependency on the sentinel (set-level dependency)
+        let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+
+        #[cfg(feature = "inspector")]
+        self.runtime.emit(|| FlowEvent::AssetDependencyRegistered {
+            span_id: self.span_id,
+            parent: query_flow_inspector::QueryKey::new(
+                self.parent_query_type,
+                self.current_key.debug_repr(),
+            ),
+            asset: query_flow_inspector::AssetKey::new("AssetKeySet", sentinel.debug_repr()),
+        });
+
+        self.deps.borrow_mut().push(sentinel);
+
+        // Return all registered asset keys
+        self.runtime.asset_key_registry.get_all::<K>()
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +958,7 @@ mod tests {
 
     #[test]
     fn test_simple_query() {
+        #[derive(Clone)]
         struct Add {
             a: i32,
             b: i32,
@@ -855,6 +993,7 @@ mod tests {
 
     #[test]
     fn test_dependent_queries() {
+        #[derive(Clone)]
         struct Base {
             value: i32,
         }
@@ -876,6 +1015,7 @@ mod tests {
             }
         }
 
+        #[derive(Clone)]
         struct Derived {
             base_value: i32,
         }
@@ -908,10 +1048,12 @@ mod tests {
 
     #[test]
     fn test_cycle_detection() {
+        #[derive(Clone)]
         struct CycleA {
             id: i32,
         }
 
+        #[derive(Clone)]
         struct CycleB {
             id: i32,
         }
@@ -960,6 +1102,7 @@ mod tests {
 
     #[test]
     fn test_fallible_query() {
+        #[derive(Clone)]
         struct ParseInt {
             input: String,
         }

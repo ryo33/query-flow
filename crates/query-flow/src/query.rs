@@ -62,7 +62,7 @@ use crate::QueryError;
 ///     }
 /// }
 /// ```
-pub trait Query: Send + Sync + 'static {
+pub trait Query: Clone + Send + Sync + 'static {
     /// The cache key type for this query.
     ///
     /// Two queries with the same cache key are considered equivalent and

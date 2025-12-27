@@ -364,7 +364,9 @@ fn test_cycle_detection_events() {
     use EventKind::*;
 
     // Create mutually recursive queries
+    #[derive(Clone)]
     struct CycleA(i32);
+    #[derive(Clone)]
     struct CycleB(i32);
 
     impl query_flow::Query for CycleA {

@@ -18,6 +18,12 @@ impl<T> Key for T where T: Hash + Eq + Clone + Send + Sync + Debug + 'static {}
 /// Marker type to distinguish asset keys in the dependency graph.
 struct AssetKeyMarker;
 
+/// Marker type for query set sentinels (used by list_queries).
+struct QuerySetMarker;
+
+/// Marker type for asset key set sentinels (used by list_asset_keys).
+struct AssetKeySetMarker;
+
 /// Internal full cache key that includes query type information.
 ///
 /// This prevents collisions between different query types that might
@@ -67,6 +73,38 @@ impl FullCacheKey {
     /// Get debug representation for error messages.
     pub fn debug_repr(&self) -> &str {
         &self.debug_repr
+    }
+
+    /// Create a sentinel key representing "all queries of type Q".
+    ///
+    /// This is used by `list_queries` to track dependencies on the set of queries,
+    /// rather than individual query values.
+    pub fn query_set_sentinel<Q: 'static>() -> Self {
+        let mut hasher = ahash::AHasher::default();
+        TypeId::of::<Q>().hash(&mut hasher);
+        let type_hash = hasher.finish();
+
+        Self {
+            query_type: TypeId::of::<QuerySetMarker>(),
+            key_hash: type_hash,
+            debug_repr: Arc::from(format!("QuerySet<{}>", std::any::type_name::<Q>())),
+        }
+    }
+
+    /// Create a sentinel key representing "all asset keys of type K".
+    ///
+    /// This is used by `list_asset_keys` to track dependencies on the set of asset keys,
+    /// rather than individual asset values.
+    pub fn asset_key_set_sentinel<K: 'static>() -> Self {
+        let mut hasher = ahash::AHasher::default();
+        TypeId::of::<K>().hash(&mut hasher);
+        let type_hash = hasher.finish();
+
+        Self {
+            query_type: TypeId::of::<AssetKeySetMarker>(),
+            key_hash: type_hash,
+            debug_repr: Arc::from(format!("AssetKeySet<{}>", std::any::type_name::<K>())),
+        }
     }
 }
 

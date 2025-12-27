@@ -226,7 +226,6 @@ name = "query-flow-inspector"
 version = "0.2.0"
 dependencies = [
  "parking_lot",
- "query-flow",
  "serde",
  "serde_json",
  "tracing",

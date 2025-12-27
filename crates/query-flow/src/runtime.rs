@@ -551,9 +551,7 @@ impl QueryRuntime {
 
         if changed {
             // Register with new changed_at to invalidate dependents
-            let _ = self
-                .whale
-                .register(full_cache_key, (), durability, vec![]);
+            let _ = self.whale.register(full_cache_key, (), durability, vec![]);
         } else {
             // Early cutoff - keep old changed_at
             let _ = self.whale.confirm_unchanged(&full_cache_key, vec![]);

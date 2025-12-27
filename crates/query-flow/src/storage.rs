@@ -311,17 +311,20 @@ impl QueryRegistry {
             if queries_pinned.contains_key(&key_hash) {
                 return false; // Already registered
             }
-            queries_pinned.insert(key_hash, Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>);
+            queries_pinned.insert(
+                key_hash,
+                Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>,
+            );
             true
         } else {
             // Create new per-type registry
             let type_registry = QueryTypeRegistry {
                 queries: HashMap::with_hasher(ahash::RandomState::new()),
             };
-            type_registry
-                .queries
-                .pin()
-                .insert(key_hash, Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>);
+            type_registry.queries.pin().insert(
+                key_hash,
+                Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>,
+            );
             entries_pinned.insert(type_id, type_registry);
             true
         }
@@ -386,16 +389,19 @@ impl AssetKeyRegistry {
             if keys_pinned.contains_key(&key_hash) {
                 return false; // Already registered
             }
-            keys_pinned.insert(key_hash, Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>);
+            keys_pinned.insert(
+                key_hash,
+                Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>,
+            );
             true
         } else {
             let type_registry = AssetKeyTypeRegistry {
                 keys: HashMap::with_hasher(ahash::RandomState::new()),
             };
-            type_registry
-                .keys
-                .pin()
-                .insert(key_hash, Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>);
+            type_registry.keys.pin().insert(
+                key_hash,
+                Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>,
+            );
             entries_pinned.insert(type_id, type_registry);
             true
         }

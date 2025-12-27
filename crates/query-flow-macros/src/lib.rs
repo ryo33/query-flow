@@ -678,7 +678,11 @@ mod tests {
     use quote::quote;
 
     fn normalize_tokens(tokens: TokenStream2) -> String {
-        tokens.to_string().split_whitespace().collect::<Vec<_>>().join(" ")
+        tokens
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]

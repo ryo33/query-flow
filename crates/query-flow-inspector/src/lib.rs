@@ -55,8 +55,8 @@ mod span_context;
 
 pub use collector::EventCollector;
 pub use events::{
-    AssetKey, AssetState, ExecutionResult, ExecutionTrace, FlowEvent, InvalidationReason,
-    QueryKey, SpanId,
+    to_kinds, AssetKey, AssetState, EventKind, ExecutionResult, ExecutionTrace, FlowEvent,
+    InvalidationReason, QueryKey, SpanId,
 };
 pub use sink::{EventSink, FilterSink, MultiplexSink, NullSink};
 pub use span_context::new_span_id;

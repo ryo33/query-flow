@@ -176,6 +176,47 @@ pub struct ExecutionTrace {
     pub events: Vec<FlowEvent>,
 }
 
+/// Event kind for comparison (without span_id/duration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventKind {
+    QueryStart { query: QueryKey },
+    CacheCheck { query: QueryKey, valid: bool },
+    QueryEnd { query: QueryKey, result: ExecutionResult },
+    DependencyRegistered { parent: QueryKey, dependency: QueryKey },
+    AssetDependencyRegistered { parent: QueryKey, asset: AssetKey },
+    EarlyCutoffCheck { query: QueryKey, output_changed: bool },
+    AssetRequested { asset: AssetKey, state: AssetState },
+    AssetResolved { asset: AssetKey, changed: bool },
+    AssetInvalidated { asset: AssetKey },
+    QueryInvalidated { query: QueryKey, reason: InvalidationReason },
+    CycleDetected { path: Vec<QueryKey> },
+    MissingDependency { query: QueryKey, dependency_description: String },
+}
+
+impl From<&FlowEvent> for EventKind {
+    fn from(event: &FlowEvent) -> Self {
+        match event {
+            FlowEvent::QueryStart { query, .. } => EventKind::QueryStart { query: query.clone() },
+            FlowEvent::CacheCheck { query, valid, .. } => EventKind::CacheCheck { query: query.clone(), valid: *valid },
+            FlowEvent::QueryEnd { query, result, .. } => EventKind::QueryEnd { query: query.clone(), result: result.clone() },
+            FlowEvent::DependencyRegistered { parent, dependency, .. } => EventKind::DependencyRegistered { parent: parent.clone(), dependency: dependency.clone() },
+            FlowEvent::AssetDependencyRegistered { parent, asset, .. } => EventKind::AssetDependencyRegistered { parent: parent.clone(), asset: asset.clone() },
+            FlowEvent::EarlyCutoffCheck { query, output_changed, .. } => EventKind::EarlyCutoffCheck { query: query.clone(), output_changed: *output_changed },
+            FlowEvent::AssetRequested { asset, state } => EventKind::AssetRequested { asset: asset.clone(), state: state.clone() },
+            FlowEvent::AssetResolved { asset, changed } => EventKind::AssetResolved { asset: asset.clone(), changed: *changed },
+            FlowEvent::AssetInvalidated { asset } => EventKind::AssetInvalidated { asset: asset.clone() },
+            FlowEvent::QueryInvalidated { query, reason } => EventKind::QueryInvalidated { query: query.clone(), reason: reason.clone() },
+            FlowEvent::CycleDetected { path } => EventKind::CycleDetected { path: path.clone() },
+            FlowEvent::MissingDependency { query, dependency_description } => EventKind::MissingDependency { query: query.clone(), dependency_description: dependency_description.clone() },
+        }
+    }
+}
+
+/// Convert a trace to a list of event kinds for comparison.
+pub fn to_kinds(trace: &ExecutionTrace) -> Vec<EventKind> {
+    trace.events.iter().map(EventKind::from).collect()
+}
+
 impl ExecutionTrace {
     pub fn new() -> Self {
         Self { events: Vec::new() }

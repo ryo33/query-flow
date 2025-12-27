@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use query_flow::{asset_key, query, QueryContext, QueryError, QueryRuntime};
-use query_flow_inspector::{EventCollector, ExecutionResult, FlowEvent};
+use query_flow_inspector::{
+    to_kinds, AssetKey, AssetState, EventCollector, EventKind, ExecutionResult, QueryKey,
+};
 
 // ============================================================================
 // Test Queries
@@ -46,11 +48,26 @@ fn process_source(ctx: &mut QueryContext, name: String) -> Result<String, QueryE
 }
 
 // ============================================================================
+// Helper
+// ============================================================================
+
+fn q(query_type: &str, cache_key_debug: &str) -> QueryKey {
+    QueryKey::new(query_type, cache_key_debug)
+}
+
+fn a(asset_type: &str, key_debug: &str) -> AssetKey {
+    AssetKey::new(asset_type, key_debug)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[test]
 fn test_simple_query_events() {
+    use EventKind::*;
+    use ExecutionResult::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
     runtime.set_sink(Some(collector.clone()));
@@ -58,36 +75,22 @@ fn test_simple_query_events() {
     let result = runtime.query(SimpleAdd::new(1, 2)).unwrap();
     assert_eq!(*result, 3);
 
-    let trace = collector.trace();
-
-    // Should have: QueryStart, CacheCheck(false), EarlyCutoffCheck, QueryEnd
-    assert!(
-        trace.events.len() >= 3,
-        "Expected at least 3 events, got {}",
-        trace.events.len()
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![
+            QueryStart { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))") },
+            CacheCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"), valid: false },
+            EarlyCutoffCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"), output_changed: true },
+            QueryEnd { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"), result: Changed },
+        ]
     );
-
-    // Verify QueryStart
-    assert!(
-        trace.has_event(|e| matches!(e, FlowEvent::QueryStart { query, .. }
-        if query.query_type.contains("SimpleAdd")))
-    );
-
-    // Verify CacheCheck(false) - first query is never cached
-    assert!(trace.has_event(|e| matches!(e, FlowEvent::CacheCheck { valid: false, .. })));
-
-    // Verify QueryEnd with Changed (first execution always changes)
-    assert!(trace.has_event(|e| matches!(
-        e,
-        FlowEvent::QueryEnd {
-            result: ExecutionResult::Changed,
-            ..
-        }
-    )));
 }
 
 #[test]
 fn test_cached_query_events() {
+    use EventKind::*;
+    use ExecutionResult::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
 
@@ -99,21 +102,21 @@ fn test_cached_query_events() {
     let result = runtime.query(SimpleAdd::new(1, 2)).unwrap();
     assert_eq!(*result, 3);
 
-    let trace = collector.trace();
-
-    // Should have: QueryStart, CacheCheck(true), QueryEnd(CacheHit)
-    assert!(trace.has_event(|e| matches!(e, FlowEvent::CacheCheck { valid: true, .. })));
-    assert!(trace.has_event(|e| matches!(
-        e,
-        FlowEvent::QueryEnd {
-            result: ExecutionResult::CacheHit,
-            ..
-        }
-    )));
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![
+            QueryStart { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))") },
+            CacheCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"), valid: true },
+            QueryEnd { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"), result: CacheHit },
+        ]
+    );
 }
 
 #[test]
 fn test_dependent_query_events() {
+    use EventKind::*;
+    use ExecutionResult::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
     runtime.set_sink(Some(collector.clone()));
@@ -121,41 +124,41 @@ fn test_dependent_query_events() {
     let result = runtime.query(AddThenDouble::new(2, 3)).unwrap();
     assert_eq!(*result, 10); // (2+3)*2 = 10
 
-    let trace = collector.trace();
-
-    // Should have events for all three queries
-    let query_starts: Vec<_> = trace.query_starts().collect();
-    assert!(
-        query_starts.len() >= 3,
-        "Expected at least 3 query starts, got {}",
-        query_starts.len()
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![
+            QueryStart { query: q("inspector::AddThenDouble", "inspector::AddThenDouble((2, 3))") },
+            CacheCheck { query: q("inspector::AddThenDouble", "inspector::AddThenDouble((2, 3))"), valid: false },
+            // SimpleAdd(2, 3) = 5
+            DependencyRegistered {
+                parent: q("inspector::AddThenDouble", "inspector::AddThenDouble((2, 3))"),
+                dependency: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"),
+            },
+            QueryStart { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))") },
+            CacheCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"), valid: false },
+            EarlyCutoffCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"), output_changed: true },
+            QueryEnd { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"), result: Changed },
+            // Double(5) = 10
+            DependencyRegistered {
+                parent: q("inspector::AddThenDouble", "inspector::AddThenDouble((2, 3))"),
+                dependency: q("inspector::Double", "inspector::Double(5)"),
+            },
+            QueryStart { query: q("inspector::Double", "inspector::Double(5)") },
+            CacheCheck { query: q("inspector::Double", "inspector::Double(5)"), valid: false },
+            EarlyCutoffCheck { query: q("inspector::Double", "inspector::Double(5)"), output_changed: true },
+            QueryEnd { query: q("inspector::Double", "inspector::Double(5)"), result: Changed },
+            // AddThenDouble completes
+            EarlyCutoffCheck { query: q("inspector::AddThenDouble", "inspector::AddThenDouble((2, 3))"), output_changed: true },
+            QueryEnd { query: q("inspector::AddThenDouble", "inspector::AddThenDouble((2, 3))"), result: Changed },
+        ]
     );
-
-    // Verify we see AddThenDouble, SimpleAdd, and Double
-    assert!(
-        trace.has_event(|e| matches!(e, FlowEvent::QueryStart { query, .. }
-        if query.query_type.contains("AddThenDouble")))
-    );
-    assert!(
-        trace.has_event(|e| matches!(e, FlowEvent::QueryStart { query, .. }
-        if query.query_type.contains("SimpleAdd")))
-    );
-    assert!(
-        trace.has_event(|e| matches!(e, FlowEvent::QueryStart { query, .. }
-        if query.query_type.contains("Double")))
-    );
-
-    // NEW: Verify DependencyRegistered events
-    assert!(trace.has_event(|e| matches!(e, FlowEvent::DependencyRegistered { parent, dependency, .. }
-        if parent.query_type.contains("AddThenDouble") && dependency.query_type.contains("SimpleAdd"))));
-    assert!(trace.has_event(
-        |e| matches!(e, FlowEvent::DependencyRegistered { parent, dependency, .. }
-        if parent.query_type.contains("AddThenDouble") && dependency.query_type.contains("Double"))
-    ));
 }
 
 #[test]
 fn test_asset_events() {
+    use EventKind::*;
+    use ExecutionResult::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
 
@@ -168,34 +171,42 @@ fn test_asset_events() {
         .unwrap();
     assert_eq!(*result, "processed: hello");
 
-    let trace = collector.trace();
-
-    // Should have AssetDependencyRegistered event
-    assert!(trace.has_event(
-        |e| matches!(e, FlowEvent::AssetDependencyRegistered { asset, .. }
-        if asset.asset_type.contains("TestSource"))
-    ));
-
-    // Should have AssetRequested event
-    assert!(trace.has_event(|e| matches!(e, FlowEvent::AssetRequested { .. })));
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![
+            QueryStart { query: q("inspector::ProcessSource", "inspector::ProcessSource(\"test\")") },
+            CacheCheck { query: q("inspector::ProcessSource", "inspector::ProcessSource(\"test\")"), valid: false },
+            AssetDependencyRegistered {
+                parent: q("inspector::ProcessSource", "inspector::ProcessSource(\"test\")"),
+                asset: a("inspector::TestSource", "TestSource(\"test\")"),
+            },
+            AssetRequested { asset: a("inspector::TestSource", "TestSource(\"test\")"), state: AssetState::Ready },
+            EarlyCutoffCheck { query: q("inspector::ProcessSource", "inspector::ProcessSource(\"test\")"), output_changed: true },
+            QueryEnd { query: q("inspector::ProcessSource", "inspector::ProcessSource(\"test\")"), result: Changed },
+        ]
+    );
 }
 
 #[test]
 fn test_asset_resolution_events() {
+    use EventKind::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
     runtime.set_sink(Some(collector.clone()));
 
     runtime.resolve_asset(TestSource("new".to_string()), "content".to_string());
 
-    let trace = collector.trace();
-
-    // Should have AssetResolved event
-    assert!(trace.has_event(|e| matches!(e, FlowEvent::AssetResolved { changed: true, .. })));
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![AssetResolved { asset: a("inspector::TestSource", "TestSource(\"new\")"), changed: true }]
+    );
 }
 
 #[test]
 fn test_asset_invalidation_events() {
+    use EventKind::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
 
@@ -204,17 +215,17 @@ fn test_asset_invalidation_events() {
     runtime.set_sink(Some(collector.clone()));
     runtime.invalidate_asset(&TestSource("test".to_string()));
 
-    let trace = collector.trace();
-
-    // Should have AssetInvalidated event
-    assert!(
-        trace.has_event(|e| matches!(e, FlowEvent::AssetInvalidated { asset, .. }
-        if asset.asset_type.contains("TestSource")))
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![AssetInvalidated { asset: a("inspector::TestSource", "TestSource(\"test\")") }]
     );
 }
 
 #[test]
 fn test_early_cutoff_events() {
+    use EventKind::*;
+    use ExecutionResult::*;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
     runtime.set_sink(Some(collector.clone()));
@@ -222,20 +233,21 @@ fn test_early_cutoff_events() {
     let result = runtime.query(SimpleAdd::new(5, 5)).unwrap();
     assert_eq!(*result, 10);
 
-    let trace = collector.trace();
-
-    // First execution should have EarlyCutoffCheck with output_changed=true (no previous value)
-    assert!(trace.has_event(|e| matches!(
-        e,
-        FlowEvent::EarlyCutoffCheck {
-            output_changed: true,
-            ..
-        }
-    )));
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![
+            QueryStart { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))") },
+            CacheCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))"), valid: false },
+            EarlyCutoffCheck { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))"), output_changed: true },
+            QueryEnd { query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))"), result: Changed },
+        ]
+    );
 }
 
 #[test]
 fn test_cycle_detection_events() {
+    use EventKind::*;
+
     // Create mutually recursive queries
     struct CycleA(i32);
     struct CycleB(i32);
@@ -283,23 +295,39 @@ fn test_cycle_detection_events() {
     let result = runtime.query(CycleA(1));
     assert!(matches!(result, Err(QueryError::Cycle { .. })));
 
-    let trace = collector.trace();
-
-    // Should have CycleDetected event
-    assert!(trace.has_event(|e| matches!(e, FlowEvent::CycleDetected { .. })));
-
-    // Should have QueryEnd with CycleDetected result
-    assert!(trace.has_event(|e| matches!(
-        e,
-        FlowEvent::QueryEnd {
-            result: ExecutionResult::CycleDetected,
-            ..
-        }
-    )));
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![
+            QueryStart { query: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)") },
+            CacheCheck { query: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)"), valid: false },
+            DependencyRegistered {
+                parent: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)"),
+                dependency: q("inspector::test_cycle_detection_events::CycleB", "inspector::test_cycle_detection_events::CycleB(1)"),
+            },
+            QueryStart { query: q("inspector::test_cycle_detection_events::CycleB", "inspector::test_cycle_detection_events::CycleB(1)") },
+            CacheCheck { query: q("inspector::test_cycle_detection_events::CycleB", "inspector::test_cycle_detection_events::CycleB(1)"), valid: false },
+            DependencyRegistered {
+                parent: q("inspector::test_cycle_detection_events::CycleB", "inspector::test_cycle_detection_events::CycleB(1)"),
+                dependency: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)"),
+            },
+            QueryStart { query: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)") },
+            EventKind::CycleDetected { path: vec![
+                q("", "inspector::test_cycle_detection_events::CycleA(1)"),
+                q("", "inspector::test_cycle_detection_events::CycleB(1)"),
+                q("", "inspector::test_cycle_detection_events::CycleA(1)"),
+            ]},
+            QueryEnd { query: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)"), result: ExecutionResult::CycleDetected },
+            QueryEnd { query: q("inspector::test_cycle_detection_events::CycleB", "inspector::test_cycle_detection_events::CycleB(1)"), result: ExecutionResult::CycleDetected },
+            QueryEnd { query: q("inspector::test_cycle_detection_events::CycleA", "inspector::test_cycle_detection_events::CycleA(1)"), result: ExecutionResult::CycleDetected },
+        ]
+    );
 }
 
 #[test]
 fn test_query_invalidation_events() {
+    use EventKind::*;
+    use query_flow_inspector::InvalidationReason;
+
     let collector = Arc::new(EventCollector::new());
     let runtime = QueryRuntime::new();
 
@@ -310,13 +338,11 @@ fn test_query_invalidation_events() {
     runtime.set_sink(Some(collector.clone()));
     runtime.invalidate::<SimpleAdd>(&(1, 2));
 
-    let trace = collector.trace();
-
-    // Should have QueryInvalidated event
-    assert!(
-        trace.has_event(|e| matches!(e, FlowEvent::QueryInvalidated { query, .. }
-        if query.query_type.contains("SimpleAdd")))
+    assert_eq!(
+        to_kinds(&collector.trace()),
+        vec![QueryInvalidated {
+            query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+            reason: InvalidationReason::ManualInvalidation,
+        }]
     );
 }
-
-// Serialization tests are in query-flow-inspector crate

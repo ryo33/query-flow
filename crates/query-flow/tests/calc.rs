@@ -8,6 +8,24 @@
 
 use query_flow::{asset_key, query, Query, QueryContext, QueryError, QueryRuntime};
 
+#[cfg(feature = "inspector")]
+use std::sync::Arc;
+
+#[cfg(feature = "inspector")]
+use query_flow_inspector::{
+    to_kinds, AssetKey, AssetState, EventCollector, EventKind, ExecutionResult, QueryKey,
+};
+
+#[cfg(feature = "inspector")]
+fn q(query_type: &str, cache_key_debug: &str) -> QueryKey {
+    QueryKey::new(query_type, cache_key_debug)
+}
+
+#[cfg(feature = "inspector")]
+fn a(asset_type: &str, key_debug: &str) -> AssetKey {
+    AssetKey::new(asset_type, key_debug)
+}
+
 // ============================================================================
 // Expression AST
 // ============================================================================
@@ -208,18 +226,62 @@ fn eval_expr(ctx: &mut QueryContext, expr: &Expr) -> Result<i64, QueryError> {
 
 #[test]
 fn test_simple_expression() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2 * 3".to_string());
 
     let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // 1 + (2 * 3) = 7
     assert_eq!(*result, 7);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"main\")"), changed: true },
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"main\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"main\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
 fn test_with_variables() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("main".to_string()), "x + y * 2".to_string());
     runtime.resolve_asset(Variable("x".to_string()), 10);
     runtime.resolve_asset(Variable("y".to_string()), 5);
@@ -228,17 +290,98 @@ fn test_with_variables() {
 
     // 10 + (5 * 2) = 20
     assert_eq!(*result, 20);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"main\")"), changed: true },
+                AssetResolved { asset: a("calc::Variable", "Variable(\"x\")"), changed: true },
+                AssetResolved { asset: a("calc::Variable", "Variable(\"y\")"), changed: true },
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"main\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"main\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), result: Changed },
+                // x variable lookup
+                AssetDependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    asset: a("calc::Variable", "Variable(\"x\")"),
+                },
+                AssetRequested { asset: a("calc::Variable", "Variable(\"x\")"), state: AssetState::Ready },
+                // y variable lookup
+                AssetDependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    asset: a("calc::Variable", "Variable(\"y\")"),
+                },
+                AssetRequested { asset: a("calc::Variable", "Variable(\"y\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
 fn test_parentheses() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("main".to_string()), "(1 + 2) * 3".to_string());
 
     let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // (1 + 2) * 3 = 9
     assert_eq!(*result, 9);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"main\")"), changed: true },
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"main\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"main\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
@@ -297,7 +440,14 @@ fn test_caching() {
 
 #[test]
 fn test_complex_expression() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(
         SourceFile("main".to_string()),
         "((2 + 3) * 4 - 5) / 3".to_string(),
@@ -307,22 +457,129 @@ fn test_complex_expression() {
 
     // ((2 + 3) * 4 - 5) / 3 = (5 * 4 - 5) / 3 = (20 - 5) / 3 = 15 / 3 = 5
     assert_eq!(*result, 5);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"main\")"), changed: true },
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"main\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"main\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
 fn test_multiple_files() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("a".to_string()), "10".to_string());
     runtime.resolve_asset(SourceFile("b".to_string()), "20 + 5".to_string());
     runtime.resolve_asset(SourceFile("c".to_string()), "3 * 3".to_string());
 
-    let a = runtime.query(EvalFile::new("a".to_string())).unwrap();
-    let b = runtime.query(EvalFile::new("b".to_string())).unwrap();
-    let c = runtime.query(EvalFile::new("c".to_string())).unwrap();
+    let result_a = runtime.query(EvalFile::new("a".to_string())).unwrap();
+    let result_b = runtime.query(EvalFile::new("b".to_string())).unwrap();
+    let result_c = runtime.query(EvalFile::new("c".to_string())).unwrap();
 
-    assert_eq!(*a, 10);
-    assert_eq!(*b, 25);
-    assert_eq!(*c, 9);
+    assert_eq!(*result_a, 10);
+    assert_eq!(*result_b, 25);
+    assert_eq!(*result_c, 9);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                // Asset resolutions
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"a\")"), changed: true },
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"b\")"), changed: true },
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"c\")"), changed: true },
+                // File "a"
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"a\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"a\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"a\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"a\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"a\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"a\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"a\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"a\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"a\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"a\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"a\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"a\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"a\")"), result: Changed },
+                // File "b"
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"b\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"b\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"b\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"b\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"b\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"b\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"b\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"b\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"b\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"b\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"b\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"b\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"b\")"), result: Changed },
+                // File "c"
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"c\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"c\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"c\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"c\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"c\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"c\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"c\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"c\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"c\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"c\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"c\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"c\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"c\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
@@ -331,7 +588,14 @@ fn test_dependency_chain() {
     // SourceFile asset -> parse_expr query -> eval_file query
     // Variable assets -> eval_file query
 
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("expr".to_string()), "a * b + c".to_string());
     runtime.resolve_asset(Variable("a".to_string()), 2);
     runtime.resolve_asset(Variable("b".to_string()), 3);
@@ -341,33 +605,171 @@ fn test_dependency_chain() {
 
     // 2 * 3 + 4 = 10
     assert_eq!(*result, 10);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                // Asset resolutions
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"expr\")"), changed: true },
+                AssetResolved { asset: a("calc::Variable", "Variable(\"a\")"), changed: true },
+                AssetResolved { asset: a("calc::Variable", "Variable(\"b\")"), changed: true },
+                AssetResolved { asset: a("calc::Variable", "Variable(\"c\")"), changed: true },
+                // EvalFile query
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"expr\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"expr\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"expr\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"expr\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"expr\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"expr\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"expr\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"expr\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"expr\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"expr\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"expr\")"), result: Changed },
+                // Variable lookups
+                AssetDependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"expr\")"),
+                    asset: a("calc::Variable", "Variable(\"a\")"),
+                },
+                AssetRequested { asset: a("calc::Variable", "Variable(\"a\")"), state: AssetState::Ready },
+                AssetDependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"expr\")"),
+                    asset: a("calc::Variable", "Variable(\"b\")"),
+                },
+                AssetRequested { asset: a("calc::Variable", "Variable(\"b\")"), state: AssetState::Ready },
+                AssetDependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"expr\")"),
+                    asset: a("calc::Variable", "Variable(\"c\")"),
+                },
+                AssetRequested { asset: a("calc::Variable", "Variable(\"c\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"expr\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"expr\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
 fn test_subtraction_and_division() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("main".to_string()), "100 - 50 / 2".to_string());
 
     let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     // 100 - (50 / 2) = 100 - 25 = 75
     assert_eq!(*result, 75);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"main\")"), changed: true },
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"main\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"main\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
 fn test_variable_only() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     runtime.resolve_asset(SourceFile("main".to_string()), "answer".to_string());
     runtime.resolve_asset(Variable("answer".to_string()), 42);
 
     let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
     assert_eq!(*result, 42);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                AssetResolved { asset: a("calc::SourceFile", "SourceFile(\"main\")"), changed: true },
+                AssetResolved { asset: a("calc::Variable", "Variable(\"answer\")"), changed: true },
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"main\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"main\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"), result: Changed },
+                AssetDependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                    asset: a("calc::Variable", "Variable(\"answer\")"),
+                },
+                AssetRequested { asset: a("calc::Variable", "Variable(\"answer\")"), state: AssetState::Ready },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"main\")"), result: Changed },
+            ]
+        );
+    }
 }
 
 #[test]
 fn test_empty_source() {
+    #[cfg(feature = "inspector")]
+    let collector = Arc::new(EventCollector::new());
+
     let runtime = QueryRuntime::new();
+
+    #[cfg(feature = "inspector")]
+    runtime.set_sink(Some(collector.clone()));
+
     // Don't set any source - should get empty string -> 0
 
     let result = runtime
@@ -375,4 +777,33 @@ fn test_empty_source() {
         .unwrap();
 
     assert_eq!(*result, 0);
+
+    #[cfg(feature = "inspector")]
+    {
+        use EventKind::*;
+        use ExecutionResult::*;
+
+        assert_eq!(
+            to_kinds(&collector.trace()),
+            vec![
+                QueryStart { query: q("calc::EvalFile", "calc::EvalFile(\"nonexistent\")") },
+                CacheCheck { query: q("calc::EvalFile", "calc::EvalFile(\"nonexistent\")"), valid: false },
+                DependencyRegistered {
+                    parent: q("calc::EvalFile", "calc::EvalFile(\"nonexistent\")"),
+                    dependency: q("calc::ParseExpr", "calc::ParseExpr(\"nonexistent\")"),
+                },
+                QueryStart { query: q("calc::ParseExpr", "calc::ParseExpr(\"nonexistent\")") },
+                CacheCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"nonexistent\")"), valid: false },
+                AssetDependencyRegistered {
+                    parent: q("calc::ParseExpr", "calc::ParseExpr(\"nonexistent\")"),
+                    asset: a("calc::SourceFile", "SourceFile(\"nonexistent\")"),
+                },
+                AssetRequested { asset: a("calc::SourceFile", "SourceFile(\"nonexistent\")"), state: AssetState::Loading },
+                EarlyCutoffCheck { query: q("calc::ParseExpr", "calc::ParseExpr(\"nonexistent\")"), output_changed: true },
+                QueryEnd { query: q("calc::ParseExpr", "calc::ParseExpr(\"nonexistent\")"), result: Changed },
+                EarlyCutoffCheck { query: q("calc::EvalFile", "calc::EvalFile(\"nonexistent\")"), output_changed: true },
+                QueryEnd { query: q("calc::EvalFile", "calc::EvalFile(\"nonexistent\")"), result: Changed },
+            ]
+        );
+    }
 }

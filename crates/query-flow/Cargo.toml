@@ -17,6 +17,7 @@ inspector = ["dep:query-flow-inspector", "dep:parking_lot"]
 whale.workspace = true
 ahash.workspace = true
 papaya.workspace = true
+anyhow.workspace = true
 query-flow-macros.workspace = true
 query-flow-inspector = { workspace = true, optional = true }
 parking_lot = { version = "0.12", optional = true }

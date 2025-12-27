@@ -45,4 +45,4 @@ pub use key::Key;
 pub use loading::LoadingState;
 pub use query::Query;
 pub use query_flow_macros::{asset_key, query};
-pub use runtime::{QueryContext, QueryRuntime};
+pub use runtime::{ErrorComparator, QueryContext, QueryRuntime, QueryRuntimeBuilder};

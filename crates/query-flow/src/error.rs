@@ -1,11 +1,12 @@
 //! Error types for query execution.
 
 use std::fmt;
+use std::sync::Arc;
 
-/// System-level query errors.
+/// Query errors including both system-level and user errors.
 ///
-/// These are distinct from user domain errors, which should be wrapped
-/// in `Query::Output` (e.g., `type Output = Result<T, MyError>`).
+/// User errors can be propagated using the `?` operator, which automatically
+/// converts any `Into<anyhow::Error>` type into `QueryError::UserError`.
 #[derive(Debug, Clone)]
 pub enum QueryError {
     /// Query is waiting for async loading to complete.
@@ -32,6 +33,16 @@ pub enum QueryError {
         /// Description of the missing dependency.
         description: String,
     },
+
+    /// User-defined error.
+    ///
+    /// This variant allows user errors to be propagated through the query system
+    /// using the `?` operator. Any type implementing `Into<anyhow::Error>` can be
+    /// converted to this variant.
+    ///
+    /// Unlike system errors (Suspend, Cycle, etc.), UserError results are cached
+    /// and participate in early cutoff optimization.
+    UserError(Arc<anyhow::Error>),
 }
 
 impl fmt::Display for QueryError {
@@ -45,8 +56,13 @@ impl fmt::Display for QueryError {
             QueryError::MissingDependency { description } => {
                 write!(f, "missing dependency: {}", description)
             }
+            QueryError::UserError(e) => write!(f, "user error: {}", e),
         }
     }
 }
 
-impl std::error::Error for QueryError {}
+impl<T: Into<anyhow::Error>> From<T> for QueryError {
+    fn from(err: T) -> Self {
+        QueryError::UserError(Arc::new(err.into()))
+    }
+}

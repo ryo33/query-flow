@@ -10,12 +10,33 @@ use crate::asset::{AssetKey, AssetLocator, FullAssetKey};
 use crate::key::FullCacheKey;
 use crate::query::Query;
 
+/// Cached query result (success or user error).
+///
+/// This is used internally to store both successful outputs and user errors
+/// in the cache, enabling early cutoff optimization for error results.
+#[derive(Clone)]
+pub enum CachedValue<T> {
+    /// Successful query output.
+    Ok(T),
+    /// User error from `QueryError::UserError`.
+    UserError(Arc<anyhow::Error>),
+}
+
+/// Internal type-erased cache entry.
+#[derive(Clone)]
+pub(crate) enum CachedEntry {
+    /// Successful output (type-erased).
+    Ok(Arc<dyn Any + Send + Sync>),
+    /// User error.
+    UserError(Arc<anyhow::Error>),
+}
+
 /// Thread-safe, type-erased storage for cached query results.
 ///
 /// Uses papaya's lock-free HashMap internally.
 pub(crate) struct CacheStorage {
-    /// Map from FullCacheKey to type-erased Arc<Output>
-    entries: HashMap<FullCacheKey, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+    /// Map from FullCacheKey to cached entry (Ok or UserError)
+    entries: HashMap<FullCacheKey, CachedEntry, ahash::RandomState>,
 }
 
 impl Default for CacheStorage {
@@ -32,21 +53,29 @@ impl CacheStorage {
         }
     }
 
-    /// Get a cached value if present.
-    ///
-    /// Returns `None` if not cached or if type doesn't match.
-    pub fn get<Q: Query>(&self, key: &FullCacheKey) -> Option<Arc<Q::Output>> {
+    /// Get a cached entry (Ok or UserError) if present.
+    pub fn get_cached<Q: Query>(&self, key: &FullCacheKey) -> Option<CachedValue<Arc<Q::Output>>> {
         let pinned = self.entries.pin();
-        pinned.get(key).and_then(|arc| {
-            // Downcast from Any to the concrete type
-            arc.clone().downcast::<Q::Output>().ok()
+        pinned.get(key).and_then(|entry| match entry {
+            CachedEntry::Ok(arc) => arc
+                .clone()
+                .downcast::<Q::Output>()
+                .ok()
+                .map(CachedValue::Ok),
+            CachedEntry::UserError(e) => Some(CachedValue::UserError(e.clone())),
         })
     }
 
-    /// Insert a value into the cache.
-    pub fn insert<Q: Query>(&self, key: FullCacheKey, value: Arc<Q::Output>) {
+    /// Insert an Ok value into the cache.
+    pub fn insert_ok<Q: Query>(&self, key: FullCacheKey, value: Arc<Q::Output>) {
         let pinned = self.entries.pin();
-        pinned.insert(key, value as Arc<dyn Any + Send + Sync>);
+        pinned.insert(key, CachedEntry::Ok(value as Arc<dyn Any + Send + Sync>));
+    }
+
+    /// Insert a UserError into the cache.
+    pub fn insert_error(&self, key: FullCacheKey, error: Arc<anyhow::Error>) {
+        let pinned = self.entries.pin();
+        pinned.insert(key, CachedEntry::UserError(error));
     }
 
     /// Remove a value from the cache.
@@ -473,16 +502,19 @@ mod tests {
         let key = FullCacheKey::new::<TestQuery, _>(&42u32);
 
         // Initially empty
-        assert!(storage.get::<TestQuery>(&key).is_none());
+        assert!(storage.get_cached::<TestQuery>(&key).is_none());
 
         // Insert and retrieve
-        storage.insert::<TestQuery>(key.clone(), Arc::new("hello".to_string()));
-        let result = storage.get::<TestQuery>(&key);
+        storage.insert_ok::<TestQuery>(key.clone(), Arc::new("hello".to_string()));
+        let result = storage.get_cached::<TestQuery>(&key);
         assert!(result.is_some());
-        assert_eq!(*result.unwrap(), "hello");
+        match result.unwrap() {
+            CachedValue::Ok(v) => assert_eq!(*v, "hello"),
+            CachedValue::UserError(_) => panic!("expected Ok"),
+        }
 
         // Remove
         assert!(storage.remove(&key));
-        assert!(storage.get::<TestQuery>(&key).is_none());
+        assert!(storage.get_cached::<TestQuery>(&key).is_none());
     }
 }

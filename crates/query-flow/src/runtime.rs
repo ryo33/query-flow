@@ -11,10 +11,16 @@ use crate::key::FullCacheKey;
 use crate::loading::LoadingState;
 use crate::query::Query;
 use crate::storage::{
-    AssetKeyRegistry, AssetState, AssetStorage, CacheStorage, LocatorStorage, PendingStorage,
-    QueryRegistry,
+    AssetKeyRegistry, AssetState, AssetStorage, CacheStorage, CachedValue, LocatorStorage,
+    PendingStorage, QueryRegistry,
 };
 use crate::QueryError;
+
+/// Function type for comparing user errors during early cutoff.
+///
+/// Used by `QueryRuntimeBuilder::error_comparator` to customize how
+/// `QueryError::UserError` values are compared for caching purposes.
+pub type ErrorComparator = fn(&anyhow::Error, &anyhow::Error) -> bool;
 
 #[cfg(feature = "inspector")]
 use query_flow_inspector::{EventSink, FlowEvent, SpanId};
@@ -57,6 +63,8 @@ pub struct QueryRuntime {
     query_registry: Arc<QueryRegistry>,
     /// Registry for tracking asset keys (for list_asset_keys)
     asset_key_registry: Arc<AssetKeyRegistry>,
+    /// Comparator for user errors during early cutoff
+    error_comparator: ErrorComparator,
     /// Event sink for inspector/tracing
     #[cfg(feature = "inspector")]
     sink: Arc<parking_lot::RwLock<Option<Arc<dyn EventSink>>>>,
@@ -78,26 +86,43 @@ impl Clone for QueryRuntime {
             pending: self.pending.clone(),
             query_registry: self.query_registry.clone(),
             asset_key_registry: self.asset_key_registry.clone(),
+            error_comparator: self.error_comparator,
             #[cfg(feature = "inspector")]
             sink: self.sink.clone(),
         }
     }
 }
 
+/// Default error comparator that treats all errors as different.
+///
+/// This is conservative - it always triggers recomputation when an error occurs.
+fn default_error_comparator(_a: &anyhow::Error, _b: &anyhow::Error) -> bool {
+    false
+}
+
 impl QueryRuntime {
-    /// Create a new query runtime.
+    /// Create a new query runtime with default settings.
     pub fn new() -> Self {
-        Self {
-            whale: WhaleRuntime::new(),
-            cache: Arc::new(CacheStorage::new()),
-            assets: Arc::new(AssetStorage::new()),
-            locators: Arc::new(LocatorStorage::new()),
-            pending: Arc::new(PendingStorage::new()),
-            query_registry: Arc::new(QueryRegistry::new()),
-            asset_key_registry: Arc::new(AssetKeyRegistry::new()),
-            #[cfg(feature = "inspector")]
-            sink: Arc::new(parking_lot::RwLock::new(None)),
-        }
+        Self::builder().build()
+    }
+
+    /// Create a builder for customizing the runtime.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let runtime = QueryRuntime::builder()
+    ///     .error_comparator(|a, b| {
+    ///         // Custom error comparison logic
+    ///         match (a.downcast_ref::<MyError>(), b.downcast_ref::<MyError>()) {
+    ///             (Some(a), Some(b)) => a == b,
+    ///             _ => false,
+    ///         }
+    ///     })
+    ///     .build();
+    /// ```
+    pub fn builder() -> QueryRuntimeBuilder {
+        QueryRuntimeBuilder::new()
     }
 
     /// Set the event sink for tracing/inspection.
@@ -214,7 +239,10 @@ impl QueryRuntime {
                 duration: start_time.elapsed(),
             });
 
-            return Ok(cached);
+            return match cached {
+                CachedValue::Ok(output) => Ok(output),
+                CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+            };
         }
 
         #[cfg(feature = "inspector")]
@@ -283,55 +311,104 @@ impl QueryRuntime {
         };
 
         // Execute the query
-        let output = query.query(&mut ctx)?;
-        let output = Arc::new(output);
+        let result = query.query(&mut ctx);
 
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
 
-        // Check if output changed (for early cutoff)
-        let output_changed = if let Some(old) = self.cache.get::<Q>(full_key) {
-            !Q::output_eq(&old, &output)
-        } else {
-            true // No previous value, so "changed"
-        };
-
-        // Emit early cutoff check event
-        self.emit(|| FlowEvent::EarlyCutoffCheck {
-            span_id,
-            query: query_flow_inspector::QueryKey::new(
-                std::any::type_name::<Q>(),
-                full_key.debug_repr(),
-            ),
-            output_changed,
-        });
-
-        // Update cache
-        self.cache.insert::<Q>(full_key.clone(), output.clone());
-
-        // Update whale dependency tracking
+        // Get durability for whale registration
         let durability =
             Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
 
-        if output_changed {
-            // Register with new changed_at
-            let _ = self.whale.register(full_key.clone(), (), durability, deps);
-        } else {
-            // Early cutoff: keep old changed_at
-            let _ = self.whale.confirm_unchanged(full_key, deps);
-        }
+        match result {
+            Ok(output) => {
+                let output = Arc::new(output);
 
-        // Register query in registry for list_queries
-        let is_new_query = self.query_registry.register(query);
-        if is_new_query {
-            // Update sentinel to invalidate list_queries dependents
-            let sentinel = FullCacheKey::query_set_sentinel::<Q>();
-            let _ = self
-                .whale
-                .register(sentinel, (), Durability::volatile(), vec![]);
-        }
+                // Check if output changed (for early cutoff)
+                let output_changed =
+                    if let Some(CachedValue::Ok(old)) = self.cache.get_cached::<Q>(full_key) {
+                        !Q::output_eq(&old, &output)
+                    } else {
+                        true // No previous value or was error, so "changed"
+                    };
 
-        Ok((output, output_changed))
+                // Emit early cutoff check event
+                self.emit(|| FlowEvent::EarlyCutoffCheck {
+                    span_id,
+                    query: query_flow_inspector::QueryKey::new(
+                        std::any::type_name::<Q>(),
+                        full_key.debug_repr(),
+                    ),
+                    output_changed,
+                });
+
+                // Update cache
+                self.cache.insert_ok::<Q>(full_key.clone(), output.clone());
+
+                // Update whale dependency tracking
+                if output_changed {
+                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                } else {
+                    let _ = self.whale.confirm_unchanged(full_key, deps);
+                }
+
+                // Register query in registry for list_queries
+                let is_new_query = self.query_registry.register(query);
+                if is_new_query {
+                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+                    let _ = self
+                        .whale
+                        .register(sentinel, (), Durability::volatile(), vec![]);
+                }
+
+                Ok((output, output_changed))
+            }
+            Err(QueryError::UserError(err)) => {
+                // Check if error changed (for early cutoff)
+                let output_changed = if let Some(CachedValue::UserError(old_err)) =
+                    self.cache.get_cached::<Q>(full_key)
+                {
+                    !(self.error_comparator)(old_err.as_ref(), err.as_ref())
+                } else {
+                    true // No previous error or was Ok, so "changed"
+                };
+
+                // Emit early cutoff check event
+                self.emit(|| FlowEvent::EarlyCutoffCheck {
+                    span_id,
+                    query: query_flow_inspector::QueryKey::new(
+                        std::any::type_name::<Q>(),
+                        full_key.debug_repr(),
+                    ),
+                    output_changed,
+                });
+
+                // Update cache with error
+                self.cache.insert_error(full_key.clone(), err.clone());
+
+                // Update whale dependency tracking
+                if output_changed {
+                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                } else {
+                    let _ = self.whale.confirm_unchanged(full_key, deps);
+                }
+
+                // Register query in registry for list_queries
+                let is_new_query = self.query_registry.register(query);
+                if is_new_query {
+                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+                    let _ = self
+                        .whale
+                        .register(sentinel, (), Durability::volatile(), vec![]);
+                }
+
+                Err(QueryError::UserError(err))
+            }
+            Err(e) => {
+                // System errors (Suspend, Cycle, Cancelled, MissingDependency) are not cached
+                Err(e)
+            }
+        }
     }
 
     /// Execute a query, caching the result if appropriate.
@@ -351,59 +428,103 @@ impl QueryRuntime {
         };
 
         // Execute the query
-        let output = query.query(&mut ctx)?;
-        let output = Arc::new(output);
+        let result = query.query(&mut ctx);
 
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
 
-        // Check if output changed (for early cutoff)
-        let output_changed = if let Some(old) = self.cache.get::<Q>(full_key) {
-            !Q::output_eq(&old, &output)
-        } else {
-            true // No previous value, so "changed"
-        };
-
-        // Update cache
-        self.cache.insert::<Q>(full_key.clone(), output.clone());
-
-        // Update whale dependency tracking
+        // Get durability for whale registration
         let durability =
             Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
 
-        if output_changed {
-            // Register with new changed_at
-            let _ = self.whale.register(full_key.clone(), (), durability, deps);
-        } else {
-            // Early cutoff: keep old changed_at
-            let _ = self.whale.confirm_unchanged(full_key, deps);
-        }
+        match result {
+            Ok(output) => {
+                let output = Arc::new(output);
 
-        // Register query in registry for list_queries
-        let is_new_query = self.query_registry.register(query);
-        if is_new_query {
-            // Update sentinel to invalidate list_queries dependents
-            let sentinel = FullCacheKey::query_set_sentinel::<Q>();
-            let _ = self
-                .whale
-                .register(sentinel, (), Durability::volatile(), vec![]);
-        }
+                // Check if output changed (for early cutoff)
+                let output_changed =
+                    if let Some(CachedValue::Ok(old)) = self.cache.get_cached::<Q>(full_key) {
+                        !Q::output_eq(&old, &output)
+                    } else {
+                        true // No previous value or was error, so "changed"
+                    };
 
-        Ok((output, output_changed))
+                // Update cache
+                self.cache.insert_ok::<Q>(full_key.clone(), output.clone());
+
+                // Update whale dependency tracking
+                if output_changed {
+                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                } else {
+                    let _ = self.whale.confirm_unchanged(full_key, deps);
+                }
+
+                // Register query in registry for list_queries
+                let is_new_query = self.query_registry.register(query);
+                if is_new_query {
+                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+                    let _ = self
+                        .whale
+                        .register(sentinel, (), Durability::volatile(), vec![]);
+                }
+
+                Ok((output, output_changed))
+            }
+            Err(QueryError::UserError(err)) => {
+                // Check if error changed (for early cutoff)
+                let output_changed = if let Some(CachedValue::UserError(old_err)) =
+                    self.cache.get_cached::<Q>(full_key)
+                {
+                    !(self.error_comparator)(old_err.as_ref(), err.as_ref())
+                } else {
+                    true // No previous error or was Ok, so "changed"
+                };
+
+                // Update cache with error
+                self.cache.insert_error(full_key.clone(), err.clone());
+
+                // Update whale dependency tracking
+                if output_changed {
+                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                } else {
+                    let _ = self.whale.confirm_unchanged(full_key, deps);
+                }
+
+                // Register query in registry for list_queries
+                let is_new_query = self.query_registry.register(query);
+                if is_new_query {
+                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+                    let _ = self
+                        .whale
+                        .register(sentinel, (), Durability::volatile(), vec![]);
+                }
+
+                Err(QueryError::UserError(err))
+            }
+            Err(e) => {
+                // System errors (Suspend, Cycle, Cancelled, MissingDependency) are not cached
+                Err(e)
+            }
+        }
     }
 
-    /// Get cached value if it's still valid.
-    fn get_cached_if_valid<Q: Query>(&self, full_key: &FullCacheKey) -> Option<Arc<Q::Output>> {
+    /// Get cached result (Ok or UserError) if it's still valid.
+    fn get_cached_if_valid<Q: Query>(
+        &self,
+        full_key: &FullCacheKey,
+    ) -> Option<CachedValue<Arc<Q::Output>>> {
         // Check whale validity first
         if !self.whale.is_valid(full_key) {
             return None;
         }
 
         // Then check if we have the cached value
-        self.cache.get::<Q>(full_key)
+        self.cache.get_cached::<Q>(full_key)
     }
 
     /// Invalidate a query, forcing recomputation on next access.
+    ///
+    /// This also invalidates any queries that depend on this one.
     pub fn invalidate<Q: Query>(&self, key: &Q::CacheKey) {
         let full_key = FullCacheKey::new::<Q, _>(key);
 
@@ -416,13 +537,92 @@ impl QueryRuntime {
             reason: query_flow_inspector::InvalidationReason::ManualInvalidation,
         });
 
+        // Remove from cache
         self.cache.remove(&full_key);
-        // Whale will detect invalidity via is_valid check
+
+        // Update whale to invalidate dependents (register with new changed_at)
+        let _ = self
+            .whale
+            .register(full_key, (), Durability::volatile(), vec![]);
     }
 
     /// Clear all cached values.
     pub fn clear_cache(&self) {
         self.cache.clear();
+    }
+}
+
+// ============================================================================
+// Builder
+// ============================================================================
+
+/// Builder for [`QueryRuntime`] with customizable settings.
+///
+/// # Example
+///
+/// ```ignore
+/// let runtime = QueryRuntime::builder()
+///     .error_comparator(|a, b| {
+///         // Treat all errors of the same type as equal
+///         a.downcast_ref::<std::io::Error>().is_some()
+///             == b.downcast_ref::<std::io::Error>().is_some()
+///     })
+///     .build();
+/// ```
+pub struct QueryRuntimeBuilder {
+    error_comparator: ErrorComparator,
+}
+
+impl Default for QueryRuntimeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueryRuntimeBuilder {
+    /// Create a new builder with default settings.
+    pub fn new() -> Self {
+        Self {
+            error_comparator: default_error_comparator,
+        }
+    }
+
+    /// Set the error comparator function for early cutoff optimization.
+    ///
+    /// When a query returns `QueryError::UserError`, this function is used
+    /// to compare it with the previously cached error. If they are equal,
+    /// downstream queries can skip recomputation (early cutoff).
+    ///
+    /// The default comparator returns `false` for all errors, meaning errors
+    /// are always considered different (conservative, always recomputes).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Treat errors as equal if they have the same display message
+    /// let runtime = QueryRuntime::builder()
+    ///     .error_comparator(|a, b| a.to_string() == b.to_string())
+    ///     .build();
+    /// ```
+    pub fn error_comparator(mut self, f: ErrorComparator) -> Self {
+        self.error_comparator = f;
+        self
+    }
+
+    /// Build the runtime with the configured settings.
+    pub fn build(self) -> QueryRuntime {
+        QueryRuntime {
+            whale: WhaleRuntime::new(),
+            cache: Arc::new(CacheStorage::new()),
+            assets: Arc::new(AssetStorage::new()),
+            locators: Arc::new(LocatorStorage::new()),
+            pending: Arc::new(PendingStorage::new()),
+            query_registry: Arc::new(QueryRegistry::new()),
+            asset_key_registry: Arc::new(AssetKeyRegistry::new()),
+            error_comparator: self.error_comparator,
+            #[cfg(feature = "inspector")]
+            sink: Arc::new(parking_lot::RwLock::new(None)),
+        }
     }
 }
 

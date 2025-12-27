@@ -3,17 +3,17 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/ryo33/query-flow"
 repository = "https://github.com/ryo33/query-flow"
 
 [workspace.dependencies]
-whale = { path = "crates/whale", version = "0.1.0" }
-query-flow = { path = "crates/query-flow", version = "0.1.0" }
-query-flow-macros = { path = "crates/query-flow-macros", version = "0.1.0" }
-query-flow-inspector = { path = "crates/query-flow-inspector", version = "0.1.0" }
+whale = { path = "crates/whale", version = "0.2.0" }
+query-flow = { path = "crates/query-flow", version = "0.2.0" }
+query-flow-macros = { path = "crates/query-flow-macros", version = "0.2.0" }
+query-flow-inspector = { path = "crates/query-flow-inspector", version = "0.2.0" }
 ahash = "0.8"
 papaya = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }

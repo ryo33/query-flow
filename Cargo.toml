@@ -6,8 +6,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/ryo33/whale"
-repository = "https://github.com/ryo33/whale"
+homepage = "https://github.com/ryo33/query-flow"
+repository = "https://github.com/ryo33/query-flow"
 
 [workspace.dependencies]
 whale = { path = "crates/whale", version = "0.1.0" }

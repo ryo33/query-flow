@@ -48,6 +48,7 @@ jobs:
       - name: Run release-plz
         uses: ryo33/release-plz@41cda47b63e53b9ca021d5f9be27cde62471435b # v0.3.150
         with:
+          project_manifest: Cargo.toml
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

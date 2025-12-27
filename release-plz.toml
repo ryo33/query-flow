@@ -1,0 +1,17 @@
+[workspace]
+semver_check = true
+
+[[package]]
+name = "whale"
+
+[[package]]
+name = "query-flow"
+version_group = "query-flow"
+
+[[package]]
+name = "query-flow-macros"
+version_group = "query-flow"
+
+[[package]]
+name = "query-flow-inspector"
+version_group = "query-flow"

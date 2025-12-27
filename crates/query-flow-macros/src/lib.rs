@@ -512,7 +512,9 @@ impl FromMeta for DurabilityAttr {
                 return Self::parse_str(&ident.to_string());
             }
         }
-        Err(darling::Error::custom("expected durability level: volatile, session, stable, or constant"))
+        Err(darling::Error::custom(
+            "expected durability level: volatile, session, stable, or constant",
+        ))
     }
 }
 

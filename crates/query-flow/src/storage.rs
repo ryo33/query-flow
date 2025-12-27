@@ -259,7 +259,9 @@ impl PendingStorage {
         let pinned = self.pending.pin();
         pinned
             .iter()
-            .map(|(k, v)| crate::asset::PendingAsset::new_from_parts(k.key_type(), k.debug_repr(), v.clone()))
+            .map(|(k, v)| {
+                crate::asset::PendingAsset::new_from_parts(k.key_type(), k.debug_repr(), v.clone())
+            })
             .collect()
     }
 }

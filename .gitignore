@@ -16,3 +16,5 @@
 !*.lean
 !/lake-manifest.json
 !/lean-toolchain
+
+!Makefile

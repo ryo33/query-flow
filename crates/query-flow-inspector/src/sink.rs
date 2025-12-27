@@ -175,10 +175,7 @@ mod tests {
     #[test]
     fn test_filter_sink() {
         let inner = CountingSink::new();
-        let filter_sink = FilterSink::new(
-            |e| matches!(e, FlowEvent::QueryStart { .. }),
-            inner,
-        );
+        let filter_sink = FilterSink::new(|e| matches!(e, FlowEvent::QueryStart { .. }), inner);
 
         // This should pass the filter
         filter_sink.emit(FlowEvent::QueryStart {

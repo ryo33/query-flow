@@ -78,7 +78,10 @@ fn test_resolve_asset_before_query() {
     let runtime = QueryRuntime::new();
 
     // Pre-populate asset before any query
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "config content".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "config content".to_string(),
+    );
 
     // Define a query that uses the asset
     #[query]
@@ -115,7 +118,10 @@ fn test_pending_asset_flow() {
     assert_eq!(pending[0].0, "app.json");
 
     // Resolve the asset
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "resolved content".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "resolved content".to_string(),
+    );
 
     // Now query should succeed
     let result = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
@@ -316,7 +322,10 @@ fn test_remove_asset() {
     });
 
     // Pre-resolve asset
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "pre_resolved".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "pre_resolved".to_string(),
+    );
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
@@ -340,7 +349,10 @@ fn test_remove_asset() {
 fn test_multiple_asset_types() {
     let runtime = QueryRuntime::new();
 
-    runtime.resolve_asset(ConfigFile("config.json".to_string()), "config content".to_string());
+    runtime.resolve_asset(
+        ConfigFile("config.json".to_string()),
+        "config content".to_string(),
+    );
     runtime.resolve_asset(BinaryFile("data.bin".to_string()), vec![1, 2, 3, 4]);
 
     #[query]

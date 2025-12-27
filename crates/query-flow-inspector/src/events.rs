@@ -92,10 +92,7 @@ pub enum AssetState {
 pub enum FlowEvent {
     // === Query Lifecycle ===
     /// Query execution started.
-    QueryStart {
-        span_id: SpanId,
-        query: QueryKey,
-    },
+    QueryStart { span_id: SpanId, query: QueryKey },
 
     /// Cache validity check completed.
     CacheCheck {
@@ -179,35 +176,110 @@ pub struct ExecutionTrace {
 /// Event kind for comparison (without span_id/duration).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
-    QueryStart { query: QueryKey },
-    CacheCheck { query: QueryKey, valid: bool },
-    QueryEnd { query: QueryKey, result: ExecutionResult },
-    DependencyRegistered { parent: QueryKey, dependency: QueryKey },
-    AssetDependencyRegistered { parent: QueryKey, asset: AssetKey },
-    EarlyCutoffCheck { query: QueryKey, output_changed: bool },
-    AssetRequested { asset: AssetKey, state: AssetState },
-    AssetResolved { asset: AssetKey, changed: bool },
-    AssetInvalidated { asset: AssetKey },
-    QueryInvalidated { query: QueryKey, reason: InvalidationReason },
-    CycleDetected { path: Vec<QueryKey> },
-    MissingDependency { query: QueryKey, dependency_description: String },
+    QueryStart {
+        query: QueryKey,
+    },
+    CacheCheck {
+        query: QueryKey,
+        valid: bool,
+    },
+    QueryEnd {
+        query: QueryKey,
+        result: ExecutionResult,
+    },
+    DependencyRegistered {
+        parent: QueryKey,
+        dependency: QueryKey,
+    },
+    AssetDependencyRegistered {
+        parent: QueryKey,
+        asset: AssetKey,
+    },
+    EarlyCutoffCheck {
+        query: QueryKey,
+        output_changed: bool,
+    },
+    AssetRequested {
+        asset: AssetKey,
+        state: AssetState,
+    },
+    AssetResolved {
+        asset: AssetKey,
+        changed: bool,
+    },
+    AssetInvalidated {
+        asset: AssetKey,
+    },
+    QueryInvalidated {
+        query: QueryKey,
+        reason: InvalidationReason,
+    },
+    CycleDetected {
+        path: Vec<QueryKey>,
+    },
+    MissingDependency {
+        query: QueryKey,
+        dependency_description: String,
+    },
 }
 
 impl From<&FlowEvent> for EventKind {
     fn from(event: &FlowEvent) -> Self {
         match event {
-            FlowEvent::QueryStart { query, .. } => EventKind::QueryStart { query: query.clone() },
-            FlowEvent::CacheCheck { query, valid, .. } => EventKind::CacheCheck { query: query.clone(), valid: *valid },
-            FlowEvent::QueryEnd { query, result, .. } => EventKind::QueryEnd { query: query.clone(), result: result.clone() },
-            FlowEvent::DependencyRegistered { parent, dependency, .. } => EventKind::DependencyRegistered { parent: parent.clone(), dependency: dependency.clone() },
-            FlowEvent::AssetDependencyRegistered { parent, asset, .. } => EventKind::AssetDependencyRegistered { parent: parent.clone(), asset: asset.clone() },
-            FlowEvent::EarlyCutoffCheck { query, output_changed, .. } => EventKind::EarlyCutoffCheck { query: query.clone(), output_changed: *output_changed },
-            FlowEvent::AssetRequested { asset, state } => EventKind::AssetRequested { asset: asset.clone(), state: state.clone() },
-            FlowEvent::AssetResolved { asset, changed } => EventKind::AssetResolved { asset: asset.clone(), changed: *changed },
-            FlowEvent::AssetInvalidated { asset } => EventKind::AssetInvalidated { asset: asset.clone() },
-            FlowEvent::QueryInvalidated { query, reason } => EventKind::QueryInvalidated { query: query.clone(), reason: reason.clone() },
+            FlowEvent::QueryStart { query, .. } => EventKind::QueryStart {
+                query: query.clone(),
+            },
+            FlowEvent::CacheCheck { query, valid, .. } => EventKind::CacheCheck {
+                query: query.clone(),
+                valid: *valid,
+            },
+            FlowEvent::QueryEnd { query, result, .. } => EventKind::QueryEnd {
+                query: query.clone(),
+                result: result.clone(),
+            },
+            FlowEvent::DependencyRegistered {
+                parent, dependency, ..
+            } => EventKind::DependencyRegistered {
+                parent: parent.clone(),
+                dependency: dependency.clone(),
+            },
+            FlowEvent::AssetDependencyRegistered { parent, asset, .. } => {
+                EventKind::AssetDependencyRegistered {
+                    parent: parent.clone(),
+                    asset: asset.clone(),
+                }
+            }
+            FlowEvent::EarlyCutoffCheck {
+                query,
+                output_changed,
+                ..
+            } => EventKind::EarlyCutoffCheck {
+                query: query.clone(),
+                output_changed: *output_changed,
+            },
+            FlowEvent::AssetRequested { asset, state } => EventKind::AssetRequested {
+                asset: asset.clone(),
+                state: state.clone(),
+            },
+            FlowEvent::AssetResolved { asset, changed } => EventKind::AssetResolved {
+                asset: asset.clone(),
+                changed: *changed,
+            },
+            FlowEvent::AssetInvalidated { asset } => EventKind::AssetInvalidated {
+                asset: asset.clone(),
+            },
+            FlowEvent::QueryInvalidated { query, reason } => EventKind::QueryInvalidated {
+                query: query.clone(),
+                reason: reason.clone(),
+            },
             FlowEvent::CycleDetected { path } => EventKind::CycleDetected { path: path.clone() },
-            FlowEvent::MissingDependency { query, dependency_description } => EventKind::MissingDependency { query: query.clone(), dependency_description: dependency_description.clone() },
+            FlowEvent::MissingDependency {
+                query,
+                dependency_description,
+            } => EventKind::MissingDependency {
+                query: query.clone(),
+                dependency_description: dependency_description.clone(),
+            },
         }
     }
 }
@@ -228,7 +300,10 @@ impl ExecutionTrace {
 
     /// Filter events for a specific query.
     pub fn events_for_query(&self, query: &QueryKey) -> Vec<&FlowEvent> {
-        self.events.iter().filter(|e| matches_query(e, query)).collect()
+        self.events
+            .iter()
+            .filter(|e| matches_query(e, query))
+            .collect()
     }
 
     /// Get all query start events.
@@ -240,7 +315,9 @@ impl ExecutionTrace {
     }
 
     /// Get all query end events.
-    pub fn query_ends(&self) -> impl Iterator<Item = (&SpanId, &QueryKey, &ExecutionResult, &Duration)> {
+    pub fn query_ends(
+        &self,
+    ) -> impl Iterator<Item = (&SpanId, &QueryKey, &ExecutionResult, &Duration)> {
         self.events.iter().filter_map(|e| match e {
             FlowEvent::QueryEnd {
                 span_id,
@@ -270,9 +347,9 @@ fn matches_query(event: &FlowEvent, query: &QueryKey) -> bool {
         | FlowEvent::EarlyCutoffCheck { query: q, .. }
         | FlowEvent::QueryInvalidated { query: q, .. }
         | FlowEvent::MissingDependency { query: q, .. } => q == query,
-        FlowEvent::DependencyRegistered { parent, dependency, .. } => {
-            parent == query || dependency == query
-        }
+        FlowEvent::DependencyRegistered {
+            parent, dependency, ..
+        } => parent == query || dependency == query,
         FlowEvent::AssetDependencyRegistered { parent, .. } => parent == query,
         FlowEvent::CycleDetected { path } => path.contains(query),
         _ => false,

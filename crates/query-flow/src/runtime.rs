@@ -143,10 +143,8 @@ impl QueryRuntime {
         #[cfg(feature = "inspector")]
         let start_time = std::time::Instant::now();
         #[cfg(feature = "inspector")]
-        let query_key = query_flow_inspector::QueryKey::new(
-            std::any::type_name::<Q>(),
-            full_key.debug_repr(),
-        );
+        let query_key =
+            query_flow_inspector::QueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr());
 
         #[cfg(feature = "inspector")]
         self.emit(|| FlowEvent::QueryStart {
@@ -510,14 +508,15 @@ impl QueryRuntime {
         });
 
         // Store the new value
-        self.assets.insert_ready::<K>(full_asset_key.clone(), Arc::new(value));
+        self.assets
+            .insert_ready::<K>(full_asset_key.clone(), Arc::new(value));
 
         // Remove from pending
         self.pending.remove(&full_asset_key);
 
         // Update whale dependency tracking
-        let durability = Durability::new(durability_level.as_u8() as usize)
-            .unwrap_or(Durability::volatile());
+        let durability =
+            Durability::new(durability_level.as_u8() as usize).unwrap_or(Durability::volatile());
 
         if changed {
             // Register with new changed_at to invalidate dependents
@@ -555,13 +554,16 @@ impl QueryRuntime {
         });
 
         // Mark as loading
-        self.assets.insert(full_asset_key.clone(), AssetState::Loading);
+        self.assets
+            .insert(full_asset_key.clone(), AssetState::Loading);
 
         // Add to pending
         self.pending.insert::<K>(full_asset_key, key.clone());
 
         // Update whale to invalidate dependents (use volatile during loading)
-        let _ = self.whale.register(full_cache_key, (), Durability::volatile(), vec![]);
+        let _ = self
+            .whale
+            .register(full_cache_key, (), Durability::volatile(), vec![]);
     }
 
     /// Remove an asset from the cache entirely.
@@ -574,7 +576,9 @@ impl QueryRuntime {
 
         // First, register a change to invalidate dependents
         // This ensures queries that depend on this asset will recompute
-        let _ = self.whale.register(full_cache_key.clone(), (), Durability::volatile(), vec![]);
+        let _ = self
+            .whale
+            .register(full_cache_key.clone(), (), Durability::volatile(), vec![]);
 
         // Then remove the asset from storage
         self.assets.remove(&full_asset_key);
@@ -680,7 +684,8 @@ impl QueryRuntime {
         // No locator registered or locator returned None - mark as pending
         #[cfg(feature = "inspector")]
         emit_requested(self, query_flow_inspector::AssetState::Loading);
-        self.assets.insert(full_asset_key.clone(), AssetState::Loading);
+        self.assets
+            .insert(full_asset_key.clone(), AssetState::Loading);
         self.pending.insert::<K>(full_asset_key, key.clone());
         Ok(LoadingState::Loading)
     }
@@ -1041,12 +1046,8 @@ mod tests {
             let runtime = QueryRuntime::new();
 
             // Same id, different include_extra - should return cached
-            let r1 = runtime
-                .query(WithKeySelection::new(1, true))
-                .unwrap();
-            let r2 = runtime
-                .query(WithKeySelection::new(1, false))
-                .unwrap();
+            let r1 = runtime.query(WithKeySelection::new(1, true)).unwrap();
+            let r2 = runtime.query(WithKeySelection::new(1, false)).unwrap();
 
             // Both should have same value because only `id` is the key
             assert_eq!(*r1, "id=1, extra=true");

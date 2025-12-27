@@ -17,4 +17,5 @@
 !/lake-manifest.json
 !/lean-toolchain
 
+!.github/workflows/**/*.yml
 !Makefile

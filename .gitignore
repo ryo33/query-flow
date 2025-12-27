@@ -3,6 +3,7 @@
 !*/
 
 !Cargo.toml
+!Cargo.lock
 !src/**/*.rs
 !crates/**/*.rs
 

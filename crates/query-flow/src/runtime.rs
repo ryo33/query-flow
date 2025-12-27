@@ -1235,5 +1235,25 @@ mod tests {
             let result = runtime.query(CustomName::new(42)).unwrap();
             assert_eq!(*result, 42);
         }
+
+        // Test that attribute macros like #[tracing::instrument] are preserved
+        // We use #[allow(unused_variables)] and #[inline] as test attributes since
+        // they don't require external dependencies.
+        #[allow(unused_variables)]
+        #[inline]
+        #[query]
+        fn with_attributes(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
+            // This would warn without #[allow(unused_variables)] on the generated method
+            let unused_var = 42;
+            Ok(*x * 2)
+        }
+
+        #[test]
+        fn test_macro_preserves_attributes() {
+            let runtime = QueryRuntime::new();
+            // If attributes weren't preserved, this might warn about unused_var
+            let result = runtime.query(WithAttributes::new(5)).unwrap();
+            assert_eq!(*result, 10);
+        }
     }
 }

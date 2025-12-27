@@ -138,6 +138,8 @@ struct ParsedFn {
     params: Vec<Param>,
     output_ty: Type,
     body: TokenStream2,
+    /// Attributes from the original function (e.g., #[tracing::instrument])
+    attrs: Vec<syn::Attribute>,
 }
 
 /// Define a query from a function.
@@ -233,6 +235,8 @@ fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream2, Err
 fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     let vis = input_fn.vis.clone();
     let name = input_fn.sig.ident.clone();
+    // Extract function attributes (e.g., #[tracing::instrument], #[inline])
+    let attrs = input_fn.attrs.clone();
 
     // Check that first param is ctx: &mut QueryContext
     let mut iter = input_fn.sig.inputs.iter();
@@ -272,6 +276,7 @@ fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
         params,
         output_ty,
         body: body_tokens,
+        attrs,
     })
 }
 
@@ -466,6 +471,9 @@ fn generate_query_impl(
         },
     };
 
+    // Attributes from the original function to apply to the query method
+    let fn_attrs = &parsed.attrs;
+
     Ok(quote! {
         impl ::query_flow::Query for #struct_name {
             type CacheKey = #cache_key_ty;
@@ -475,6 +483,7 @@ fn generate_query_impl(
                 #cache_key_body
             }
 
+            #( #fn_attrs )*
             fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                 #( #field_bindings )*
                 #fn_body
@@ -661,4 +670,118 @@ fn generate_asset_key(attr: AssetKeyAttr, input_struct: ItemStruct) -> Result<To
             #durability_impl
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn normalize_tokens(tokens: TokenStream2) -> String {
+        tokens.to_string().split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn test_query_macro_preserves_attributes() {
+        let input_fn: ItemFn = syn::parse_quote! {
+            #[allow(unused_variables)]
+            #[inline]
+            fn my_query(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
+                let unused = 42;
+                Ok(x * 2)
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            #[derive(Clone, Debug)]
+            struct MyQuery {
+                pub x: i32
+            }
+
+            impl MyQuery {
+                #[doc = r" Create a new query instance."]
+                fn new(x: i32) -> Self {
+                    Self { x }
+                }
+            }
+
+            impl ::query_flow::Query for MyQuery {
+                type CacheKey = i32;
+                type Output = i32;
+
+                fn cache_key(&self) -> Self::CacheKey {
+                    self.x.clone()
+                }
+
+                #[allow(unused_variables)]
+                #[inline]
+                fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                    let x = &self.x;
+                    {
+                        let unused = 42;
+                        Ok(x * 2)
+                    }
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_without_attributes() {
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn simple(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+                Ok(a + b)
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            #[derive(Clone, Debug)]
+            struct Simple {
+                pub a: i32,
+                pub b: i32
+            }
+
+            impl Simple {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: i32) -> Self {
+                    Self { a, b }
+                }
+            }
+
+            impl ::query_flow::Query for Simple {
+                type CacheKey = (i32, i32);
+                type Output = i32;
+
+                fn cache_key(&self) -> Self::CacheKey {
+                    (self.a.clone(), self.b.clone())
+                }
+
+                fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                    let a = &self.a;
+                    let b = &self.b;
+                    {
+                        Ok(a + b)
+                    }
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
 }

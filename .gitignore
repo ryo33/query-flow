@@ -21,3 +21,5 @@
 !.github/workflows/**/*.yml
 !Makefile
 
+!.vscode/extensions.json
+!.vscode/settings.json

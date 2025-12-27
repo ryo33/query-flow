@@ -34,6 +34,7 @@ mod error;
 mod inspector;
 mod key;
 mod loading;
+pub mod output_eq;
 mod query;
 mod runtime;
 mod storage;

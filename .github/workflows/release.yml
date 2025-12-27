@@ -17,7 +17,7 @@ jobs:
     - run: |
         publish() {
           output=$(cargo publish -p "$1" 2>&1) && return 0
-          if echo "$output" | grep -q "already uploaded"; then
+          if echo "$output" | grep -q "already exists"; then
             echo "Skipping $1: already published"
             return 0
           fi

@@ -1,8 +1,37 @@
 //! Tests for list_queries and list_asset_keys functionality.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::cell::Cell;
 
 use query_flow::{AssetKey, Query, QueryContext, QueryError, QueryRuntime};
+
+/// Thread-local counter helper to avoid test interference in parallel execution.
+macro_rules! thread_local_counter {
+    ($name:ident) => {
+        thread_local! {
+            static $name: Cell<u32> = const { Cell::new(0) };
+        }
+    };
+}
+
+/// Helper trait for thread-local counters.
+#[allow(dead_code)]
+trait Counter {
+    fn reset(&'static self);
+    fn inc(&'static self);
+    fn get(&'static self) -> u32;
+}
+
+impl Counter for std::thread::LocalKey<Cell<u32>> {
+    fn reset(&'static self) {
+        self.with(|c| c.set(0));
+    }
+    fn inc(&'static self) {
+        self.with(|c| c.set(c.get() + 1));
+    }
+    fn get(&'static self) -> u32 {
+        self.with(|c| c.get())
+    }
+}
 
 // Simple query that doubles a value
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -102,7 +131,7 @@ fn test_list_queries_basic() {
 
 #[test]
 fn test_list_queries_invalidation_on_add() {
-    static AGGREGATE_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(AGGREGATE_COUNT);
 
     // Query that aggregates all DoubleQuery results using list_queries
     #[derive(Clone)]
@@ -115,7 +144,7 @@ fn test_list_queries_invalidation_on_add() {
         fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
+            AGGREGATE_COUNT.inc();
             let queries = ctx.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
@@ -131,7 +160,7 @@ fn test_list_queries_invalidation_on_add() {
     }
 
     let runtime = QueryRuntime::new();
-    AGGREGATE_COUNT.store(0, Ordering::SeqCst);
+    AGGREGATE_COUNT.reset();
 
     // Execute initial queries
     runtime.query(DoubleQuery { value: 1 }).unwrap();
@@ -140,12 +169,12 @@ fn test_list_queries_invalidation_on_add() {
     // First aggregate
     let result = runtime.query(TrackedAggregateQuery).unwrap();
     assert_eq!(*result, vec![2, 4]);
-    assert_eq!(AGGREGATE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(AGGREGATE_COUNT.get(), 1);
 
     // Cache hit - should not recompute
     let result = runtime.query(TrackedAggregateQuery).unwrap();
     assert_eq!(*result, vec![2, 4]);
-    assert_eq!(AGGREGATE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(AGGREGATE_COUNT.get(), 1);
 
     // Add a new query - this should invalidate the aggregate
     runtime.query(DoubleQuery { value: 3 }).unwrap();
@@ -153,12 +182,12 @@ fn test_list_queries_invalidation_on_add() {
     // Should recompute with the new query
     let result = runtime.query(TrackedAggregateQuery).unwrap();
     assert_eq!(*result, vec![2, 4, 6]);
-    assert_eq!(AGGREGATE_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(AGGREGATE_COUNT.get(), 2);
 }
 
 #[test]
 fn test_list_queries_no_invalidation_on_value_change() {
-    static AGGREGATE_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(AGGREGATE_COUNT);
 
     // Query that only uses list_queries, not individual queries
     #[derive(Clone)]
@@ -171,7 +200,7 @@ fn test_list_queries_no_invalidation_on_value_change() {
         fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
+            AGGREGATE_COUNT.inc();
             let queries = ctx.list_queries::<DoubleQuery>();
             // Just count, don't query individual ones
             Ok(queries.len())
@@ -183,7 +212,7 @@ fn test_list_queries_no_invalidation_on_value_change() {
     }
 
     let runtime = QueryRuntime::new();
-    AGGREGATE_COUNT.store(0, Ordering::SeqCst);
+    AGGREGATE_COUNT.reset();
 
     // Execute initial query
     runtime.query(DoubleQuery { value: 1 }).unwrap();
@@ -191,7 +220,7 @@ fn test_list_queries_no_invalidation_on_value_change() {
     // First list-only query
     let result = runtime.query(ListOnlyQuery).unwrap();
     assert_eq!(*result, 1);
-    assert_eq!(AGGREGATE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(AGGREGATE_COUNT.get(), 1);
 
     // Invalidate the individual query (not the set)
     runtime.invalidate::<DoubleQuery>(&1);
@@ -201,7 +230,7 @@ fn test_list_queries_no_invalidation_on_value_change() {
     // 2. The SET didn't change (no add/remove)
     let result = runtime.query(ListOnlyQuery).unwrap();
     assert_eq!(*result, 1);
-    assert_eq!(AGGREGATE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(AGGREGATE_COUNT.get(), 1);
 }
 
 #[test]
@@ -266,7 +295,7 @@ fn test_list_asset_keys_basic() {
 
 #[test]
 fn test_list_asset_keys_invalidation_on_remove() {
-    static LIST_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(LIST_COUNT);
 
     #[derive(Clone)]
     struct TrackedListConfigs;
@@ -278,7 +307,7 @@ fn test_list_asset_keys_invalidation_on_remove() {
         fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            LIST_COUNT.fetch_add(1, Ordering::SeqCst);
+            LIST_COUNT.inc();
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
             names.sort();
@@ -291,7 +320,7 @@ fn test_list_asset_keys_invalidation_on_remove() {
     }
 
     let runtime = QueryRuntime::new();
-    LIST_COUNT.store(0, Ordering::SeqCst);
+    LIST_COUNT.reset();
 
     // Resolve assets
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "{}".to_string());
@@ -300,12 +329,12 @@ fn test_list_asset_keys_invalidation_on_remove() {
     // First list
     let result = runtime.query(TrackedListConfigs).unwrap();
     assert_eq!(*result, vec!["app.json", "db.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(LIST_COUNT.get(), 1);
 
     // Cache hit
     let result = runtime.query(TrackedListConfigs).unwrap();
     assert_eq!(*result, vec!["app.json", "db.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(LIST_COUNT.get(), 1);
 
     // Remove an asset - should invalidate list
     runtime.remove_asset(&ConfigFile("db.json".to_string()));
@@ -313,12 +342,12 @@ fn test_list_asset_keys_invalidation_on_remove() {
     // Should recompute
     let result = runtime.query(TrackedListConfigs).unwrap();
     assert_eq!(*result, vec!["app.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(LIST_COUNT.get(), 2);
 }
 
 #[test]
 fn test_list_asset_keys_no_invalidation_on_value_change() {
-    static LIST_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(LIST_COUNT);
 
     #[derive(Clone)]
     struct TrackedListConfigs2;
@@ -330,7 +359,7 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
         fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            LIST_COUNT.fetch_add(1, Ordering::SeqCst);
+            LIST_COUNT.inc();
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
             names.sort();
@@ -343,7 +372,7 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
     }
 
     let runtime = QueryRuntime::new();
-    LIST_COUNT.store(0, Ordering::SeqCst);
+    LIST_COUNT.reset();
 
     // Resolve asset
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
@@ -351,7 +380,7 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
     // First list
     let result = runtime.query(TrackedListConfigs2).unwrap();
     assert_eq!(*result, vec!["app.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(LIST_COUNT.get(), 1);
 
     // Update asset value (same key, different value)
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v2".to_string());
@@ -359,12 +388,12 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
     // List should still be cached because the SET didn't change
     let result = runtime.query(TrackedListConfigs2).unwrap();
     assert_eq!(*result, vec!["app.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(LIST_COUNT.get(), 1);
 }
 
 #[test]
 fn test_list_asset_keys_with_individual_asset_dependency() {
-    static CONTENT_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(CONTENT_COUNT);
 
     // Query that lists all config files and reads their contents
     #[derive(Clone)]
@@ -377,7 +406,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
         fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            CONTENT_COUNT.fetch_add(1, Ordering::SeqCst);
+            CONTENT_COUNT.inc();
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut results = Vec::new();
             for key in keys {
@@ -395,7 +424,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
     }
 
     let runtime = QueryRuntime::new();
-    CONTENT_COUNT.store(0, Ordering::SeqCst);
+    CONTENT_COUNT.reset();
 
     // Resolve assets
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
@@ -403,7 +432,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
     // First query
     let result = runtime.query(AllConfigContents).unwrap();
     assert_eq!(*result, vec![("app.json".to_string(), "v1".to_string())]);
-    assert_eq!(CONTENT_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(CONTENT_COUNT.get(), 1);
 
     // Update asset value - should invalidate because we depend on individual assets too
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v2".to_string());
@@ -411,7 +440,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
     // Should recompute because of individual asset dependency
     let result = runtime.query(AllConfigContents).unwrap();
     assert_eq!(*result, vec![("app.json".to_string(), "v2".to_string())]);
-    assert_eq!(CONTENT_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(CONTENT_COUNT.get(), 2);
 }
 
 #[test]
@@ -458,7 +487,7 @@ fn test_list_asset_keys_empty() {
 
 #[test]
 fn test_list_asset_keys_invalidation_on_add() {
-    static LIST_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(LIST_COUNT);
 
     #[derive(Clone)]
     struct TrackedListConfigs3;
@@ -470,7 +499,7 @@ fn test_list_asset_keys_invalidation_on_add() {
         fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            LIST_COUNT.fetch_add(1, Ordering::SeqCst);
+            LIST_COUNT.inc();
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
             names.sort();
@@ -483,7 +512,7 @@ fn test_list_asset_keys_invalidation_on_add() {
     }
 
     let runtime = QueryRuntime::new();
-    LIST_COUNT.store(0, Ordering::SeqCst);
+    LIST_COUNT.reset();
 
     // Resolve first asset
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "{}".to_string());
@@ -491,7 +520,7 @@ fn test_list_asset_keys_invalidation_on_add() {
     // First list
     let result = runtime.query(TrackedListConfigs3).unwrap();
     assert_eq!(*result, vec!["app.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(LIST_COUNT.get(), 1);
 
     // Add another asset - should invalidate list
     runtime.resolve_asset(ConfigFile("db.json".to_string()), "{}".to_string());
@@ -499,5 +528,5 @@ fn test_list_asset_keys_invalidation_on_add() {
     // Should recompute
     let result = runtime.query(TrackedListConfigs3).unwrap();
     assert_eq!(*result, vec!["app.json", "db.json"]);
-    assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(LIST_COUNT.get(), 2);
 }

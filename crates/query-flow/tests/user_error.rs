@@ -1,13 +1,37 @@
 //! Tests for QueryError::UserError functionality.
-//!
-//! NOTE: Run with `--test-threads=1` due to static variables:
-//! ```sh
-//! cargo test --package query-flow --test user_error -- --test-threads=1
-//! ```
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::cell::Cell;
 
 use query_flow::{query, QueryError, QueryRuntime};
+
+/// Thread-local counter helper to avoid test interference in parallel execution.
+macro_rules! thread_local_counter {
+    ($name:ident) => {
+        thread_local! {
+            static $name: Cell<u32> = const { Cell::new(0) };
+        }
+    };
+}
+
+/// Helper trait for thread-local counters.
+#[allow(dead_code)]
+trait Counter {
+    fn reset(&'static self);
+    fn inc(&'static self);
+    fn get(&'static self) -> u32;
+}
+
+impl Counter for std::thread::LocalKey<Cell<u32>> {
+    fn reset(&'static self) {
+        self.with(|c| c.set(0));
+    }
+    fn inc(&'static self) {
+        self.with(|c| c.set(c.get() + 1));
+    }
+    fn get(&'static self) -> u32 {
+        self.with(|c| c.get())
+    }
+}
 
 // =============================================================================
 // Basic Error Conversion Tests
@@ -117,12 +141,12 @@ fn test_io_error_propagation() {
 // Error Caching Tests
 // =============================================================================
 
-static FALLIBLE_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+thread_local_counter!(FALLIBLE_CALL_COUNT);
 
 #[query]
 fn fallible_cached(ctx: &mut QueryContext, id: u32) -> Result<i32, QueryError> {
     let _ = ctx;
-    FALLIBLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    FALLIBLE_CALL_COUNT.inc();
 
     if *id == 0 {
         return Err(anyhow::anyhow!("id cannot be zero").into());
@@ -132,49 +156,49 @@ fn fallible_cached(ctx: &mut QueryContext, id: u32) -> Result<i32, QueryError> {
 
 #[test]
 fn test_user_error_cached() {
-    FALLIBLE_CALL_COUNT.store(0, Ordering::SeqCst);
+    FALLIBLE_CALL_COUNT.reset();
     let runtime = QueryRuntime::new();
 
     // First call - executes query, returns error
     let result1 = runtime.query(FallibleCached::new(0));
     assert!(matches!(result1, Err(QueryError::UserError(_))));
-    assert_eq!(FALLIBLE_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(FALLIBLE_CALL_COUNT.get(), 1);
 
     // Second call - should return cached error
     let result2 = runtime.query(FallibleCached::new(0));
     assert!(matches!(result2, Err(QueryError::UserError(_))));
-    assert_eq!(FALLIBLE_CALL_COUNT.load(Ordering::SeqCst), 1); // Still 1, not recomputed
+    assert_eq!(FALLIBLE_CALL_COUNT.get(), 1); // Still 1, not recomputed
 }
 
 #[test]
 fn test_success_cached() {
-    FALLIBLE_CALL_COUNT.store(0, Ordering::SeqCst);
+    FALLIBLE_CALL_COUNT.reset();
     let runtime = QueryRuntime::new();
 
     // First call
     let result1 = runtime.query(FallibleCached::new(5));
     assert_eq!(*result1.unwrap(), 50);
-    assert_eq!(FALLIBLE_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(FALLIBLE_CALL_COUNT.get(), 1);
 
     // Second call - should return cached
     let result2 = runtime.query(FallibleCached::new(5));
     assert_eq!(*result2.unwrap(), 50);
-    assert_eq!(FALLIBLE_CALL_COUNT.load(Ordering::SeqCst), 1); // Still 1
+    assert_eq!(FALLIBLE_CALL_COUNT.get(), 1); // Still 1
 }
 
 // =============================================================================
 // Error Comparator Tests
 // =============================================================================
 
-static ERROR_LEVEL1_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
-static ERROR_LEVEL2_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
-static ERROR_LEVEL3_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+thread_local_counter!(ERROR_LEVEL1_CALL_COUNT);
+thread_local_counter!(ERROR_LEVEL2_CALL_COUNT);
+thread_local_counter!(ERROR_LEVEL3_CALL_COUNT);
 
 /// Level 1: Base query that may return an error
 #[query]
 fn error_level1(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
     let _ = ctx;
-    ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    ERROR_LEVEL1_CALL_COUNT.inc();
 
     if *code < 0 {
         return Err(CustomError {
@@ -189,7 +213,7 @@ fn error_level1(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
 /// Level 2: Depends on Level 1
 #[query]
 fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
-    ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    ERROR_LEVEL2_CALL_COUNT.inc();
     let base = ctx.query(ErrorLevel1::new(*code))?;
     Ok(*base + 1)
 }
@@ -197,7 +221,7 @@ fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
 /// Level 3: Depends on Level 2 (transitively on Level 1)
 #[query]
 fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
-    ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    ERROR_LEVEL3_CALL_COUNT.inc();
     let base = ctx.query(ErrorLevel2::new(*code))?;
     Ok(*base + 10)
 }
@@ -206,18 +230,18 @@ fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
 fn test_error_comparator_default_false() {
     // Default comparator returns false, so errors are always "different"
     // This means all downstream queries will be recomputed
-    ERROR_LEVEL1_CALL_COUNT.store(0, Ordering::SeqCst);
-    ERROR_LEVEL2_CALL_COUNT.store(0, Ordering::SeqCst);
-    ERROR_LEVEL3_CALL_COUNT.store(0, Ordering::SeqCst);
+    ERROR_LEVEL1_CALL_COUNT.reset();
+    ERROR_LEVEL2_CALL_COUNT.reset();
+    ERROR_LEVEL3_CALL_COUNT.reset();
 
     let runtime = QueryRuntime::new();
 
     // First call through Level 3 -> Level 2 -> Level 1
     let result1 = runtime.query(ErrorLevel3::new(-1));
     assert!(matches!(result1, Err(QueryError::UserError(_))));
-    assert_eq!(ERROR_LEVEL1_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(ERROR_LEVEL2_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(ERROR_LEVEL1_CALL_COUNT.get(), 1);
+    assert_eq!(ERROR_LEVEL2_CALL_COUNT.get(), 1);
+    assert_eq!(ERROR_LEVEL3_CALL_COUNT.get(), 1);
 
     // Invalidate Level 1 and rerun Level 3
     runtime.invalidate::<ErrorLevel1>(&-1);
@@ -225,20 +249,20 @@ fn test_error_comparator_default_false() {
     let result2 = runtime.query(ErrorLevel3::new(-1));
     assert!(matches!(result2, Err(QueryError::UserError(_))));
     // Level 1 is recomputed
-    assert_eq!(ERROR_LEVEL1_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL1_CALL_COUNT.get(), 2);
     // With default comparator (always different), Level 2 is also recomputed
-    assert_eq!(ERROR_LEVEL2_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL2_CALL_COUNT.get(), 2);
     // Level 3 is also recomputed
-    assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL3_CALL_COUNT.get(), 2);
 }
 
 #[test]
 fn test_error_comparator_custom() {
     // Custom comparator that considers CustomErrors equal if they have the same code
     // With early cutoff, downstream queries should NOT be recomputed
-    ERROR_LEVEL1_CALL_COUNT.store(0, Ordering::SeqCst);
-    ERROR_LEVEL2_CALL_COUNT.store(0, Ordering::SeqCst);
-    ERROR_LEVEL3_CALL_COUNT.store(0, Ordering::SeqCst);
+    ERROR_LEVEL1_CALL_COUNT.reset();
+    ERROR_LEVEL2_CALL_COUNT.reset();
+    ERROR_LEVEL3_CALL_COUNT.reset();
 
     let runtime = QueryRuntime::builder()
         .error_comparator(|a, b| {
@@ -255,9 +279,9 @@ fn test_error_comparator_custom() {
     // First call through Level 3 -> Level 2 -> Level 1
     let result1 = runtime.query(ErrorLevel3::new(-1));
     assert!(matches!(result1, Err(QueryError::UserError(_))));
-    assert_eq!(ERROR_LEVEL1_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(ERROR_LEVEL2_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(ERROR_LEVEL1_CALL_COUNT.get(), 1);
+    assert_eq!(ERROR_LEVEL2_CALL_COUNT.get(), 1);
+    assert_eq!(ERROR_LEVEL3_CALL_COUNT.get(), 1);
 
     // Invalidate Level 1 and rerun Level 3
     runtime.invalidate::<ErrorLevel1>(&-1);
@@ -265,23 +289,23 @@ fn test_error_comparator_custom() {
     let result2 = runtime.query(ErrorLevel3::new(-1));
     assert!(matches!(result2, Err(QueryError::UserError(_))));
     // Level 1 is recomputed
-    assert_eq!(ERROR_LEVEL1_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL1_CALL_COUNT.get(), 2);
     // With custom comparator, same error means Level 2 gets early cutoff
     // Level 2 is still checked (executed), but since Level 1 returned same error,
     // its downstream (Level 3) should benefit from early cutoff
     // Note: Level 2 is executed because we need to verify its output hasn't changed
-    assert_eq!(ERROR_LEVEL2_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL2_CALL_COUNT.get(), 2);
     // Level 3 benefits from early cutoff (Level 2's error is unchanged)
-    assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(ERROR_LEVEL3_CALL_COUNT.get(), 1);
 }
 
 #[test]
 fn test_error_comparator_always_equal() {
     // Comparator that treats all errors as equal
     // With 3-level chain, early cutoff at Level 2 should prevent Level 3 recomputation
-    ERROR_LEVEL1_CALL_COUNT.store(0, Ordering::SeqCst);
-    ERROR_LEVEL2_CALL_COUNT.store(0, Ordering::SeqCst);
-    ERROR_LEVEL3_CALL_COUNT.store(0, Ordering::SeqCst);
+    ERROR_LEVEL1_CALL_COUNT.reset();
+    ERROR_LEVEL2_CALL_COUNT.reset();
+    ERROR_LEVEL3_CALL_COUNT.reset();
 
     let runtime = QueryRuntime::builder()
         .error_comparator(|_, _| true)
@@ -290,9 +314,9 @@ fn test_error_comparator_always_equal() {
     // First call through Level 3 -> Level 2 -> Level 1
     let result1 = runtime.query(ErrorLevel3::new(-1));
     assert!(matches!(result1, Err(QueryError::UserError(_))));
-    assert_eq!(ERROR_LEVEL1_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(ERROR_LEVEL2_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(ERROR_LEVEL1_CALL_COUNT.get(), 1);
+    assert_eq!(ERROR_LEVEL2_CALL_COUNT.get(), 1);
+    assert_eq!(ERROR_LEVEL3_CALL_COUNT.get(), 1);
 
     // Invalidate Level 1 and rerun Level 3
     runtime.invalidate::<ErrorLevel1>(&-1);
@@ -301,31 +325,31 @@ fn test_error_comparator_always_equal() {
     assert!(matches!(result2, Err(QueryError::UserError(_))));
 
     // Level 1 is recomputed
-    assert_eq!(ERROR_LEVEL1_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL1_CALL_COUNT.get(), 2);
     // Level 2 is executed to verify its output
-    assert_eq!(ERROR_LEVEL2_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(ERROR_LEVEL2_CALL_COUNT.get(), 2);
     // Level 3 benefits from early cutoff (all errors are "equal")
-    assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(ERROR_LEVEL3_CALL_COUNT.get(), 1);
 }
 
 // =============================================================================
 // Mixed Ok/Error Chain Tests
 // =============================================================================
 
-static MIXED_BASE_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
-static MIXED_MIDDLE_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
-static MIXED_TOP_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+thread_local_counter!(MIXED_BASE_CALL_COUNT);
+thread_local_counter!(MIXED_MIDDLE_CALL_COUNT);
+thread_local_counter!(MIXED_TOP_CALL_COUNT);
 
 #[query]
 fn mixed_base(ctx: &mut QueryContext, value: i32) -> Result<i32, QueryError> {
     let _ = ctx;
-    MIXED_BASE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    MIXED_BASE_CALL_COUNT.inc();
     Ok(value * 2)
 }
 
 #[query]
 fn mixed_middle(ctx: &mut QueryContext, value: i32) -> Result<i32, QueryError> {
-    MIXED_MIDDLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    MIXED_MIDDLE_CALL_COUNT.inc();
     let base = ctx.query(MixedBase::new(*value))?;
 
     if *base > 100 {
@@ -336,16 +360,16 @@ fn mixed_middle(ctx: &mut QueryContext, value: i32) -> Result<i32, QueryError> {
 
 #[query]
 fn mixed_top(ctx: &mut QueryContext, value: i32) -> Result<String, QueryError> {
-    MIXED_TOP_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    MIXED_TOP_CALL_COUNT.inc();
     let middle = ctx.query(MixedMiddle::new(*value))?;
     Ok(format!("result: {}", middle))
 }
 
 #[test]
 fn test_mixed_ok_and_error_chain() {
-    MIXED_BASE_CALL_COUNT.store(0, Ordering::SeqCst);
-    MIXED_MIDDLE_CALL_COUNT.store(0, Ordering::SeqCst);
-    MIXED_TOP_CALL_COUNT.store(0, Ordering::SeqCst);
+    MIXED_BASE_CALL_COUNT.reset();
+    MIXED_MIDDLE_CALL_COUNT.reset();
+    MIXED_TOP_CALL_COUNT.reset();
 
     let runtime = QueryRuntime::new();
 
@@ -391,15 +415,15 @@ fn test_error_downcast() {
 // Transition Tests (Ok -> Error, Error -> Ok)
 // =============================================================================
 
-static TRANSITION_VALUE: AtomicU32 = AtomicU32::new(10);
-static TRANSITION_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
-static TRANSITION_DEPENDENT_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+thread_local_counter!(TRANSITION_VALUE);
+thread_local_counter!(TRANSITION_CALL_COUNT);
+thread_local_counter!(TRANSITION_DEPENDENT_CALL_COUNT);
 
 #[query]
 fn transition_source(ctx: &mut QueryContext) -> Result<i32, QueryError> {
     let _ = ctx;
-    TRANSITION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-    let value = TRANSITION_VALUE.load(Ordering::SeqCst) as i32;
+    TRANSITION_CALL_COUNT.inc();
+    let value = TRANSITION_VALUE.get() as i32;
 
     if value < 0 {
         return Err(anyhow::anyhow!("negative value").into());
@@ -409,41 +433,41 @@ fn transition_source(ctx: &mut QueryContext) -> Result<i32, QueryError> {
 
 #[query]
 fn transition_dependent(ctx: &mut QueryContext) -> Result<i32, QueryError> {
-    TRANSITION_DEPENDENT_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    TRANSITION_DEPENDENT_CALL_COUNT.inc();
     let source = ctx.query(TransitionSource::new())?;
     Ok(*source * 2)
 }
 
 #[test]
 fn test_ok_to_error_transition() {
-    TRANSITION_VALUE.store(10, Ordering::SeqCst);
-    TRANSITION_CALL_COUNT.store(0, Ordering::SeqCst);
-    TRANSITION_DEPENDENT_CALL_COUNT.store(0, Ordering::SeqCst);
+    TRANSITION_VALUE.with(|c| c.set(10));
+    TRANSITION_CALL_COUNT.reset();
+    TRANSITION_DEPENDENT_CALL_COUNT.reset();
 
     let runtime = QueryRuntime::new();
 
     // Start with Ok
     let result = runtime.query(TransitionDependent::new());
     assert_eq!(*result.unwrap(), 20);
-    assert_eq!(TRANSITION_CALL_COUNT.load(Ordering::SeqCst), 1);
-    assert_eq!(TRANSITION_DEPENDENT_CALL_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(TRANSITION_CALL_COUNT.get(), 1);
+    assert_eq!(TRANSITION_DEPENDENT_CALL_COUNT.get(), 1);
 
     // Change to error state
-    TRANSITION_VALUE.store(u32::MAX, Ordering::SeqCst); // Will be -1 as i32
+    TRANSITION_VALUE.with(|c| c.set(u32::MAX)); // Will be -1 as i32
     runtime.invalidate::<TransitionSource>(&());
 
     // Should now get error
     let result = runtime.query(TransitionDependent::new());
     assert!(matches!(result, Err(QueryError::UserError(_))));
-    assert_eq!(TRANSITION_CALL_COUNT.load(Ordering::SeqCst), 2);
-    assert_eq!(TRANSITION_DEPENDENT_CALL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(TRANSITION_CALL_COUNT.get(), 2);
+    assert_eq!(TRANSITION_DEPENDENT_CALL_COUNT.get(), 2);
 }
 
 #[test]
 fn test_error_to_ok_transition() {
-    TRANSITION_VALUE.store(u32::MAX, Ordering::SeqCst); // -1 as i32, will error
-    TRANSITION_CALL_COUNT.store(0, Ordering::SeqCst);
-    TRANSITION_DEPENDENT_CALL_COUNT.store(0, Ordering::SeqCst);
+    TRANSITION_VALUE.with(|c| c.set(u32::MAX)); // -1 as i32, will error
+    TRANSITION_CALL_COUNT.reset();
+    TRANSITION_DEPENDENT_CALL_COUNT.reset();
 
     let runtime = QueryRuntime::new();
 
@@ -452,7 +476,7 @@ fn test_error_to_ok_transition() {
     assert!(matches!(result, Err(QueryError::UserError(_))));
 
     // Change to Ok state
-    TRANSITION_VALUE.store(5, Ordering::SeqCst);
+    TRANSITION_VALUE.with(|c| c.set(5));
     runtime.invalidate::<TransitionSource>(&());
 
     // Should now get Ok

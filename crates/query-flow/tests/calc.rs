@@ -482,9 +482,11 @@ fn test_parentheses() {
 
 #[test]
 fn test_caching() {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::cell::Cell;
 
-    static PARSE_COUNT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static PARSE_COUNT: Cell<u32> = const { Cell::new(0) };
+    }
 
     // Custom parse query that tracks call count
     #[derive(Clone)]
@@ -501,7 +503,7 @@ fn test_caching() {
         }
 
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
+            PARSE_COUNT.with(|c| c.set(c.get() + 1));
             let source = ctx
                 .asset(&SourceFile(self.file_name.clone()))?
                 .map(|s| (*s).clone())
@@ -519,12 +521,13 @@ fn test_caching() {
     runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2".to_string());
 
     // First query - should parse
+    PARSE_COUNT.with(|c| c.set(0));
     let _ = runtime
         .query(TrackedParse {
             file_name: "main".to_string(),
         })
         .unwrap();
-    assert_eq!(PARSE_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(PARSE_COUNT.with(|c| c.get()), 1);
 
     // Second query - should be cached
     let _ = runtime
@@ -532,7 +535,7 @@ fn test_caching() {
             file_name: "main".to_string(),
         })
         .unwrap();
-    assert_eq!(PARSE_COUNT.load(Ordering::SeqCst), 1); // Still 1!
+    assert_eq!(PARSE_COUNT.with(|c| c.get()), 1); // Still 1!
 }
 
 #[test]

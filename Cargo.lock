@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow-inspector"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "serde",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "darling",
  "heck",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "whale"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "papaya",

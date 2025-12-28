@@ -159,6 +159,18 @@ def calculateLevel {N : Nat} (nodes : QueryId → Option (Node N)) (deps : List 
 
 /-! ## Core Algorithms -/
 
+/-- Check if a single dependency has not changed since observation -/
+def depUnchanged {N : Nat} (nodes : QueryId → Option (Node N)) (dep : Dep) : Bool :=
+  match nodes dep.queryId with
+  | none => false  -- dependency removed
+  | some depNode =>
+    -- Using > not >=: equal means "no change since observation"
+    !decide (depNode.changedAt > dep.observedChangedAt)
+
+/-- Check if all dependencies have not changed since observation -/
+def depsUnchanged {N : Nat} (nodes : QueryId → Option (Node N)) (deps : List Dep) : Bool :=
+  deps.all (depUnchanged nodes)
+
 /-- Check if a node is valid at a given revision (read-only operation)
 
     A node is valid if:
@@ -174,13 +186,7 @@ def isValidAt {N : Nat} (rt : Runtime N) (qid : QueryId) (atRev : Revision N) : 
     if node.verifiedAt ≥ atRev.counters d then
       true
     else
-      -- Check each dependency
-      node.dependencies.all fun dep =>
-        match rt.nodes dep.queryId with
-        | none => false  -- dependency removed
-        | some depNode =>
-          -- Using > not >=: equal means "no change since observation"
-          !decide (depNode.changedAt > dep.observedChangedAt)
+      depsUnchanged rt.nodes node.dependencies
 
 /-- Convenience: check validity at current revision -/
 def isValid {N : Nat} (rt : Runtime N) (qid : QueryId) : Bool :=
@@ -686,68 +692,30 @@ lemma isValidAt_updateGraphEdgesStep {N : Nat} (rt : Runtime N) (qid : QueryId) 
             exact Option.some.inj hd'
           subst hdep
           -- the dependency check is unchanged, because only `dependents` changes
-          have hall :
-              (node.dependencies).all (fun dep =>
-                match
-                  if dep.queryId = d.queryId then
-                    some { node with dependents := qid :: node.dependents }
-                  else rt.nodes dep.queryId with
-                | none => false
-                | some dn => !decide (dep.observedChangedAt < dn.changedAt)) =
-              (node.dependencies).all (fun dep =>
-                match rt.nodes dep.queryId with
-                | none => false
-                | some dn => !decide (dep.observedChangedAt < dn.changedAt)) := by
-            let f : Dep → Bool := fun dep =>
-              match
-                if dep.queryId = d.queryId then
-                  some { node with dependents := qid :: node.dependents }
-                else rt.nodes dep.queryId with
-              | none => false
-              | some dn => !decide (dep.observedChangedAt < dn.changedAt)
-            let g : Dep → Bool := fun dep =>
-              match rt.nodes dep.queryId with
-              | none => false
-              | some dn => !decide (dep.observedChangedAt < dn.changedAt)
-            have hpoint : ∀ (dep : Dep), f dep = g dep := by
-              intro dep
-              by_cases heq : dep.queryId = d.queryId
-              · simp [f, g, heq, hd]
-              · simp [f, g, heq]
-            simpa [f, g] using List.all_congr hpoint node.dependencies
-          simp [updateGraphEdgesStep, hd, hmem, hall]
+          have hall : depsUnchanged (fun q => if q = d.queryId then
+                some { node with dependents := qid :: node.dependents } else rt.nodes q)
+              node.dependencies = depsUnchanged rt.nodes node.dependencies := by
+            unfold depsUnchanged
+            apply List.all_congr
+            intro dep
+            unfold depUnchanged
+            by_cases heq : dep.queryId = d.queryId
+            · simp [heq, hd]
+            · simp [heq]
+          simp only [updateGraphEdgesStep, hd, hmem, ite_false, ite_true, hall]
         · -- node at `x` is unchanged, but the nodes map at `d.queryId` changes only in `dependents`;
           -- `isValidAt` only looks at `changedAt`, so the deps check is unchanged.
-          have hall :
-              (node.dependencies).all (fun (dep : Dep) =>
-                match
-                  if dep.queryId = d.queryId then
-                    some { depNode with dependents := qid :: depNode.dependents }
-                  else rt.nodes dep.queryId with
-                | none => false
-                | some dn => !decide (dep.observedChangedAt < dn.changedAt)) =
-              (node.dependencies).all (fun (dep : Dep) =>
-                match rt.nodes dep.queryId with
-                | none => false
-                | some dn => !decide (dep.observedChangedAt < dn.changedAt)) := by
-            let f : Dep → Bool := fun dep =>
-              match
-                if dep.queryId = d.queryId then
-                  some { depNode with dependents := qid :: depNode.dependents }
-                else rt.nodes dep.queryId with
-              | none => false
-              | some dn => !decide (dep.observedChangedAt < dn.changedAt)
-            let g : Dep → Bool := fun dep =>
-              match rt.nodes dep.queryId with
-              | none => false
-              | some dn => !decide (dep.observedChangedAt < dn.changedAt)
-            have hpoint : ∀ (dep : Dep), f dep = g dep := by
-              intro dep
-              by_cases heq : dep.queryId = d.queryId
-              · simp [f, g, heq, hd]
-              · simp [f, g, heq]
-            simpa [f, g] using List.all_congr hpoint node.dependencies
-          simp [updateGraphEdgesStep, hx, hd, hmem, hxkey, hall]
+          have hall : depsUnchanged (fun q => if q = d.queryId then
+                some { depNode with dependents := qid :: depNode.dependents } else rt.nodes q)
+              node.dependencies = depsUnchanged rt.nodes node.dependencies := by
+            unfold depsUnchanged
+            apply List.all_congr
+            intro dep
+            unfold depUnchanged
+            by_cases heq : dep.queryId = d.queryId
+            · simp [heq, hd]
+            · simp [heq]
+          simp only [updateGraphEdgesStep, hx, hd, hmem, hxkey, ite_false, hall]
 
 theorem isValidAt_updateGraphEdges {N : Nat} (rt : Runtime N) (qid : QueryId) (deps : List Dep)
     (x : QueryId) (atRev : Revision N) :
@@ -946,13 +914,13 @@ theorem isValidAt_cleanupStaleEdges {N : Nat} (rt : Runtime N)
     have ⟨n', hn', hchg, hdur, hver, hdeps⟩ := cleanupStaleEdges_preserves_node rt.nodes qid target oldDeps newDepIds node hnode
     simp only [hn', hdur, hver]
     -- Now we need to show the dependencies check is the same
-    -- After simp, we should have equality of the List.all expressions
-    -- Use congrArg to focus on the List.all part
     congr 1
     rw [hdeps]
-    -- Now prove the List.all gives the same value
-    congr 1
-    funext dep
+    -- Prove depsUnchanged gives the same value
+    unfold depsUnchanged
+    apply List.all_congr
+    intro dep
+    unfold depUnchanged
     cases hdepNode : rt.nodes dep.queryId with
     | none =>
       have hcleanDep := cleanupStaleEdges_preserves_none rt.nodes qid dep.queryId oldDeps newDepIds hdepNode
@@ -1367,9 +1335,11 @@ theorem isValidAt_deps_all_unchanged {N : Nat} (rt : Runtime N) (qid : QueryId)
   by_cases hverified : node.verifiedAt ≥ atRev.counters node.durability
   · simp only [hverified, ite_true]
   · simp only [hverified, ite_false]
+    unfold depsUnchanged
     rw [List.all_eq_true]
     intro dep hdep
     obtain ⟨depNode, hdepNode, hle⟩ := hdeps dep hdep
+    unfold depUnchanged
     simp [hdepNode]
     exact hle
 
@@ -1397,7 +1367,14 @@ theorem isValidAt_false_reason {N : Nat} (rt : Runtime N) (qid : QueryId)
     by_cases hverified : node.verifiedAt ≥ atRev.counters node.durability
     · simp [hnode, hverified] at hinvalid
     · have hallFalse : node.dependencies.all f = false := by
-        simpa [hnode, hverified, f] using hinvalid
+        have heq : node.dependencies.all f = depsUnchanged rt.nodes node.dependencies := by
+          unfold depsUnchanged
+          apply List.all_congr
+          intro dep
+          unfold depUnchanged
+          rfl
+        rw [heq]
+        simpa [hnode, hverified] using hinvalid
       refine ⟨node, rfl, Nat.lt_of_not_ge hverified, ?_⟩
       rcases (List.all_eq_false).1 hallFalse with ⟨dep, hdep, hfail⟩
       refine ⟨dep, hdep, ?_⟩
@@ -1452,8 +1429,10 @@ theorem isValidAt_dep_changed {N : Nat} (rt : Runtime N) (qid : QueryId)
   -- Need to show List.all returns false
   rw [Bool.eq_false_iff]
   intro hall
+  unfold depsUnchanged at hall
   rw [List.all_eq_true] at hall
   have := hall dep hdep
+  unfold depUnchanged at this
   simp only [hdepNode] at this
   simp only [Bool.not_eq_true', decide_eq_false_iff_not, not_lt] at this
   exact Nat.not_lt.mpr this hchanged

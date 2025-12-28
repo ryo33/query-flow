@@ -11,6 +11,7 @@
 
 import Mathlib.Data.Finset.Basic
 import Mathlib.Tactic
+import WhaleSpec.Lemmas
 
 set_option linter.style.longLine false
 set_option linter.flexible false
@@ -563,17 +564,6 @@ theorem minDepDurability_empty {N : Nat} (nodes : QueryId → Option (Node N)) (
   unfold minDepDurability
   simp [List.foldl]
 
-/-- Helper lemma for foldl with min -/
-lemma foldl_min_le_init {α : Type} (f : α → Nat) (init : Nat) (l : List α) :
-    List.foldl (fun acc a => min acc (f a)) init l ≤ init := by
-  induction l generalizing init with
-  | nil => simp [List.foldl]
-  | cons hd tl ih =>
-    simp only [List.foldl_cons]
-    calc List.foldl (fun acc a => min acc (f a)) (min init (f hd)) tl
-        ≤ min init (f hd) := ih _
-      _ ≤ init := Nat.min_le_left _ _
-
 /-- Helper: minDepDurability is ≤ default -/
 theorem minDepDurability_le_default {N : Nat} (nodes : QueryId → Option (Node N)) (deps : List Dep)
     (default : Durability) :
@@ -724,25 +714,7 @@ lemma isValidAt_updateGraphEdgesStep {N : Nat} (rt : Runtime N) (qid : QueryId) 
               by_cases heq : dep.queryId = d.queryId
               · simp [f, g, heq, hd]
               · simp [f, g, heq]
-            have hall' : (node.dependencies).all f = (node.dependencies).all g := by
-              classical
-              cases hf : (node.dependencies).all f with
-              | true =>
-                have hallTrue : ∀ dep ∈ node.dependencies, f dep = true := (List.all_eq_true).1 hf
-                have hallTrue' : ∀ dep ∈ node.dependencies, g dep = true := by
-                  intro dep hmem
-                  have h := hallTrue dep hmem
-                  simpa [hpoint dep] using h
-                have hg : (node.dependencies).all g = true := (List.all_eq_true).2 hallTrue'
-                simp [hg]
-              | false =>
-                rcases (List.all_eq_false).1 hf with ⟨dep, hmem, hfail⟩
-                have hfail' : g dep = false := by
-                  simpa [hpoint dep] using hfail
-                have hg : (node.dependencies).all g = false :=
-                  (List.all_eq_false).2 ⟨dep, hmem, by simp [hfail']⟩
-                simp [hg]
-            simpa [f, g] using hall'
+            simpa [f, g] using List.all_congr hpoint node.dependencies
           simp [updateGraphEdgesStep, hd, hmem, hall]
         · -- node at `x` is unchanged, but the nodes map at `d.queryId` changes only in `dependents`;
           -- `isValidAt` only looks at `changedAt`, so the deps check is unchanged.
@@ -774,25 +746,7 @@ lemma isValidAt_updateGraphEdgesStep {N : Nat} (rt : Runtime N) (qid : QueryId) 
               by_cases heq : dep.queryId = d.queryId
               · simp [f, g, heq, hd]
               · simp [f, g, heq]
-            have hall' : (node.dependencies).all f = (node.dependencies).all g := by
-              classical
-              cases hf : (node.dependencies).all f with
-              | true =>
-                have hallTrue : ∀ dep ∈ node.dependencies, f dep = true := (List.all_eq_true).1 hf
-                have hallTrue' : ∀ dep ∈ node.dependencies, g dep = true := by
-                  intro dep hmem
-                  have h := hallTrue dep hmem
-                  simpa [hpoint dep] using h
-                have hg : (node.dependencies).all g = true := (List.all_eq_true).2 hallTrue'
-                simp [hg]
-              | false =>
-                rcases (List.all_eq_false).1 hf with ⟨dep, hmem, hfail⟩
-                have hfail' : g dep = false := by
-                  simpa [hpoint dep] using hfail
-                have hg : (node.dependencies).all g = false :=
-                  (List.all_eq_false).2 ⟨dep, hmem, by simp [hfail']⟩
-                simp [hg]
-            simpa [f, g] using hall'
+            simpa [f, g] using List.all_congr hpoint node.dependencies
           simp [updateGraphEdgesStep, hx, hd, hmem, hxkey, hall]
 
 theorem isValidAt_updateGraphEdges {N : Nat} (rt : Runtime N) (qid : QueryId) (deps : List Dep)

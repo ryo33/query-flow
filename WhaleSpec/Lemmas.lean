@@ -56,6 +56,29 @@ theorem List.foldl_preserves_some {α β γ : Type*} {f : (α → Option β) →
     obtain ⟨n', hn'⟩ := h_step ns hd n h_init
     exact ih (ns := f ns hd) (n := n') hn'
 
+/-! ## Foldl with Equality Preservation -/
+
+/-- Foldl preserves a projection's value when each step preserves it -/
+theorem List.foldl_preserves_eq {α β γ : Type*} {f : β → α → β} {g : β → γ}
+    (h_step : ∀ b a, g (f b a) = g b) (init : β) (l : List α) :
+    g (l.foldl f init) = g init := by
+  induction l generalizing init with
+  | nil => rfl
+  | cons hd tl ih => rw [List.foldl_cons, ih, h_step]
+
+/-! ## Nat Min Lemmas -/
+
+/-- Foldl with min is bounded by init -/
+theorem List.foldl_min_le_init {α : Type*} (f : α → Nat) (init : Nat) (l : List α) :
+    l.foldl (fun acc a => min acc (f a)) init ≤ init := by
+  induction l generalizing init with
+  | nil => simp [List.foldl]
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    calc tl.foldl (fun acc a => min acc (f a)) (min init (f hd))
+        ≤ min init (f hd) := ih _
+      _ ≤ init := Nat.min_le_left _ _
+
 /-! ## Option Handling -/
 
 /-- Unwrap option with default -/

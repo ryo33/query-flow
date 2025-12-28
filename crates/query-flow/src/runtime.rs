@@ -33,6 +33,49 @@ thread_local! {
     static QUERY_STACK: RefCell<Vec<FullCacheKey>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Execution context passed through query execution.
+///
+/// When the `inspector` feature is disabled, this is a zero-sized type (ZST)
+/// with no runtime cost.
+#[cfg(feature = "inspector")]
+#[derive(Clone, Copy)]
+pub struct ExecutionContext {
+    span_id: SpanId,
+}
+
+#[cfg(not(feature = "inspector"))]
+#[derive(Clone, Copy)]
+pub struct ExecutionContext;
+
+impl ExecutionContext {
+    /// Create a new execution context.
+    #[cfg(feature = "inspector")]
+    pub fn new() -> Self {
+        Self {
+            span_id: query_flow_inspector::new_span_id(),
+        }
+    }
+
+    /// Create a new execution context.
+    #[cfg(not(feature = "inspector"))]
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Get the span ID for this execution context.
+    #[cfg(feature = "inspector")]
+    pub fn span_id(&self) -> SpanId {
+        self.span_id
+    }
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The query runtime manages query execution, caching, and dependency tracking.
 ///
 /// This is cheap to clone - all data is behind `Arc`.
@@ -183,9 +226,8 @@ impl QueryRuntime {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
-        // Generate span ID and emit start event
-        #[cfg(feature = "inspector")]
-        let span_id = query_flow_inspector::new_span_id();
+        // Create execution context and emit start event
+        let exec_ctx = ExecutionContext::new();
         #[cfg(feature = "inspector")]
         let start_time = std::time::Instant::now();
         #[cfg(feature = "inspector")]
@@ -194,7 +236,7 @@ impl QueryRuntime {
 
         #[cfg(feature = "inspector")]
         self.emit(|| FlowEvent::QueryStart {
-            span_id,
+            span_id: exec_ctx.span_id(),
             query: query_key.clone(),
         });
 
@@ -223,7 +265,7 @@ impl QueryRuntime {
 
             #[cfg(feature = "inspector")]
             self.emit(|| FlowEvent::QueryEnd {
-                span_id,
+                span_id: exec_ctx.span_id(),
                 query: query_key.clone(),
                 result: query_flow_inspector::ExecutionResult::CycleDetected,
                 duration: start_time.elapsed(),
@@ -240,14 +282,14 @@ impl QueryRuntime {
             if let Some(cached) = self.get_cached::<Q>(&full_key) {
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::CacheCheck {
-                    span_id,
+                    span_id: exec_ctx.span_id(),
                     query: query_key.clone(),
                     valid: true,
                 });
 
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::QueryEnd {
-                    span_id,
+                    span_id: exec_ctx.span_id(),
                     query: query_key.clone(),
                     result: query_flow_inspector::ExecutionResult::CacheHit,
                     duration: start_time.elapsed(),
@@ -284,14 +326,14 @@ impl QueryRuntime {
 
                     #[cfg(feature = "inspector")]
                     self.emit(|| FlowEvent::CacheCheck {
-                        span_id,
+                        span_id: exec_ctx.span_id(),
                         query: query_key.clone(),
                         valid: true,
                     });
 
                     #[cfg(feature = "inspector")]
                     self.emit(|| FlowEvent::QueryEnd {
-                        span_id,
+                        span_id: exec_ctx.span_id(),
                         query: query_key.clone(),
                         result: query_flow_inspector::ExecutionResult::CacheHit,
                         duration: start_time.elapsed(),
@@ -308,7 +350,7 @@ impl QueryRuntime {
 
         #[cfg(feature = "inspector")]
         self.emit(|| FlowEvent::CacheCheck {
-            span_id,
+            span_id: exec_ctx.span_id(),
             query: query_key.clone(),
             valid: false,
         });
@@ -318,10 +360,7 @@ impl QueryRuntime {
             stack.borrow_mut().push(full_key.clone());
         });
 
-        #[cfg(feature = "inspector")]
-        let result = self.execute_query::<Q>(&query, &full_key, span_id);
-        #[cfg(not(feature = "inspector"))]
-        let result = self.execute_query::<Q>(&query, &full_key);
+        let result = self.execute_query::<Q>(&query, &full_key, exec_ctx);
 
         QUERY_STACK.with(|stack| {
             stack.borrow_mut().pop();
@@ -342,7 +381,7 @@ impl QueryRuntime {
                 },
             };
             self.emit(|| FlowEvent::QueryEnd {
-                span_id,
+                span_id: exec_ctx.span_id(),
                 query: query_key.clone(),
                 result: exec_result,
                 duration: start_time.elapsed(),
@@ -355,21 +394,25 @@ impl QueryRuntime {
     /// Execute a query, caching the result if appropriate.
     ///
     /// Returns (output, output_changed) tuple for instrumentation.
-    #[cfg(feature = "inspector")]
     fn execute_query<Q: Query>(
         &self,
         query: &Q,
         full_key: &FullCacheKey,
-        span_id: SpanId,
+        exec_ctx: ExecutionContext,
     ) -> Result<(Arc<Q::Output>, bool), QueryError> {
         // Create context for this query execution
         let mut ctx = QueryContext {
             runtime: self,
             current_key: full_key.clone(),
+            #[cfg(feature = "inspector")]
             parent_query_type: std::any::type_name::<Q>(),
-            span_id,
+            #[cfg(feature = "inspector")]
+            exec_ctx,
             deps: RefCell::new(Vec::new()),
         };
+        // Suppress unused variable warning when inspector is disabled
+        #[cfg(not(feature = "inspector"))]
+        let _ = exec_ctx;
 
         // Execute the query
         let result = query.query(&mut ctx);
@@ -394,8 +437,9 @@ impl QueryRuntime {
                     };
 
                 // Emit early cutoff check event
+                #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::EarlyCutoffCheck {
-                    span_id,
+                    span_id: exec_ctx.span_id(),
                     query: query_flow_inspector::QueryKey::new(
                         std::any::type_name::<Q>(),
                         full_key.debug_repr(),
@@ -437,116 +481,15 @@ impl QueryRuntime {
                     };
 
                 // Emit early cutoff check event
+                #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::EarlyCutoffCheck {
-                    span_id,
+                    span_id: exec_ctx.span_id(),
                     query: query_flow_inspector::QueryKey::new(
                         std::any::type_name::<Q>(),
                         full_key.debug_repr(),
                     ),
                     output_changed,
                 });
-
-                // Update whale with cached error (atomic update of value + dependency state)
-                let entry = CachedEntry::UserError(err.clone());
-                if output_changed {
-                    let _ = self
-                        .whale
-                        .register(full_key.clone(), Some(entry), durability, deps);
-                } else {
-                    let _ = self.whale.confirm_unchanged(full_key, deps);
-                }
-
-                // Register query in registry for list_queries
-                let is_new_query = self.query_registry.register(query);
-                if is_new_query {
-                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
-                    let _ = self
-                        .whale
-                        .register(sentinel, None, Durability::volatile(), vec![]);
-                }
-
-                // Store verifier for this query (for verify-then-decide pattern)
-                self.verifiers.insert(full_key.clone(), query.clone());
-
-                Err(QueryError::UserError(err))
-            }
-            Err(e) => {
-                // System errors (Suspend, Cycle, Cancelled, MissingDependency) are not cached
-                Err(e)
-            }
-        }
-    }
-
-    /// Execute a query, caching the result if appropriate.
-    ///
-    /// Returns (output, output_changed) tuple for instrumentation.
-    #[cfg(not(feature = "inspector"))]
-    fn execute_query<Q: Query>(
-        &self,
-        query: &Q,
-        full_key: &FullCacheKey,
-    ) -> Result<(Arc<Q::Output>, bool), QueryError> {
-        // Create context for this query execution
-        let mut ctx = QueryContext {
-            runtime: self,
-            current_key: full_key.clone(),
-            deps: RefCell::new(Vec::new()),
-        };
-
-        // Execute the query
-        let result = query.query(&mut ctx);
-
-        // Get collected dependencies
-        let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
-
-        // Get durability for whale registration
-        let durability =
-            Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
-
-        match result {
-            Ok(output) => {
-                let output = Arc::new(output);
-
-                // Check if output changed (for early cutoff)
-                let output_changed =
-                    if let Some(CachedValue::Ok(old)) = self.get_cached::<Q>(full_key) {
-                        !Q::output_eq(&old, &output)
-                    } else {
-                        true // No previous value or was error, so "changed"
-                    };
-
-                // Update whale with cached entry (atomic update of value + dependency state)
-                let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
-                if output_changed {
-                    let _ = self
-                        .whale
-                        .register(full_key.clone(), Some(entry), durability, deps);
-                } else {
-                    let _ = self.whale.confirm_unchanged(full_key, deps);
-                }
-
-                // Register query in registry for list_queries
-                let is_new_query = self.query_registry.register(query);
-                if is_new_query {
-                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
-                    let _ = self
-                        .whale
-                        .register(sentinel, None, Durability::volatile(), vec![]);
-                }
-
-                // Store verifier for this query (for verify-then-decide pattern)
-                self.verifiers.insert(full_key.clone(), query.clone());
-
-                Ok((output, output_changed))
-            }
-            Err(QueryError::UserError(err)) => {
-                // Check if error changed (for early cutoff)
-                let output_changed =
-                    if let Some(CachedValue::UserError(old_err)) = self.get_cached::<Q>(full_key) {
-                        !(self.error_comparator)(old_err.as_ref(), err.as_ref())
-                    } else {
-                        true // No previous error or was Ok, so "changed"
-                    };
 
                 // Update whale with cached error (atomic update of value + dependency state)
                 let entry = CachedEntry::UserError(err.clone());
@@ -1024,23 +967,14 @@ impl QueryRuntime {
 /// Context provided to queries during execution.
 ///
 /// Use this to access dependencies via `query()`.
-#[cfg(feature = "inspector")]
 pub struct QueryContext<'a> {
     runtime: &'a QueryRuntime,
+    #[cfg_attr(not(feature = "inspector"), allow(dead_code))]
     current_key: FullCacheKey,
+    #[cfg(feature = "inspector")]
     parent_query_type: &'static str,
-    span_id: SpanId,
-    deps: RefCell<Vec<FullCacheKey>>,
-}
-
-/// Context provided to queries during execution.
-///
-/// Use this to access dependencies via `query()`.
-#[cfg(not(feature = "inspector"))]
-pub struct QueryContext<'a> {
-    runtime: &'a QueryRuntime,
-    #[allow(dead_code)]
-    current_key: FullCacheKey,
+    #[cfg(feature = "inspector")]
+    exec_ctx: ExecutionContext,
     deps: RefCell<Vec<FullCacheKey>>,
 }
 
@@ -1064,7 +998,7 @@ impl<'a> QueryContext<'a> {
         // Emit dependency registered event
         #[cfg(feature = "inspector")]
         self.runtime.emit(|| FlowEvent::DependencyRegistered {
-            span_id: self.span_id,
+            span_id: self.exec_ctx.span_id(),
             parent: query_flow_inspector::QueryKey::new(
                 self.parent_query_type,
                 self.current_key.debug_repr(),
@@ -1112,7 +1046,7 @@ impl<'a> QueryContext<'a> {
         // Emit asset dependency registered event
         #[cfg(feature = "inspector")]
         self.runtime.emit(|| FlowEvent::AssetDependencyRegistered {
-            span_id: self.span_id,
+            span_id: self.exec_ctx.span_id(),
             parent: query_flow_inspector::QueryKey::new(
                 self.parent_query_type,
                 self.current_key.debug_repr(),
@@ -1172,7 +1106,7 @@ impl<'a> QueryContext<'a> {
 
         #[cfg(feature = "inspector")]
         self.runtime.emit(|| FlowEvent::DependencyRegistered {
-            span_id: self.span_id,
+            span_id: self.exec_ctx.span_id(),
             parent: query_flow_inspector::QueryKey::new(
                 self.parent_query_type,
                 self.current_key.debug_repr(),
@@ -1216,7 +1150,7 @@ impl<'a> QueryContext<'a> {
 
         #[cfg(feature = "inspector")]
         self.runtime.emit(|| FlowEvent::AssetDependencyRegistered {
-            span_id: self.span_id,
+            span_id: self.exec_ctx.span_id(),
             parent: query_flow_inspector::QueryKey::new(
                 self.parent_query_type,
                 self.current_key.debug_repr(),

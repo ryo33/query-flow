@@ -11,7 +11,7 @@ use crate::key::FullCacheKey;
 use crate::loading::LoadingState;
 use crate::query::Query;
 use crate::storage::{
-    AssetKeyRegistry, AssetState, AssetStorage, CacheStorage, CachedValue, LocatorStorage,
+    AssetKeyRegistry, AssetState, AssetStorage, CachedEntry, CachedValue, LocatorStorage,
     PendingStorage, QueryRegistry, VerifierStorage,
 };
 use crate::QueryError;
@@ -49,10 +49,9 @@ thread_local! {
 /// let result = runtime.query_async(MyQuery { ... }).await?;
 /// ```
 pub struct QueryRuntime {
-    /// Whale runtime for dependency tracking
-    whale: WhaleRuntime<FullCacheKey, (), DURABILITY_LEVELS>,
-    /// Cache for query outputs
-    cache: Arc<CacheStorage>,
+    /// Whale runtime for dependency tracking and cache storage.
+    /// Query outputs are stored in Node.data as Option<CachedEntry>.
+    whale: WhaleRuntime<FullCacheKey, Option<CachedEntry>, DURABILITY_LEVELS>,
     /// Asset cache and state storage
     assets: Arc<AssetStorage>,
     /// Registered asset locators
@@ -82,7 +81,6 @@ impl Clone for QueryRuntime {
     fn clone(&self) -> Self {
         Self {
             whale: self.whale.clone(),
-            cache: self.cache.clone(),
             assets: self.assets.clone(),
             locators: self.locators.clone(),
             pending: self.pending.clone(),
@@ -101,6 +99,15 @@ impl Clone for QueryRuntime {
 /// This is conservative - it always triggers recomputation when an error occurs.
 fn default_error_comparator(_a: &anyhow::Error, _b: &anyhow::Error) -> bool {
     false
+}
+
+impl QueryRuntime {
+    /// Get cached output from whale's node data.
+    fn get_cached<Q: Query>(&self, key: &FullCacheKey) -> Option<CachedValue<Arc<Q::Output>>> {
+        let node = self.whale.get(key)?;
+        let entry = node.data.as_ref()?;
+        entry.to_cached_value::<Q::Output>()
+    }
 }
 
 impl QueryRuntime {
@@ -230,7 +237,7 @@ impl QueryRuntime {
 
         // Fast path: already verified at current revision
         if self.whale.is_verified_at(&full_key, &current_rev) {
-            if let Some(cached) = self.cache.get_cached::<Q>(&full_key) {
+            if let Some(cached) = self.get_cached::<Q>(&full_key) {
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::CacheCheck {
                     span_id,
@@ -255,7 +262,7 @@ impl QueryRuntime {
 
         // Check shallow validity (deps' changed_at ok) and try verify-then-decide
         if self.whale.is_valid(&full_key) {
-            if let Some(cached) = self.cache.get_cached::<Q>(&full_key) {
+            if let Some(cached) = self.get_cached::<Q>(&full_key) {
                 // Shallow valid but not verified - verify deps first
                 let mut deps_verified = true;
                 if let Some(deps) = self.whale.get_dependency_ids(&full_key) {
@@ -380,7 +387,7 @@ impl QueryRuntime {
 
                 // Check if output changed (for early cutoff)
                 let output_changed =
-                    if let Some(CachedValue::Ok(old)) = self.cache.get_cached::<Q>(full_key) {
+                    if let Some(CachedValue::Ok(old)) = self.get_cached::<Q>(full_key) {
                         !Q::output_eq(&old, &output)
                     } else {
                         true // No previous value or was error, so "changed"
@@ -396,12 +403,12 @@ impl QueryRuntime {
                     output_changed,
                 });
 
-                // Update cache
-                self.cache.insert_ok::<Q>(full_key.clone(), output.clone());
-
-                // Update whale dependency tracking
+                // Update whale with cached entry (atomic update of value + dependency state)
+                let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
                 if output_changed {
-                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                    let _ = self
+                        .whale
+                        .register(full_key.clone(), Some(entry), durability, deps);
                 } else {
                     let _ = self.whale.confirm_unchanged(full_key, deps);
                 }
@@ -412,7 +419,7 @@ impl QueryRuntime {
                     let sentinel = FullCacheKey::query_set_sentinel::<Q>();
                     let _ = self
                         .whale
-                        .register(sentinel, (), Durability::volatile(), vec![]);
+                        .register(sentinel, None, Durability::volatile(), vec![]);
                 }
 
                 // Store verifier for this query (for verify-then-decide pattern)
@@ -422,13 +429,12 @@ impl QueryRuntime {
             }
             Err(QueryError::UserError(err)) => {
                 // Check if error changed (for early cutoff)
-                let output_changed = if let Some(CachedValue::UserError(old_err)) =
-                    self.cache.get_cached::<Q>(full_key)
-                {
-                    !(self.error_comparator)(old_err.as_ref(), err.as_ref())
-                } else {
-                    true // No previous error or was Ok, so "changed"
-                };
+                let output_changed =
+                    if let Some(CachedValue::UserError(old_err)) = self.get_cached::<Q>(full_key) {
+                        !(self.error_comparator)(old_err.as_ref(), err.as_ref())
+                    } else {
+                        true // No previous error or was Ok, so "changed"
+                    };
 
                 // Emit early cutoff check event
                 self.emit(|| FlowEvent::EarlyCutoffCheck {
@@ -440,12 +446,12 @@ impl QueryRuntime {
                     output_changed,
                 });
 
-                // Update cache with error
-                self.cache.insert_error(full_key.clone(), err.clone());
-
-                // Update whale dependency tracking
+                // Update whale with cached error (atomic update of value + dependency state)
+                let entry = CachedEntry::UserError(err.clone());
                 if output_changed {
-                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                    let _ = self
+                        .whale
+                        .register(full_key.clone(), Some(entry), durability, deps);
                 } else {
                     let _ = self.whale.confirm_unchanged(full_key, deps);
                 }
@@ -456,7 +462,7 @@ impl QueryRuntime {
                     let sentinel = FullCacheKey::query_set_sentinel::<Q>();
                     let _ = self
                         .whale
-                        .register(sentinel, (), Durability::volatile(), vec![]);
+                        .register(sentinel, None, Durability::volatile(), vec![]);
                 }
 
                 // Store verifier for this query (for verify-then-decide pattern)
@@ -503,18 +509,18 @@ impl QueryRuntime {
 
                 // Check if output changed (for early cutoff)
                 let output_changed =
-                    if let Some(CachedValue::Ok(old)) = self.cache.get_cached::<Q>(full_key) {
+                    if let Some(CachedValue::Ok(old)) = self.get_cached::<Q>(full_key) {
                         !Q::output_eq(&old, &output)
                     } else {
                         true // No previous value or was error, so "changed"
                     };
 
-                // Update cache
-                self.cache.insert_ok::<Q>(full_key.clone(), output.clone());
-
-                // Update whale dependency tracking
+                // Update whale with cached entry (atomic update of value + dependency state)
+                let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
                 if output_changed {
-                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                    let _ = self
+                        .whale
+                        .register(full_key.clone(), Some(entry), durability, deps);
                 } else {
                     let _ = self.whale.confirm_unchanged(full_key, deps);
                 }
@@ -525,7 +531,7 @@ impl QueryRuntime {
                     let sentinel = FullCacheKey::query_set_sentinel::<Q>();
                     let _ = self
                         .whale
-                        .register(sentinel, (), Durability::volatile(), vec![]);
+                        .register(sentinel, None, Durability::volatile(), vec![]);
                 }
 
                 // Store verifier for this query (for verify-then-decide pattern)
@@ -535,20 +541,19 @@ impl QueryRuntime {
             }
             Err(QueryError::UserError(err)) => {
                 // Check if error changed (for early cutoff)
-                let output_changed = if let Some(CachedValue::UserError(old_err)) =
-                    self.cache.get_cached::<Q>(full_key)
-                {
-                    !(self.error_comparator)(old_err.as_ref(), err.as_ref())
-                } else {
-                    true // No previous error or was Ok, so "changed"
-                };
+                let output_changed =
+                    if let Some(CachedValue::UserError(old_err)) = self.get_cached::<Q>(full_key) {
+                        !(self.error_comparator)(old_err.as_ref(), err.as_ref())
+                    } else {
+                        true // No previous error or was Ok, so "changed"
+                    };
 
-                // Update cache with error
-                self.cache.insert_error(full_key.clone(), err.clone());
-
-                // Update whale dependency tracking
+                // Update whale with cached error (atomic update of value + dependency state)
+                let entry = CachedEntry::UserError(err.clone());
                 if output_changed {
-                    let _ = self.whale.register(full_key.clone(), (), durability, deps);
+                    let _ = self
+                        .whale
+                        .register(full_key.clone(), Some(entry), durability, deps);
                 } else {
                     let _ = self.whale.confirm_unchanged(full_key, deps);
                 }
@@ -559,7 +564,7 @@ impl QueryRuntime {
                     let sentinel = FullCacheKey::query_set_sentinel::<Q>();
                     let _ = self
                         .whale
-                        .register(sentinel, (), Durability::volatile(), vec![]);
+                        .register(sentinel, None, Durability::volatile(), vec![]);
                 }
 
                 // Store verifier for this query (for verify-then-decide pattern)
@@ -589,18 +594,20 @@ impl QueryRuntime {
             reason: query_flow_inspector::InvalidationReason::ManualInvalidation,
         });
 
-        // Remove from cache
-        self.cache.remove(&full_key);
-
-        // Update whale to invalidate dependents (register with new changed_at)
+        // Update whale to invalidate dependents (register with None to clear cached value)
         let _ = self
             .whale
-            .register(full_key, (), Durability::volatile(), vec![]);
+            .register(full_key, None, Durability::volatile(), vec![]);
     }
 
-    /// Clear all cached values.
+    /// Clear all cached values by removing all nodes from whale.
+    ///
+    /// Note: This is a relatively expensive operation as it iterates through all keys.
     pub fn clear_cache(&self) {
-        self.cache.clear();
+        let keys = self.whale.keys();
+        for key in keys {
+            self.whale.remove(&key);
+        }
     }
 }
 
@@ -665,7 +672,6 @@ impl QueryRuntimeBuilder {
     pub fn build(self) -> QueryRuntime {
         QueryRuntime {
             whale: WhaleRuntime::new(),
-            cache: Arc::new(CacheStorage::new()),
             assets: Arc::new(AssetStorage::new()),
             locators: Arc::new(LocatorStorage::new()),
             pending: Arc::new(PendingStorage::new()),
@@ -804,7 +810,9 @@ impl QueryRuntime {
 
         if changed {
             // Register with new changed_at to invalidate dependents
-            let _ = self.whale.register(full_cache_key, (), durability, vec![]);
+            let _ = self
+                .whale
+                .register(full_cache_key, None, durability, vec![]);
         } else {
             // Early cutoff - keep old changed_at
             let _ = self.whale.confirm_unchanged(&full_cache_key, vec![]);
@@ -817,7 +825,7 @@ impl QueryRuntime {
             let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
             let _ = self
                 .whale
-                .register(sentinel, (), Durability::volatile(), vec![]);
+                .register(sentinel, None, Durability::volatile(), vec![]);
         }
     }
 
@@ -857,7 +865,7 @@ impl QueryRuntime {
         // Update whale to invalidate dependents (use volatile during loading)
         let _ = self
             .whale
-            .register(full_cache_key, (), Durability::volatile(), vec![]);
+            .register(full_cache_key, None, Durability::volatile(), vec![]);
     }
 
     /// Remove an asset from the cache entirely.
@@ -872,7 +880,7 @@ impl QueryRuntime {
         // This ensures queries that depend on this asset will recompute
         let _ = self
             .whale
-            .register(full_cache_key.clone(), (), Durability::volatile(), vec![]);
+            .register(full_cache_key.clone(), None, Durability::volatile(), vec![]);
 
         // Then remove the asset from storage
         self.assets.remove(&full_asset_key);
@@ -886,7 +894,7 @@ impl QueryRuntime {
             let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
             let _ = self
                 .whale
-                .register(sentinel, (), Durability::volatile(), vec![]);
+                .register(sentinel, None, Durability::volatile(), vec![]);
         }
     }
 
@@ -973,7 +981,9 @@ impl QueryRuntime {
                         // Register with whale
                         let durability = Durability::new(key.durability().as_u8() as usize)
                             .unwrap_or(Durability::volatile());
-                        let _ = self.whale.register(full_cache_key, (), durability, vec![]);
+                        let _ = self
+                            .whale
+                            .register(full_cache_key, None, durability, vec![]);
 
                         match arc.downcast::<K::Asset>() {
                             Ok(value) => return Ok(LoadingState::Ready(value)),

@@ -22,72 +22,25 @@ pub enum CachedValue<T> {
     UserError(Arc<anyhow::Error>),
 }
 
-/// Internal type-erased cache entry.
+/// Type-erased cache entry stored in whale's Node.data.
+///
+/// This is stored directly in the whale runtime's nodes for atomic
+/// update of both cached value and dependency tracking state.
 #[derive(Clone)]
-pub(crate) enum CachedEntry {
+pub enum CachedEntry {
     /// Successful output (type-erased).
     Ok(Arc<dyn Any + Send + Sync>),
     /// User error.
     UserError(Arc<anyhow::Error>),
 }
 
-/// Thread-safe, type-erased storage for cached query results.
-///
-/// Uses papaya's lock-free HashMap internally.
-pub(crate) struct CacheStorage {
-    /// Map from FullCacheKey to cached entry (Ok or UserError)
-    entries: HashMap<FullCacheKey, CachedEntry, ahash::RandomState>,
-}
-
-impl Default for CacheStorage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CacheStorage {
-    /// Create a new empty cache storage.
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::with_hasher(ahash::RandomState::new()),
-        }
-    }
-
-    /// Get a cached entry (Ok or UserError) if present.
-    pub fn get_cached<Q: Query>(&self, key: &FullCacheKey) -> Option<CachedValue<Arc<Q::Output>>> {
-        let pinned = self.entries.pin();
-        pinned.get(key).and_then(|entry| match entry {
-            CachedEntry::Ok(arc) => arc
-                .clone()
-                .downcast::<Q::Output>()
-                .ok()
-                .map(CachedValue::Ok),
+impl CachedEntry {
+    /// Convert to typed CachedValue by downcasting.
+    pub fn to_cached_value<T: Send + Sync + 'static>(&self) -> Option<CachedValue<Arc<T>>> {
+        match self {
+            CachedEntry::Ok(arc) => arc.clone().downcast::<T>().ok().map(CachedValue::Ok),
             CachedEntry::UserError(e) => Some(CachedValue::UserError(e.clone())),
-        })
-    }
-
-    /// Insert an Ok value into the cache.
-    pub fn insert_ok<Q: Query>(&self, key: FullCacheKey, value: Arc<Q::Output>) {
-        let pinned = self.entries.pin();
-        pinned.insert(key, CachedEntry::Ok(value as Arc<dyn Any + Send + Sync>));
-    }
-
-    /// Insert a UserError into the cache.
-    pub fn insert_error(&self, key: FullCacheKey, error: Arc<anyhow::Error>) {
-        let pinned = self.entries.pin();
-        pinned.insert(key, CachedEntry::UserError(error));
-    }
-
-    /// Remove a value from the cache.
-    pub fn remove(&self, key: &FullCacheKey) -> bool {
-        let pinned = self.entries.pin();
-        pinned.remove(key).is_some()
-    }
-
-    /// Clear all cached values.
-    pub fn clear(&self) {
-        let pinned = self.entries.pin();
-        pinned.clear();
+        }
     }
 }
 
@@ -550,46 +503,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cache_storage_basic() {
-        #[derive(Clone)]
-        struct TestQuery;
-        impl Query for TestQuery {
-            type CacheKey = u32;
-            type Output = String;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                42
-            }
-
-            fn query(
-                &self,
-                _ctx: &mut crate::runtime::QueryContext,
-            ) -> Result<Self::Output, crate::QueryError> {
-                Ok("hello".to_string())
-            }
-
-            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
-                old == new
-            }
-        }
-
-        let storage = CacheStorage::new();
-        let key = FullCacheKey::new::<TestQuery, _>(&42u32);
-
-        // Initially empty
-        assert!(storage.get_cached::<TestQuery>(&key).is_none());
-
-        // Insert and retrieve
-        storage.insert_ok::<TestQuery>(key.clone(), Arc::new("hello".to_string()));
-        let result = storage.get_cached::<TestQuery>(&key);
+    fn test_cached_entry_to_cached_value() {
+        // Test Ok variant
+        let entry = CachedEntry::Ok(Arc::new("hello".to_string()) as Arc<dyn Any + Send + Sync>);
+        let result: Option<CachedValue<Arc<String>>> = entry.to_cached_value();
         assert!(result.is_some());
         match result.unwrap() {
             CachedValue::Ok(v) => assert_eq!(*v, "hello"),
             CachedValue::UserError(_) => panic!("expected Ok"),
         }
 
-        // Remove
-        assert!(storage.remove(&key));
-        assert!(storage.get_cached::<TestQuery>(&key).is_none());
+        // Test UserError variant
+        let err = Arc::new(anyhow::anyhow!("test error"));
+        let entry = CachedEntry::UserError(err.clone());
+        let result: Option<CachedValue<Arc<String>>> = entry.to_cached_value();
+        assert!(result.is_some());
+        match result.unwrap() {
+            CachedValue::Ok(_) => panic!("expected UserError"),
+            CachedValue::UserError(e) => assert_eq!(e.to_string(), "test error"),
+        }
+
+        // Test type mismatch (Ok with wrong type)
+        let entry = CachedEntry::Ok(Arc::new(42i32) as Arc<dyn Any + Send + Sync>);
+        let result: Option<CachedValue<Arc<String>>> = entry.to_cached_value();
+        assert!(result.is_none()); // downcast fails
     }
 }

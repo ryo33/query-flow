@@ -203,7 +203,6 @@ fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
 }
 
 #[test]
-#[ignore = "blocked by whale bug: is_valid_at doesn't check transitive dependencies"]
 fn test_error_comparator_default_false() {
     // Default comparator returns false, so errors are always "different"
     // This means all downstream queries will be recomputed
@@ -234,7 +233,6 @@ fn test_error_comparator_default_false() {
 }
 
 #[test]
-#[ignore = "blocked by whale bug: is_valid_at doesn't check transitive dependencies"]
 fn test_error_comparator_custom() {
     // Custom comparator that considers CustomErrors equal if they have the same code
     // With early cutoff, downstream queries should NOT be recomputed
@@ -278,7 +276,6 @@ fn test_error_comparator_custom() {
 }
 
 #[test]
-#[ignore = "blocked by whale bug: is_valid_at doesn't check transitive dependencies"]
 fn test_error_comparator_always_equal() {
     // Comparator that treats all errors as equal
     // With 3-level chain, early cutoff at Level 2 should prevent Level 3 recomputation

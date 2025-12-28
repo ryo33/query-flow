@@ -106,7 +106,7 @@ where
             return true;
         }
 
-        // Check each dependency
+        // Check each dependency (shallow check - only direct deps' changed_at)
         let deps_valid = node.dependencies.iter().all(|dep| {
             match self.get(&dep.query_id) {
                 None => false, // dependency removed
@@ -122,6 +122,26 @@ where
     /// Convenience: check validity at current revision.
     pub fn is_valid(&self, qid: &K) -> bool {
         self.is_valid_at(qid, &self.current_revision())
+    }
+
+    /// Get the dependency IDs for a node.
+    ///
+    /// Returns None if the node doesn't exist.
+    /// Used by query-flow to verify dependencies before deciding to recompute.
+    pub fn get_dependency_ids(&self, qid: &K) -> Option<Vec<K>> {
+        self.get(qid)
+            .map(|node| node.dependencies.iter().map(|d| d.query_id.clone()).collect())
+    }
+
+    /// Check if a node has been verified at the given revision.
+    ///
+    /// This is a fast check that only looks at verified_at, not dependencies.
+    pub fn is_verified_at(&self, qid: &K, at_rev: &Revision<N>) -> bool {
+        let Some(node) = self.get(qid) else {
+            return false;
+        };
+        let d = node.durability;
+        node.verified_at >= at_rev.get(d)
     }
 
     /// Mark a node as verified at given revision (idempotent update).

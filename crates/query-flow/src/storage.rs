@@ -470,6 +470,81 @@ impl AssetKeyRegistry {
     }
 }
 
+/// Trait for type-erased query verification.
+///
+/// Allows re-executing a query to verify it hasn't changed.
+pub(crate) trait AnyVerifier: Send + Sync + 'static {
+    /// Verify the query by re-executing it.
+    fn verify(&self, runtime: &crate::QueryRuntime) -> Result<(), crate::QueryError>;
+}
+
+/// Concrete verifier for a specific query type.
+pub(crate) struct QueryVerifier<Q: Query> {
+    query: Q,
+}
+
+impl<Q: Query> QueryVerifier<Q> {
+    pub fn new(query: Q) -> Self {
+        Self { query }
+    }
+}
+
+impl<Q: Query> AnyVerifier for QueryVerifier<Q> {
+    fn verify(&self, runtime: &crate::QueryRuntime) -> Result<(), crate::QueryError> {
+        match runtime.query(self.query.clone()) {
+            Ok(_) => Ok(()),
+            // UserError is a valid cached result, verification succeeded
+            Err(crate::QueryError::UserError(_)) => Ok(()),
+            // System errors mean verification failed
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Thread-safe storage for query verifiers.
+///
+/// Verifiers can re-execute queries to verify they haven't changed.
+/// Used by the "verify-then-decide" pattern to verify dependencies before
+/// deciding whether to recompute a dependent query.
+pub(crate) struct VerifierStorage {
+    /// Map from FullCacheKey to verifier
+    verifiers: HashMap<FullCacheKey, Arc<dyn AnyVerifier>, ahash::RandomState>,
+}
+
+impl Default for VerifierStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VerifierStorage {
+    /// Create a new empty verifier storage.
+    pub fn new() -> Self {
+        Self {
+            verifiers: HashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
+
+    /// Register a verifier for a query.
+    pub fn insert<Q: Query>(&self, key: FullCacheKey, query: Q) {
+        let pinned = self.verifiers.pin();
+        pinned.insert(key, Arc::new(QueryVerifier::new(query)));
+    }
+
+    /// Get a verifier for a query key.
+    pub fn get(&self, key: &FullCacheKey) -> Option<Arc<dyn AnyVerifier>> {
+        let pinned = self.verifiers.pin();
+        pinned.get(key).cloned()
+    }
+
+    /// Remove a verifier.
+    #[allow(dead_code)]
+    pub fn remove(&self, key: &FullCacheKey) -> bool {
+        let pinned = self.verifiers.pin();
+        pinned.remove(key).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

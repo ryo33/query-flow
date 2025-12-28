@@ -12,7 +12,7 @@ use crate::loading::LoadingState;
 use crate::query::Query;
 use crate::storage::{
     AssetKeyRegistry, AssetState, AssetStorage, CacheStorage, CachedValue, LocatorStorage,
-    PendingStorage, QueryRegistry,
+    PendingStorage, QueryRegistry, VerifierStorage,
 };
 use crate::QueryError;
 
@@ -63,6 +63,8 @@ pub struct QueryRuntime {
     query_registry: Arc<QueryRegistry>,
     /// Registry for tracking asset keys (for list_asset_keys)
     asset_key_registry: Arc<AssetKeyRegistry>,
+    /// Verifiers for re-executing queries (for verify-then-decide pattern)
+    verifiers: Arc<VerifierStorage>,
     /// Comparator for user errors during early cutoff
     error_comparator: ErrorComparator,
     /// Event sink for inspector/tracing
@@ -86,6 +88,7 @@ impl Clone for QueryRuntime {
             pending: self.pending.clone(),
             query_registry: self.query_registry.clone(),
             asset_key_registry: self.asset_key_registry.clone(),
+            verifiers: self.verifiers.clone(),
             error_comparator: self.error_comparator,
             #[cfg(feature = "inspector")]
             sink: self.sink.clone(),
@@ -222,27 +225,78 @@ impl QueryRuntime {
             return Err(QueryError::Cycle { path });
         }
 
-        // Check if cached and valid
-        if let Some(cached) = self.get_cached_if_valid::<Q>(&full_key) {
-            #[cfg(feature = "inspector")]
-            self.emit(|| FlowEvent::CacheCheck {
-                span_id,
-                query: query_key.clone(),
-                valid: true,
-            });
+        // Check if cached and valid (with verify-then-decide pattern)
+        let current_rev = self.whale.current_revision();
 
-            #[cfg(feature = "inspector")]
-            self.emit(|| FlowEvent::QueryEnd {
-                span_id,
-                query: query_key.clone(),
-                result: query_flow_inspector::ExecutionResult::CacheHit,
-                duration: start_time.elapsed(),
-            });
+        // Fast path: already verified at current revision
+        if self.whale.is_verified_at(&full_key, &current_rev) {
+            if let Some(cached) = self.cache.get_cached::<Q>(&full_key) {
+                #[cfg(feature = "inspector")]
+                self.emit(|| FlowEvent::CacheCheck {
+                    span_id,
+                    query: query_key.clone(),
+                    valid: true,
+                });
 
-            return match cached {
-                CachedValue::Ok(output) => Ok(output),
-                CachedValue::UserError(err) => Err(QueryError::UserError(err)),
-            };
+                #[cfg(feature = "inspector")]
+                self.emit(|| FlowEvent::QueryEnd {
+                    span_id,
+                    query: query_key.clone(),
+                    result: query_flow_inspector::ExecutionResult::CacheHit,
+                    duration: start_time.elapsed(),
+                });
+
+                return match cached {
+                    CachedValue::Ok(output) => Ok(output),
+                    CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+                };
+            }
+        }
+
+        // Check shallow validity (deps' changed_at ok) and try verify-then-decide
+        if self.whale.is_valid(&full_key) {
+            if let Some(cached) = self.cache.get_cached::<Q>(&full_key) {
+                // Shallow valid but not verified - verify deps first
+                let mut deps_verified = true;
+                if let Some(deps) = self.whale.get_dependency_ids(&full_key) {
+                    for dep in deps {
+                        if let Some(verifier) = self.verifiers.get(&dep) {
+                            // Re-query dep to verify it (triggers recursive verification)
+                            if verifier.verify(self).is_err() {
+                                deps_verified = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Re-check validity after deps are verified
+                if deps_verified && self.whale.is_valid(&full_key) {
+                    // Deps didn't change their changed_at, mark as verified and use cached
+                    self.whale.mark_verified(&full_key, &current_rev);
+
+                    #[cfg(feature = "inspector")]
+                    self.emit(|| FlowEvent::CacheCheck {
+                        span_id,
+                        query: query_key.clone(),
+                        valid: true,
+                    });
+
+                    #[cfg(feature = "inspector")]
+                    self.emit(|| FlowEvent::QueryEnd {
+                        span_id,
+                        query: query_key.clone(),
+                        result: query_flow_inspector::ExecutionResult::CacheHit,
+                        duration: start_time.elapsed(),
+                    });
+
+                    return match cached {
+                        CachedValue::Ok(output) => Ok(output),
+                        CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+                    };
+                }
+                // A dep's changed_at increased, fall through to execute
+            }
         }
 
         #[cfg(feature = "inspector")]
@@ -468,6 +522,9 @@ impl QueryRuntime {
                         .register(sentinel, (), Durability::volatile(), vec![]);
                 }
 
+                // Store verifier for this query (for verify-then-decide pattern)
+                self.verifiers.insert(full_key.clone(), query.clone());
+
                 Ok((output, output_changed))
             }
             Err(QueryError::UserError(err)) => {
@@ -499,6 +556,9 @@ impl QueryRuntime {
                         .register(sentinel, (), Durability::volatile(), vec![]);
                 }
 
+                // Store verifier for this query (for verify-then-decide pattern)
+                self.verifiers.insert(full_key.clone(), query.clone());
+
                 Err(QueryError::UserError(err))
             }
             Err(e) => {
@@ -506,20 +566,6 @@ impl QueryRuntime {
                 Err(e)
             }
         }
-    }
-
-    /// Get cached result (Ok or UserError) if it's still valid.
-    fn get_cached_if_valid<Q: Query>(
-        &self,
-        full_key: &FullCacheKey,
-    ) -> Option<CachedValue<Arc<Q::Output>>> {
-        // Check whale validity first
-        if !self.whale.is_valid(full_key) {
-            return None;
-        }
-
-        // Then check if we have the cached value
-        self.cache.get_cached::<Q>(full_key)
     }
 
     /// Invalidate a query, forcing recomputation on next access.
@@ -619,6 +665,7 @@ impl QueryRuntimeBuilder {
             pending: Arc::new(PendingStorage::new()),
             query_registry: Arc::new(QueryRegistry::new()),
             asset_key_registry: Arc::new(AssetKeyRegistry::new()),
+            verifiers: Arc::new(VerifierStorage::new()),
             error_comparator: self.error_comparator,
             #[cfg(feature = "inspector")]
             sink: Arc::new(parking_lot::RwLock::new(None)),

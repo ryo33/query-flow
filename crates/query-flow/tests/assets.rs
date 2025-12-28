@@ -17,6 +17,7 @@ macro_rules! thread_local_counter {
 }
 
 /// Helper trait for thread-local counters.
+#[allow(dead_code)]
 trait Counter {
     fn reset(&'static self);
     fn inc(&'static self);

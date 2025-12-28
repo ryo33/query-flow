@@ -56,6 +56,23 @@ theorem List.foldl_preserves_some {α β γ : Type*} {f : (α → Option β) →
     obtain ⟨n', hn'⟩ := h_step ns hd n h_init
     exact ih (ns := f ns hd) (n := n') hn'
 
+/-- Foldl preserves "some" with a transitive property between consecutive values -/
+theorem List.foldl_preserves_some_prop {α β γ : Type*}
+    {f : (α → Option β) → γ → (α → Option β)} {P : β → β → Prop}
+    (key : α) (ns : α → Option β) (l : List γ) (n : β)
+    (h_init : ns key = some n)
+    (h_step : ∀ ns' d n', ns' key = some n' → ∃ n'', (f ns' d) key = some n'' ∧ P n' n'')
+    (h_trans : ∀ a b c, P a b → P b c → P a c)
+    (h_refl : ∀ x, P x x) :
+    ∃ n', (l.foldl f ns) key = some n' ∧ P n n' := by
+  induction l generalizing ns n with
+  | nil => exact ⟨n, h_init, h_refl n⟩
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    obtain ⟨n', hn', hp'⟩ := h_step ns hd n h_init
+    obtain ⟨n'', hn'', hp''⟩ := ih (f ns hd) n' hn'
+    exact ⟨n'', hn'', h_trans n n' n'' hp' hp''⟩
+
 /-! ## Foldl with Equality Preservation -/
 
 /-- Foldl preserves a projection's value when each step preserves it -/

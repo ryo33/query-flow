@@ -1109,17 +1109,12 @@ lemma foldl_updateGraphEdgesStep_preserves_dependents_subset {N : Nat} (qid targ
     (hn : ns target = some n) :
     ∃ n', deps.foldl (updateGraphEdgesStep qid) ns target = some n' ∧
       ∀ x, x ∈ n.dependents → x ∈ n'.dependents := by
-  induction deps generalizing ns n with
-  | nil => exact ⟨n, hn, by intro x hx; exact hx⟩
-  | cons hd tl ih =>
-    simp only [List.foldl_cons]
-    have hpres := updateGraphEdgesStep_preserves_dependents_subset qid target ns hd n hn
-    rcases hpres with ⟨n', hn', hsubset⟩
-    have hrest := ih (updateGraphEdgesStep qid ns hd) n' hn'
-    rcases hrest with ⟨n'', hn'', hsubset'⟩
-    refine ⟨n'', hn'', ?_⟩
-    intro x hx
-    exact hsubset' x (hsubset x hx)
+  apply List.foldl_preserves_some_prop (P := fun a b => ∀ x, x ∈ a.dependents → x ∈ b.dependents)
+    target ns deps n hn
+  · intro ns' d n' hn'
+    exact updateGraphEdgesStep_preserves_dependents_subset qid target ns' d n' hn'
+  · intro a b c hab hbc x hx; exact hbc x (hab x hx)
+  · intro _ x hx; exact hx
 
 /-- updateGraphEdges preserves all existing dependents (subset) at any node -/
 lemma updateGraphEdges_preserves_dependents_subset {N : Nat} (qid target : QueryId)
@@ -1160,19 +1155,12 @@ lemma updateGraphEdges_preserves_dependencies {N : Nat} (qid target : QueryId)
     (hn : ns target = some n) :
     ∃ n', updateGraphEdges ns qid deps target = some n' ∧ n'.dependencies = n.dependencies := by
   rw [updateGraphEdges_eq]
-  -- foldl induction
-  induction deps generalizing ns n with
-  | nil =>
-    simp only [List.foldl]
-    exact ⟨n, hn, rfl⟩
-  | cons hd tl ih =>
-    simp only [List.foldl_cons]
-    have hstep := updateGraphEdgesStep_preserves_dependencies (qid := qid) (target := target) (ns := ns) (d := hd) n hn
-    rcases hstep with ⟨n1, hn1, hdeps1⟩
-    have hrest := ih (ns := updateGraphEdgesStep qid ns hd) (n := n1) hn1
-    rcases hrest with ⟨n2, hn2, hdeps2⟩
-    refine ⟨n2, hn2, ?_⟩
-    simpa [hdeps1] using hdeps2
+  apply List.foldl_preserves_some_prop (P := fun a b => b.dependencies = a.dependencies)
+    target ns deps n hn
+  · intro ns' d n' hn'
+    exact updateGraphEdgesStep_preserves_dependencies qid target ns' d n' hn'
+  · intro a b c hab hbc; exact hbc.trans hab
+  · intro _; rfl
 
 /-- updateGraphEdges never creates a node: if the result is `some`, the input was `some`. -/
 lemma updateGraphEdges_some_implies_some {N : Nat} (qid target : QueryId)
@@ -1236,19 +1224,12 @@ lemma foldl_updateGraphEdgesStep_preserves_changedAt {N : Nat} (qid target : Que
     (ns : QueryId → Option (Node N)) (deps : List Dep) (n : Node N)
     (hn : ns target = some n) :
     ∃ n', deps.foldl (updateGraphEdgesStep qid) ns target = some n' ∧ n'.changedAt = n.changedAt := by
-  induction deps generalizing ns n with
-  | nil => exact ⟨n, hn, rfl⟩
-  | cons hd tl ih =>
-    simp only [List.foldl_cons]
-    have hpres := updateGraphEdgesStep_preserves_changedAt qid target ns hd n hn
-    obtain ⟨n', hn', hchg'⟩ := hpres
-    have hrec := ih (updateGraphEdgesStep qid ns hd) n' hn'
-    obtain ⟨n'', hn'', hchg''⟩ := hrec
-    refine ⟨n'', hn'', ?_⟩
-    -- changedAt is preserved through each step
-    calc
-      n''.changedAt = n'.changedAt := hchg''
-      _ = n.changedAt := hchg'
+  apply List.foldl_preserves_some_prop (P := fun a b => b.changedAt = a.changedAt)
+    target ns deps n hn
+  · intro ns' d n' hn'
+    exact updateGraphEdgesStep_preserves_changedAt qid target ns' d n' hn'
+  · intro a b c hab hbc; exact hbc.trans hab
+  · intro _; rfl
 
 /-- updateGraphEdges adds qid to each dependency's dependents list -/
 theorem updateGraphEdges_adds_dependent {N : Nat} (nodes : QueryId → Option (Node N))

@@ -411,3 +411,59 @@ fn test_no_locator_pending() {
     let pending = runtime.pending_assets_of::<ConfigFile>();
     assert_eq!(pending.len(), 1);
 }
+
+// ============================================================================
+// get_asset Tests (direct asset access without dependency tracking)
+// ============================================================================
+
+#[test]
+fn test_get_asset_ready() {
+    let runtime = QueryRuntime::new();
+    runtime.resolve_asset(ConfigFile("app.json".to_string()), "content".to_string());
+
+    let result = runtime.get_asset(&ConfigFile("app.json".to_string()));
+    assert!(result.is_ok());
+    let state = result.unwrap();
+    assert!(state.is_ready());
+    assert_eq!(**state.get().unwrap(), "content".to_string());
+}
+
+#[test]
+fn test_get_asset_loading_no_locator() {
+    let runtime = QueryRuntime::new();
+    // No asset resolved, no locator registered
+
+    let result = runtime.get_asset(&ConfigFile("missing.json".to_string()));
+    assert!(result.is_ok());
+    let state = result.unwrap();
+    assert!(state.is_loading());
+
+    // Should be added to pending
+    assert!(runtime.has_pending_assets());
+    let pending = runtime.pending_assets_of::<ConfigFile>();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, "missing.json");
+}
+
+#[test]
+fn test_get_asset_immediate_locator() {
+    let runtime = QueryRuntime::new();
+    runtime.register_asset_locator::<ConfigFile, _>(ImmediateLocator {
+        content: "from_locator".to_string(),
+    });
+
+    let result = runtime.get_asset(&ConfigFile("any.json".to_string()));
+    assert!(result.is_ok());
+    let state = result.unwrap();
+    assert!(state.is_ready());
+    assert_eq!(**state.get().unwrap(), "from_locator".to_string());
+}
+
+#[test]
+fn test_get_asset_not_found() {
+    let runtime = QueryRuntime::new();
+    runtime.register_asset_locator::<ConfigFile, _>(NotFoundLocator);
+
+    let result = runtime.get_asset(&ConfigFile("missing.json".to_string()));
+    assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
+}

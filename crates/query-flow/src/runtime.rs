@@ -890,6 +890,24 @@ impl QueryRuntime {
         }
     }
 
+    /// Get an asset by key without tracking dependencies.
+    ///
+    /// Unlike `QueryContext::asset()`, this method does NOT register the caller
+    /// as a dependent of the asset. Use this for direct asset access outside
+    /// of query execution.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(LoadingState::Ready(value))` - Asset is loaded and ready
+    /// - `Ok(LoadingState::Loading)` - Asset is still loading (added to pending)
+    /// - `Err(QueryError::MissingDependency)` - Asset was not found
+    pub fn get_asset<K: AssetKey>(
+        &self,
+        key: &K,
+    ) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
+        self.get_asset_internal(key)
+    }
+
     /// Internal: Get asset state, checking cache and locator.
     fn get_asset_internal<K: AssetKey>(
         &self,

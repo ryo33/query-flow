@@ -1,11 +1,39 @@
 //! Tests for the assets system.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::cell::Cell;
 
 use query_flow::{
     asset_key, query, AssetKey, AssetLocator, DurabilityLevel, LoadingState, LocateResult,
     QueryError, QueryRuntime,
 };
+
+/// Thread-local counter helper to avoid test interference in parallel execution.
+macro_rules! thread_local_counter {
+    ($name:ident) => {
+        thread_local! {
+            static $name: Cell<u32> = const { Cell::new(0) };
+        }
+    };
+}
+
+/// Helper trait for thread-local counters.
+trait Counter {
+    fn reset(&'static self);
+    fn inc(&'static self);
+    fn get(&'static self) -> u32;
+}
+
+impl Counter for std::thread::LocalKey<Cell<u32>> {
+    fn reset(&'static self) {
+        self.with(|c| c.set(0));
+    }
+    fn inc(&'static self) {
+        self.with(|c| c.set(c.get() + 1));
+    }
+    fn get(&'static self) -> u32 {
+        self.with(|c| c.get())
+    }
+}
 
 // ============================================================================
 // Test Asset Keys
@@ -201,12 +229,12 @@ fn test_invalidate_asset() {
 
 #[test]
 fn test_asset_caching() {
-    static LOCATOR_CALLS: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(LOCATOR_CALLS);
 
     struct CountingLocator;
     impl AssetLocator<ConfigFile> for CountingLocator {
         fn locate(&self, _key: &ConfigFile) -> LocateResult<String> {
-            LOCATOR_CALLS.fetch_add(1, Ordering::SeqCst);
+            LOCATOR_CALLS.inc();
             LocateResult::Ready("cached".to_string())
         }
     }
@@ -221,40 +249,40 @@ fn test_asset_caching() {
     }
 
     // First query triggers locator
-    LOCATOR_CALLS.store(0, Ordering::SeqCst);
+    LOCATOR_CALLS.reset();
     let _ = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
-    assert_eq!(LOCATOR_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(LOCATOR_CALLS.get(), 1);
 
     // Second query should use cache, not call locator again
     let _ = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
-    assert_eq!(LOCATOR_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(LOCATOR_CALLS.get(), 1);
 }
 
 #[test]
 fn test_asset_dependency_tracking() {
-    static QUERY_CALLS: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(QUERY_CALLS);
 
     let runtime = QueryRuntime::new();
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
 
     #[query]
     fn process_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        QUERY_CALLS.fetch_add(1, Ordering::SeqCst);
+        QUERY_CALLS.inc();
         let content = ctx.asset(path)?.suspend()?;
         Ok(format!("processed: {}", content))
     }
 
-    QUERY_CALLS.store(0, Ordering::SeqCst);
+    QUERY_CALLS.reset();
 
     // First query
     let result = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
     assert_eq!(*result.unwrap(), "processed: v1");
-    assert_eq!(QUERY_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(QUERY_CALLS.get(), 1);
 
     // Second query - should be cached
     let result = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
     assert_eq!(*result.unwrap(), "processed: v1");
-    assert_eq!(QUERY_CALLS.load(Ordering::SeqCst), 1); // Still 1
+    assert_eq!(QUERY_CALLS.get(), 1); // Still 1
 
     // Update asset - should invalidate dependent query
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v2".to_string());
@@ -262,35 +290,35 @@ fn test_asset_dependency_tracking() {
     // Query should recompute
     let result = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
     assert_eq!(*result.unwrap(), "processed: v2");
-    assert_eq!(QUERY_CALLS.load(Ordering::SeqCst), 2); // Now 2
+    assert_eq!(QUERY_CALLS.get(), 2); // Now 2
 }
 
 #[test]
 fn test_asset_early_cutoff() {
-    static DOWNSTREAM_CALLS: AtomicU32 = AtomicU32::new(0);
+    thread_local_counter!(DOWNSTREAM_CALLS);
 
     let runtime = QueryRuntime::new();
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "same_value".to_string());
 
     #[query]
     fn process_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        DOWNSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
+        DOWNSTREAM_CALLS.inc();
         let content = ctx.asset(path)?.suspend()?;
         Ok(format!("processed: {}", content))
     }
 
-    DOWNSTREAM_CALLS.store(0, Ordering::SeqCst);
+    DOWNSTREAM_CALLS.reset();
 
     // First query
     let _ = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
-    assert_eq!(DOWNSTREAM_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(DOWNSTREAM_CALLS.get(), 1);
 
     // Resolve with same value - should not trigger recomputation
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "same_value".to_string());
 
     let _ = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
     // Early cutoff: same value means no recomputation needed
-    assert_eq!(DOWNSTREAM_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(DOWNSTREAM_CALLS.get(), 1);
 }
 
 #[test]

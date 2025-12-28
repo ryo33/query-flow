@@ -339,8 +339,10 @@ fn generate_query_impl(
     };
 
     // Generate cache_key() body
+    // Note: For 0 params, we use an empty block which evaluates to ()
+    // to avoid clippy::unused_unit warning
     let cache_key_body = match key_params.len() {
-        0 => quote! { () },
+        0 => quote! {},
         1 => {
             let name = &key_params[0].name;
             quote! { self.#name.clone() }
@@ -517,6 +519,58 @@ mod tests {
                     let b = &self.b;
                     {
                         Ok(a + b)
+                    }
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_no_params() {
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn no_params(ctx: &mut QueryContext) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            #[derive(Clone, Debug)]
+            struct NoParams {
+            }
+
+            impl NoParams {
+                #[doc = r" Create a new query instance."]
+                fn new() -> Self {
+                    Self {}
+                }
+            }
+
+            impl ::std::default::Default for NoParams {
+                fn default() -> Self {
+                    Self::new()
+                }
+            }
+
+            impl ::query_flow::Query for NoParams {
+                type CacheKey = ();
+                type Output = i32;
+
+                fn cache_key(&self) -> Self::CacheKey {
+                    // Empty body - evaluates to () without explicit unit expression
+                }
+
+                fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                    {
+                        Ok(42)
                     }
                 }
 

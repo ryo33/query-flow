@@ -478,12 +478,10 @@ fn test_error_display() {
 
 #[test]
 fn test_error_source() {
-    use std::error::Error;
-
     // Create an error chain using anyhow context
     let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "original error");
     let anyhow_err = anyhow::Error::from(io_err).context("wrapped error");
-    let query_err: QueryError = anyhow_err.into();
+    let _query_err: QueryError = anyhow_err.into();
 
     // QueryError::UserError with context should have a source
     // let source = query_err.source();

@@ -415,6 +415,9 @@ impl QueryRuntime {
                         .register(sentinel, (), Durability::volatile(), vec![]);
                 }
 
+                // Store verifier for this query (for verify-then-decide pattern)
+                self.verifiers.insert(full_key.clone(), query.clone());
+
                 Ok((output, output_changed))
             }
             Err(QueryError::UserError(err)) => {
@@ -455,6 +458,9 @@ impl QueryRuntime {
                         .whale
                         .register(sentinel, (), Durability::volatile(), vec![]);
                 }
+
+                // Store verifier for this query (for verify-then-decide pattern)
+                self.verifiers.insert(full_key.clone(), query.clone());
 
                 Err(QueryError::UserError(err))
             }

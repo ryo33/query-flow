@@ -129,8 +129,12 @@ where
     /// Returns None if the node doesn't exist.
     /// Used by query-flow to verify dependencies before deciding to recompute.
     pub fn get_dependency_ids(&self, qid: &K) -> Option<Vec<K>> {
-        self.get(qid)
-            .map(|node| node.dependencies.iter().map(|d| d.query_id.clone()).collect())
+        self.get(qid).map(|node| {
+            node.dependencies
+                .iter()
+                .map(|d| d.query_id.clone())
+                .collect()
+        })
     }
 
     /// Check if a node has been verified at the given revision.

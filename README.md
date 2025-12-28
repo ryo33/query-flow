@@ -109,24 +109,38 @@ impl Query for Add {
 
 ## Error Handling
 
-query-flow distinguishes between **system errors** and **user errors**:
+query-flow supports both **system errors** and **user errors** through `QueryError`:
 
-- **System errors** (`QueryError`): Suspend, Cycle, Cancelled, MissingDependency
-- **User errors**: Wrapped in the query output type
+- **System errors**: `Suspend`, `Cycle`, `Cancelled`, `MissingDependency`
+- **User errors**: `UserError(Arc<anyhow::Error>)` - cached like successful results
 
 ```rust
-// Fallible query - user errors in Output
+// User errors with ? operator - errors are automatically converted
 #[query]
-fn parse_int(ctx: &mut QueryContext, input: String) -> Result<Result<i32, ParseIntError>, QueryError> {
-    Ok(input.parse())  // Returns Ok(Ok(42)) or Ok(Err(parse_error))
+fn parse_int(ctx: &mut QueryContext, input: String) -> Result<i32, QueryError> {
+    let num: i32 = input.parse()?;  // ParseIntError -> QueryError::UserError
+    Ok(num)
 }
 
 // System errors propagate automatically
 #[query]
 fn process(ctx: &mut QueryContext, id: u64) -> Result<Output, QueryError> {
-    let data = ctx.query(FetchData::new(id))?;  // Propagates Suspend, Cycle, etc.
+    let data = ctx.query(FetchData::new(id))?;  // Propagates Suspend, Cycle, UserError, etc.
     Ok(transform(*data))
 }
+```
+
+### Error Comparator for Early Cutoff
+
+By default, all `UserError` values are considered different (conservative). Use `QueryRuntimeBuilder` to customize:
+
+```rust
+let runtime = QueryRuntime::builder()
+    .error_comparator(|a, b| {
+        // Treat errors as equal if they have the same message
+        a.to_string() == b.to_string()
+    })
+    .build();
 ```
 
 ## Assets: External Inputs

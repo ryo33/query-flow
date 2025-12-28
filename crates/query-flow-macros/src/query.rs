@@ -339,8 +339,10 @@ fn generate_query_impl(
     };
 
     // Generate cache_key() body
+    // Note: For 0 params, we use an empty block which evaluates to ()
+    // to avoid clippy::unused_unit warning
     let cache_key_body = match key_params.len() {
-        0 => quote! { () },
+        0 => quote! {},
         1 => {
             let name = &key_params[0].name;
             quote! { self.#name.clone() }

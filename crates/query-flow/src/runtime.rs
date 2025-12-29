@@ -108,8 +108,8 @@ pub struct Polled<T> {
     pub revision: RevisionCounter,
 }
 
-impl<T> Deref for Polled<T> {
-    type Target = T;
+impl<T: Deref> Deref for Polled<T> {
+    type Target = T::Target;
 
     fn deref(&self) -> &Self::Target {
         &self.value
@@ -1610,8 +1610,9 @@ mod tests {
 
             let result = runtime.poll(Counter { id: 1 }).unwrap();
 
-            // Value should be correct
-            assert_eq!(**result, 10);
+            // Value should be correct (Deref goes through Arc)
+            assert_eq!(*result, 10);
+            // Access Arc directly via field
             assert_eq!(*result.value, 10);
 
             // Revision should be non-zero after first execution
@@ -1650,7 +1651,7 @@ mod tests {
             // Revision should increase (value was recomputed)
             // Note: Since output_eq returns true (same value), this might not change
             // depending on early cutoff behavior. Let's verify the value is still correct.
-            assert_eq!(**result2, 10);
+            assert_eq!(*result2, 10);
 
             // With early cutoff, revision might stay the same if value didn't change
             // This is expected behavior
@@ -1697,12 +1698,13 @@ mod tests {
 
             let result = runtime.poll(Counter { id: 5 }).unwrap();
 
-            // Test Deref - should be able to use * to get the inner value
-            let value: &Arc<i32> = &*result;
-            assert_eq!(**value, 50);
+            // Test Deref - goes through Arc to get the inner value directly
+            let value: &i32 = &*result;
+            assert_eq!(*value, 50);
 
-            // Can also access fields directly
-            assert_eq!(*result.value, 50);
+            // Access Arc directly via field
+            let arc: &Arc<i32> = &result.value;
+            assert_eq!(**arc, 50);
         }
 
         #[test]

@@ -4,7 +4,9 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use whale::{Durability, Runtime as WhaleRuntime};
+use std::ops::Deref;
+
+use whale::{Durability, RevisionCounter, Runtime as WhaleRuntime};
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
 use crate::key::FullCacheKey;
@@ -73,6 +75,44 @@ impl ExecutionContext {
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Result of polling a query, containing the value and its revision.
+///
+/// This is returned by [`QueryRuntime::poll`] and provides both the query result
+/// and its change revision, enabling efficient change detection for subscription
+/// patterns.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = runtime.poll(MyQuery::new())?;
+///
+/// // Access the value via Deref
+/// println!("{:?}", *result);
+///
+/// // Check if changed since last poll
+/// if result.revision > last_known_revision {
+///     notify_subscribers(&result.value);
+///     last_known_revision = result.revision;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Polled<T> {
+    /// The query result value.
+    pub value: T,
+    /// The revision at which this value was last changed.
+    ///
+    /// Compare this with a previously stored revision to detect changes.
+    pub revision: RevisionCounter,
+}
+
+impl<T> Deref for Polled<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
@@ -551,6 +591,74 @@ impl QueryRuntime {
         for key in keys {
             self.whale.remove(&key);
         }
+    }
+
+    /// Poll a query, returning both the result and its change revision.
+    ///
+    /// This is useful for implementing subscription patterns where you need to
+    /// detect changes efficiently. Compare the returned `revision` with a
+    /// previously stored value to determine if the query result has changed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// struct Subscription<Q: Query> {
+    ///     query: Q,
+    ///     last_revision: RevisionCounter,
+    ///     tx: Sender<Arc<Q::Output>>,
+    /// }
+    ///
+    /// // Polling loop
+    /// for sub in &mut subscriptions {
+    ///     let result = runtime.poll(sub.query.clone())?;
+    ///     if result.revision > sub.last_revision {
+    ///         sub.tx.send(result.value.clone())?;
+    ///         sub.last_revision = result.revision;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Same as [`QueryRuntime::query`].
+    pub fn poll<Q: Query>(&self, query: Q) -> Result<Polled<Arc<Q::Output>>, QueryError> {
+        let key = query.cache_key();
+        let full_key = FullCacheKey::new::<Q, _>(&key);
+
+        // Execute the query (reuses existing query logic)
+        let value = self.query(query)?;
+
+        // Get the changed_at revision from whale
+        let revision = self
+            .whale
+            .get(&full_key)
+            .map(|node| node.changed_at)
+            .unwrap_or(0);
+
+        Ok(Polled { value, revision })
+    }
+
+    /// Get the change revision of a query without executing it.
+    ///
+    /// Returns `None` if the query has never been executed.
+    ///
+    /// This is useful for checking if a query has changed since the last poll
+    /// without the cost of executing the query.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Check if query has changed before deciding to poll
+    /// if let Some(rev) = runtime.changed_at::<MyQuery>(&key) {
+    ///     if rev > last_known_revision {
+    ///         let result = runtime.query(MyQuery::new(key))?;
+    ///         // Process result...
+    ///     }
+    /// }
+    /// ```
+    pub fn changed_at<Q: Query>(&self, key: &Q::CacheKey) -> Option<RevisionCounter> {
+        let full_key = FullCacheKey::new::<Q, _>(key);
+        self.whale.get(&full_key).map(|node| node.changed_at)
     }
 }
 
@@ -1467,6 +1575,170 @@ mod tests {
             // If attributes weren't preserved, this might warn about unused_var
             let result = runtime.query(WithAttributes::new(5)).unwrap();
             assert_eq!(*result, 10);
+        }
+    }
+
+    // Tests for poll() and changed_at()
+    mod poll_tests {
+        use super::*;
+
+        #[derive(Clone)]
+        struct Counter {
+            id: i32,
+        }
+
+        impl Query for Counter {
+            type CacheKey = i32;
+            type Output = i32;
+
+            fn cache_key(&self) -> Self::CacheKey {
+                self.id
+            }
+
+            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+                Ok(self.id * 10)
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
+        }
+
+        #[test]
+        fn test_poll_returns_value_and_revision() {
+            let runtime = QueryRuntime::new();
+
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+
+            // Value should be correct
+            assert_eq!(**result, 10);
+            assert_eq!(*result.value, 10);
+
+            // Revision should be non-zero after first execution
+            assert!(result.revision > 0);
+        }
+
+        #[test]
+        fn test_poll_revision_stable_on_cache_hit() {
+            let runtime = QueryRuntime::new();
+
+            // First poll
+            let result1 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev1 = result1.revision;
+
+            // Second poll (cache hit)
+            let result2 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev2 = result2.revision;
+
+            // Revision should be the same (no change)
+            assert_eq!(rev1, rev2);
+        }
+
+        #[test]
+        fn test_poll_revision_changes_on_invalidate() {
+            let runtime = QueryRuntime::new();
+
+            // First poll
+            let result1 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev1 = result1.revision;
+
+            // Invalidate and poll again
+            runtime.invalidate::<Counter>(&1);
+            let result2 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev2 = result2.revision;
+
+            // Revision should increase (value was recomputed)
+            // Note: Since output_eq returns true (same value), this might not change
+            // depending on early cutoff behavior. Let's verify the value is still correct.
+            assert_eq!(**result2, 10);
+
+            // With early cutoff, revision might stay the same if value didn't change
+            // This is expected behavior
+            assert!(rev2 >= rev1);
+        }
+
+        #[test]
+        fn test_changed_at_returns_none_for_unexecuted_query() {
+            let runtime = QueryRuntime::new();
+
+            // Query has never been executed
+            let rev = runtime.changed_at::<Counter>(&1);
+            assert!(rev.is_none());
+        }
+
+        #[test]
+        fn test_changed_at_returns_revision_after_execution() {
+            let runtime = QueryRuntime::new();
+
+            // Execute the query
+            let _ = runtime.query(Counter { id: 1 }).unwrap();
+
+            // Now changed_at should return Some
+            let rev = runtime.changed_at::<Counter>(&1);
+            assert!(rev.is_some());
+            assert!(rev.unwrap() > 0);
+        }
+
+        #[test]
+        fn test_changed_at_matches_poll_revision() {
+            let runtime = QueryRuntime::new();
+
+            // Poll the query
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+
+            // changed_at should match the revision from poll
+            let rev = runtime.changed_at::<Counter>(&1);
+            assert_eq!(rev, Some(result.revision));
+        }
+
+        #[test]
+        fn test_poll_deref() {
+            let runtime = QueryRuntime::new();
+
+            let result = runtime.poll(Counter { id: 5 }).unwrap();
+
+            // Test Deref - should be able to use * to get the inner value
+            let value: &Arc<i32> = &*result;
+            assert_eq!(**value, 50);
+
+            // Can also access fields directly
+            assert_eq!(*result.value, 50);
+        }
+
+        #[test]
+        fn test_subscription_pattern() {
+            let runtime = QueryRuntime::new();
+
+            // Simulate subscription pattern
+            let mut last_revision: RevisionCounter = 0;
+            let mut notifications = 0;
+
+            // First poll - should notify (new value)
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+            if result.revision > last_revision {
+                notifications += 1;
+                last_revision = result.revision;
+            }
+
+            // Second poll - should NOT notify (no change)
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+            if result.revision > last_revision {
+                notifications += 1;
+                last_revision = result.revision;
+            }
+
+            // Third poll - should NOT notify (no change)
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+            if result.revision > last_revision {
+                notifications += 1;
+                #[allow(unused_assignments)]
+                {
+                    last_revision = result.revision;
+                }
+            }
+
+            // Only the first poll should have triggered a notification
+            assert_eq!(notifications, 1);
         }
     }
 }

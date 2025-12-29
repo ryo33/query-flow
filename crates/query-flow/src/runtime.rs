@@ -263,6 +263,16 @@ impl QueryRuntime {
     /// - `QueryError::Suspend` - Query is waiting for async loading
     /// - `QueryError::Cycle` - Dependency cycle detected
     pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+        self.query_internal(query).map(|(output, _)| output)
+    }
+
+    /// Internal implementation shared by query() and poll().
+    ///
+    /// Returns (output, revision) tuple.
+    fn query_internal<Q: Query>(
+        &self,
+        query: Q,
+    ) -> Result<(Arc<Q::Output>, RevisionCounter), QueryError> {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
@@ -320,6 +330,13 @@ impl QueryRuntime {
         // Fast path: already verified at current revision
         if self.whale.is_verified_at(&full_key, &current_rev) {
             if let Some(cached) = self.get_cached::<Q>(&full_key) {
+                // Get revision while we have the cache hit (atomic with value)
+                let revision = self
+                    .whale
+                    .get(&full_key)
+                    .map(|n| n.changed_at)
+                    .unwrap_or(0);
+
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::CacheCheck {
                     span_id: exec_ctx.span_id(),
@@ -336,7 +353,7 @@ impl QueryRuntime {
                 });
 
                 return match cached {
-                    CachedValue::Ok(output) => Ok(output),
+                    CachedValue::Ok(output) => Ok((output, revision)),
                     CachedValue::UserError(err) => Err(QueryError::UserError(err)),
                 };
             }
@@ -364,6 +381,13 @@ impl QueryRuntime {
                     // Deps didn't change their changed_at, mark as verified and use cached
                     self.whale.mark_verified(&full_key, &current_rev);
 
+                    // Get revision while we have the cache hit (atomic with value)
+                    let revision = self
+                        .whale
+                        .get(&full_key)
+                        .map(|n| n.changed_at)
+                        .unwrap_or(0);
+
                     #[cfg(feature = "inspector")]
                     self.emit(|| FlowEvent::CacheCheck {
                         span_id: exec_ctx.span_id(),
@@ -380,7 +404,7 @@ impl QueryRuntime {
                     });
 
                     return match cached {
-                        CachedValue::Ok(output) => Ok(output),
+                        CachedValue::Ok(output) => Ok((output, revision)),
                         CachedValue::UserError(err) => Err(QueryError::UserError(err)),
                     };
                 }
@@ -410,8 +434,8 @@ impl QueryRuntime {
         #[cfg(feature = "inspector")]
         {
             let exec_result = match &result {
-                Ok((_, true)) => query_flow_inspector::ExecutionResult::Changed,
-                Ok((_, false)) => query_flow_inspector::ExecutionResult::Unchanged,
+                Ok((_, true, _)) => query_flow_inspector::ExecutionResult::Changed,
+                Ok((_, false, _)) => query_flow_inspector::ExecutionResult::Unchanged,
                 Err(QueryError::Suspend) => query_flow_inspector::ExecutionResult::Suspended,
                 Err(QueryError::Cycle { .. }) => {
                     query_flow_inspector::ExecutionResult::CycleDetected
@@ -428,18 +452,18 @@ impl QueryRuntime {
             });
         }
 
-        result.map(|(output, _)| output)
+        result.map(|(output, _, revision)| (output, revision))
     }
 
     /// Execute a query, caching the result if appropriate.
     ///
-    /// Returns (output, output_changed) tuple for instrumentation.
+    /// Returns (output, output_changed, revision) tuple for instrumentation.
     fn execute_query<Q: Query>(
         &self,
         query: &Q,
         full_key: &FullCacheKey,
         exec_ctx: ExecutionContext,
-    ) -> Result<(Arc<Q::Output>, bool), QueryError> {
+    ) -> Result<(Arc<Q::Output>, bool, RevisionCounter), QueryError> {
         // Create context for this query execution
         let mut ctx = QueryContext {
             runtime: self,
@@ -509,7 +533,14 @@ impl QueryRuntime {
                 // Store verifier for this query (for verify-then-decide pattern)
                 self.verifiers.insert(full_key.clone(), query.clone());
 
-                Ok((output, output_changed))
+                // Get revision immediately after registration (minimizes race window)
+                let revision = self
+                    .whale
+                    .get(full_key)
+                    .map(|n| n.changed_at)
+                    .unwrap_or(0);
+
+                Ok((output, output_changed, revision))
             }
             Err(QueryError::UserError(err)) => {
                 // Check if error changed (for early cutoff)
@@ -622,19 +653,7 @@ impl QueryRuntime {
     ///
     /// Same as [`QueryRuntime::query`].
     pub fn poll<Q: Query>(&self, query: Q) -> Result<Polled<Arc<Q::Output>>, QueryError> {
-        let key = query.cache_key();
-        let full_key = FullCacheKey::new::<Q, _>(&key);
-
-        // Execute the query (reuses existing query logic)
-        let value = self.query(query)?;
-
-        // Get the changed_at revision from whale
-        let revision = self
-            .whale
-            .get(&full_key)
-            .map(|node| node.changed_at)
-            .unwrap_or(0);
-
+        let (value, revision) = self.query_internal(query)?;
         Ok(Polled { value, revision })
     }
 

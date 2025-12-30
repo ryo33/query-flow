@@ -549,18 +549,19 @@ impl QueryRuntime {
             }
             Err(QueryError::UserError(err)) => {
                 // Check if error changed (for early cutoff)
-                // Also get the existing revision atomically for confirm_unchanged case
-                let (output_changed, existing_revision) =
-                    if let Some((CachedValue::UserError(old_err), rev)) =
-                        self.get_cached_with_revision::<Q>(full_key)
-                    {
-                        (
-                            !(self.error_comparator)(old_err.as_ref(), err.as_ref()),
-                            rev,
-                        )
+                // existing_revision is Some only when error is unchanged (can reuse revision)
+                let existing_revision = if let Some((CachedValue::UserError(old_err), rev)) =
+                    self.get_cached_with_revision::<Q>(full_key)
+                {
+                    if (self.error_comparator)(old_err.as_ref(), err.as_ref()) {
+                        Some(rev) // Same error - reuse revision
                     } else {
-                        (true, 0) // No previous error or was Ok, so "changed"
-                    };
+                        None // Different error
+                    }
+                } else {
+                    None // No previous UserError
+                };
+                let output_changed = existing_revision.is_none();
 
                 // Emit early cutoff check event
                 #[cfg(feature = "inspector")]
@@ -575,16 +576,16 @@ impl QueryRuntime {
 
                 // Update whale with cached error (atomic update of value + dependency state)
                 let entry = CachedEntry::UserError(err.clone());
-                let revision = if output_changed {
+                let revision = if let Some(existing_rev) = existing_revision {
+                    // confirm_unchanged doesn't change changed_at, use existing
+                    let _ = self.whale.confirm_unchanged(full_key, deps);
+                    existing_rev
+                } else {
                     // Use new_rev from register result
                     self.whale
                         .register(full_key.clone(), Some(entry), durability, deps)
                         .map(|r| r.new_rev)
                         .unwrap_or(0)
-                } else {
-                    // confirm_unchanged doesn't change changed_at, use existing
-                    let _ = self.whale.confirm_unchanged(full_key, deps);
-                    existing_revision
                 };
 
                 // Register query in registry for list_queries

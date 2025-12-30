@@ -1706,7 +1706,7 @@ mod tests {
             let result = runtime.poll(Counter { id: 5 }).unwrap();
 
             // Test Deref - goes through Arc to get the inner value directly
-            let value: &i32 = &*result;
+            let value: &i32 = &result;
             assert_eq!(*value, 50);
 
             // Access Arc directly via field

@@ -20,7 +20,9 @@ impl Presets {
         FuzzConfig::minimal()
             .with_depth(8)
             .with_asset_count(50)
-            .with_shape(TreeShape::NAry { branching_factor: 3 })
+            .with_shape(TreeShape::NAry {
+                branching_factor: 3,
+            })
             .with_update_cycles(100)
             .with_validation_sample_rate(0.1)
     }
@@ -39,7 +41,9 @@ impl Presets {
         FuzzConfig::minimal()
             .with_depth(4)
             .with_asset_count(256)
-            .with_shape(TreeShape::CompleteNAry { branching_factor: 4 })
+            .with_shape(TreeShape::CompleteNAry {
+                branching_factor: 4,
+            })
             .with_update_cycles(100)
     }
 
@@ -61,7 +65,9 @@ impl Presets {
         FuzzConfig::minimal()
             .with_depth(6)
             .with_asset_count(64)
-            .with_shape(TreeShape::NAry { branching_factor: 4 })
+            .with_shape(TreeShape::NAry {
+                branching_factor: 4,
+            })
             .with_update_bias(UpdateBias::Zipf { s: 1.0 })
             .with_update_cycles(200)
     }
@@ -104,7 +110,9 @@ impl Presets {
         FuzzConfig::minimal()
             .with_depth(6)
             .with_asset_count(64)
-            .with_shape(TreeShape::NAry { branching_factor: 4 })
+            .with_shape(TreeShape::NAry {
+                branching_factor: 4,
+            })
             .with_query_time(TimeDistribution::range_us(10, 1000))
             .with_asset_resolve_time(TimeDistribution::microseconds(100))
             .with_output_size(DataSize::range(64, 1024))

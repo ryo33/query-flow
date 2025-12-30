@@ -401,10 +401,7 @@ mod tests {
         let mut runner2 = FuzzRunner::new(config);
         let result2 = runner2.run();
 
-        assert_eq!(
-            result1.query_successes.len(),
-            result2.query_successes.len()
-        );
+        assert_eq!(result1.query_successes.len(), result2.query_successes.len());
         assert_eq!(result1.update_cycles, result2.update_cycles);
     }
 

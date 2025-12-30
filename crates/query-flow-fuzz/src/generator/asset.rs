@@ -23,7 +23,7 @@ impl AssetKey for SyntheticAssetKey {
 
 impl std::fmt::Display for SyntheticAssetKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Asset({})", self.0.0)
+        write!(f, "Asset({})", self.0 .0)
     }
 }
 
@@ -31,7 +31,12 @@ impl std::fmt::Display for SyntheticAssetKey {
 ///
 /// The data includes the node ID and version for determinism,
 /// followed by random bytes to fill the requested size.
-pub fn generate_asset_data<R: Rng>(node_id: NodeId, size: usize, version: u64, rng: &mut R) -> Vec<u8> {
+pub fn generate_asset_data<R: Rng>(
+    node_id: NodeId,
+    size: usize,
+    version: u64,
+    rng: &mut R,
+) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
 
     // Include node ID and version for determinism
@@ -42,7 +47,9 @@ pub fn generate_asset_data<R: Rng>(node_id: NodeId, size: usize, version: u64, r
     // Use a simple LCG seeded by node_id and version for reproducibility
     let mut seed = (node_id.0 as u64) ^ (version.wrapping_mul(0x9E3779B97F4A7C15));
     while data.len() < size {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         data.push((seed >> 56) as u8);
     }
     data.truncate(size);

@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+default-members = ["crates/whale", "crates/query-flow",  "crates/query-flow-macros", "crates/query-flow-inspector"]
 resolver = "2"
 
 [workspace.package]

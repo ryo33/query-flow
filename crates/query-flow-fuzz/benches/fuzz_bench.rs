@@ -34,10 +34,18 @@ fn bench_tree_shape(c: &mut Criterion) {
     let shapes = [
         ("linked_list", TreeShape::LinkedList, 1),
         ("binary", TreeShape::Binary, 16),
-        ("nary4", TreeShape::NAry { branching_factor: 4 }, 64),
+        (
+            "nary4",
+            TreeShape::NAry {
+                branching_factor: 4,
+            },
+            64,
+        ),
         (
             "complete_nary4",
-            TreeShape::CompleteNAry { branching_factor: 4 },
+            TreeShape::CompleteNAry {
+                branching_factor: 4,
+            },
             64,
         ),
         (
@@ -163,7 +171,10 @@ fn bench_presets(c: &mut Criterion) {
     // Only benchmark quick presets
     let quick_presets = [
         ("quick", Presets::quick()),
-        ("early_cutoff", Presets::early_cutoff().with_update_cycles(20)),
+        (
+            "early_cutoff",
+            Presets::early_cutoff().with_update_cycles(20),
+        ),
     ];
 
     for (name, config) in quick_presets {

@@ -78,16 +78,17 @@ impl DependencyTree {
     /// Compute expected output for all nodes given leaf values.
     ///
     /// Returns a map from node ID to expected output bytes.
-    pub fn compute_expected(&self, leaf_values: &HashMap<NodeId, Vec<u8>>) -> HashMap<NodeId, Vec<u8>> {
+    pub fn compute_expected(
+        &self,
+        leaf_values: &HashMap<NodeId, Vec<u8>>,
+    ) -> HashMap<NodeId, Vec<u8>> {
         let mut outputs: HashMap<NodeId, Vec<u8>> = HashMap::new();
 
         // Process in topological order (leaves first)
         for &node_id in &self.topology_order {
             let node = &self.nodes[&node_id];
             let output: Vec<u8> = match &node.kind {
-                NodeKind::Asset { .. } => {
-                    leaf_values.get(&node_id).cloned().unwrap_or_default()
-                }
+                NodeKind::Asset { .. } => leaf_values.get(&node_id).cloned().unwrap_or_default(),
                 NodeKind::Query | NodeKind::Root => {
                     // Combine dependency outputs with deterministic function
                     let mut combined = Vec::new();
@@ -133,7 +134,9 @@ impl<R: Rng> TreeGenerator<R> {
         match self.config.tree_shape {
             TreeShape::LinkedList => self.generate_linked_list(),
             TreeShape::Binary => self.generate_nary_tree(2, false),
-            TreeShape::NAry { branching_factor } => self.generate_nary_tree(branching_factor, false),
+            TreeShape::NAry { branching_factor } => {
+                self.generate_nary_tree(branching_factor, false)
+            }
             TreeShape::CompleteNAry { branching_factor } => {
                 self.generate_nary_tree(branching_factor, true)
             }
@@ -224,9 +227,7 @@ impl<R: Rng> TreeGenerator<R> {
         // Build tree from leaves up to root
         for depth in (0..self.config.tree_depth - 1).rev() {
             let mut next_level = vec![];
-            let chunks: Vec<_> = current_level
-                .chunks(branching_factor as usize)
-                .collect();
+            let chunks: Vec<_> = current_level.chunks(branching_factor as usize).collect();
 
             for chunk in chunks {
                 let id = self.next_id();

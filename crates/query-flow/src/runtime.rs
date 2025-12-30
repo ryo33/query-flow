@@ -331,11 +331,7 @@ impl QueryRuntime {
         if self.whale.is_verified_at(&full_key, &current_rev) {
             if let Some(cached) = self.get_cached::<Q>(&full_key) {
                 // Get revision while we have the cache hit (atomic with value)
-                let revision = self
-                    .whale
-                    .get(&full_key)
-                    .map(|n| n.changed_at)
-                    .unwrap_or(0);
+                let revision = self.whale.get(&full_key).map(|n| n.changed_at).unwrap_or(0);
 
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::CacheCheck {
@@ -382,11 +378,7 @@ impl QueryRuntime {
                     self.whale.mark_verified(&full_key, &current_rev);
 
                     // Get revision while we have the cache hit (atomic with value)
-                    let revision = self
-                        .whale
-                        .get(&full_key)
-                        .map(|n| n.changed_at)
-                        .unwrap_or(0);
+                    let revision = self.whale.get(&full_key).map(|n| n.changed_at).unwrap_or(0);
 
                     #[cfg(feature = "inspector")]
                     self.emit(|| FlowEvent::CacheCheck {
@@ -534,11 +526,7 @@ impl QueryRuntime {
                 self.verifiers.insert(full_key.clone(), query.clone());
 
                 // Get revision immediately after registration (minimizes race window)
-                let revision = self
-                    .whale
-                    .get(full_key)
-                    .map(|n| n.changed_at)
-                    .unwrap_or(0);
+                let revision = self.whale.get(full_key).map(|n| n.changed_at).unwrap_or(0);
 
                 Ok((output, output_changed, revision))
             }

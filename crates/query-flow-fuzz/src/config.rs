@@ -38,8 +38,15 @@ pub struct FuzzConfig {
     /// Which assets are updated (bias).
     pub update_bias: UpdateBias,
 
+    /// Type of mutation to perform (update, remove, invalidate, etc.).
+    pub mutation_kind: MutationKind,
+
     /// Number of update cycles to run.
     pub update_cycles: u32,
+
+    // === Concurrency ===
+    /// Number of threads for concurrent execution (1 = single-threaded).
+    pub threads: usize,
 
     // === Data size parameters ===
     /// Query output size in bytes.
@@ -86,7 +93,9 @@ impl FuzzConfig {
             asset_resolve_time: TimeDistribution::NOOP,
             assets_per_update: 1..=1,
             update_bias: UpdateBias::Uniform,
+            mutation_kind: MutationKind::Update,
             update_cycles: 10,
+            threads: 1,
             output_size: DataSize::MINIMAL,
             asset_size: DataSize::MINIMAL,
             validation_sample_rate: 1.0,
@@ -149,6 +158,16 @@ impl FuzzConfig {
         self
     }
 
+    pub fn with_mutation_kind(mut self, kind: MutationKind) -> Self {
+        self.mutation_kind = kind;
+        self
+    }
+
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
+    }
+
     pub fn with_output_size(mut self, size: DataSize) -> Self {
         self.output_size = size;
         self
@@ -204,7 +223,9 @@ impl FuzzConfig {
             assets_per_update_min: *self.assets_per_update.start(),
             assets_per_update_max: *self.assets_per_update.end(),
             update_bias: self.update_bias.name().to_string(),
+            mutation_kind: self.mutation_kind.name().to_string(),
             update_cycles: self.update_cycles,
+            threads: self.threads,
             output_size_min: self.output_size.min_bytes,
             output_size_max: self.output_size.max_bytes,
             asset_size_min: self.asset_size.min_bytes,
@@ -264,6 +285,56 @@ pub enum UpdateBias {
 
     /// Round-robin through leaves.
     RoundRobin,
+}
+
+/// Type of mutation operation to perform on assets/queries.
+#[derive(Debug, Clone, Default)]
+pub enum MutationKind {
+    /// Update asset values (resolve_asset).
+    #[default]
+    Update,
+
+    /// Remove assets from cache (remove_asset).
+    /// The next query depending on the removed asset will re-trigger the locator.
+    RemoveAsset,
+
+    /// Invalidate assets (invalidate_asset).
+    /// Queries depending on the asset will suspend until resolved again.
+    InvalidateAsset,
+
+    /// Remove queries from cache (remove_query).
+    /// The query will be recomputed from scratch on next access.
+    RemoveQuery,
+
+    /// Invalidate queries (invalidate).
+    /// The query will be recomputed on next access.
+    InvalidateQuery,
+
+    /// Mixed mutations with configurable probabilities.
+    Mixed {
+        /// Probability of removing an asset (vs updating).
+        remove_asset_prob: f64,
+        /// Probability of invalidating an asset (vs updating/removing).
+        invalidate_asset_prob: f64,
+        /// Probability of removing a query.
+        remove_query_prob: f64,
+        /// Probability of invalidating a query.
+        invalidate_query_prob: f64,
+    },
+}
+
+impl MutationKind {
+    /// Get a short name for this mutation kind.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MutationKind::Update => "update",
+            MutationKind::RemoveAsset => "remove_asset",
+            MutationKind::InvalidateAsset => "invalidate_asset",
+            MutationKind::RemoveQuery => "remove_query",
+            MutationKind::InvalidateQuery => "invalidate_query",
+            MutationKind::Mixed { .. } => "mixed",
+        }
+    }
 }
 
 impl UpdateBias {
@@ -386,7 +457,9 @@ pub struct SerializableConfig {
     pub assets_per_update_min: u32,
     pub assets_per_update_max: u32,
     pub update_bias: String,
+    pub mutation_kind: String,
     pub update_cycles: u32,
+    pub threads: usize,
     pub output_size_min: usize,
     pub output_size_max: usize,
     pub asset_size_min: usize,

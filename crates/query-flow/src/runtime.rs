@@ -649,6 +649,40 @@ impl QueryRuntime {
             .register(full_key, None, Durability::volatile(), vec![]);
     }
 
+    /// Remove a query from the cache entirely, freeing memory.
+    ///
+    /// Use this for GC when a query is no longer needed.
+    /// Unlike `invalidate`, this removes all traces of the query from storage.
+    /// The query will be recomputed from scratch on next access.
+    ///
+    /// This also invalidates any queries that depend on this one.
+    pub fn remove_query<Q: Query>(&self, key: &Q::CacheKey) {
+        let full_key = FullCacheKey::new::<Q, _>(key);
+
+        #[cfg(feature = "inspector")]
+        self.emit(|| FlowEvent::QueryInvalidated {
+            query: query_flow_inspector::QueryKey::new(
+                std::any::type_name::<Q>(),
+                full_key.debug_repr(),
+            ),
+            reason: query_flow_inspector::InvalidationReason::ManualInvalidation,
+        });
+
+        // Remove verifier if exists
+        self.verifiers.remove(&full_key);
+
+        // Remove from whale storage (this also handles dependent invalidation)
+        self.whale.remove(&full_key);
+
+        // Remove from registry and update sentinel for list_queries
+        if self.query_registry.remove::<Q>(key) {
+            let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+            let _ = self
+                .whale
+                .register(sentinel, None, Durability::volatile(), vec![]);
+        }
+    }
+
     /// Clear all cached values by removing all nodes from whale.
     ///
     /// Note: This is a relatively expensive operation as it iterates through all keys.

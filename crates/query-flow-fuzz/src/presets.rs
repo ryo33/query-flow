@@ -1,6 +1,6 @@
 //! Predefined configurations for common test scenarios.
 
-use crate::config::{DataSize, FuzzConfig, TimeDistribution, TreeShape, UpdateBias};
+use crate::config::{DataSize, FuzzConfig, MutationKind, TimeDistribution, TreeShape, UpdateBias};
 
 /// Collection of preset configurations.
 pub struct Presets;
@@ -120,6 +120,69 @@ impl Presets {
             .with_recording(true)
     }
 
+    /// Test with asset removal mutations.
+    pub fn remove_asset() -> FuzzConfig {
+        FuzzConfig::minimal()
+            .with_depth(5)
+            .with_asset_count(32)
+            .with_shape(TreeShape::Binary)
+            .with_mutation_kind(MutationKind::RemoveAsset)
+            .with_update_cycles(50)
+    }
+
+    /// Test with query removal mutations.
+    pub fn remove_query() -> FuzzConfig {
+        FuzzConfig::minimal()
+            .with_depth(5)
+            .with_asset_count(32)
+            .with_shape(TreeShape::Binary)
+            .with_mutation_kind(MutationKind::RemoveQuery)
+            .with_update_cycles(50)
+    }
+
+    /// Test with mixed mutations (update, remove, invalidate).
+    pub fn mixed_mutations() -> FuzzConfig {
+        FuzzConfig::minimal()
+            .with_depth(5)
+            .with_asset_count(32)
+            .with_shape(TreeShape::Binary)
+            .with_mutation_kind(MutationKind::Mixed {
+                remove_asset_prob: 0.1,
+                invalidate_asset_prob: 0.1,
+                remove_query_prob: 0.05,
+                invalidate_query_prob: 0.05,
+            })
+            .with_update_cycles(100)
+    }
+
+    /// Concurrent execution stress test.
+    pub fn concurrent() -> FuzzConfig {
+        FuzzConfig::minimal()
+            .with_depth(5)
+            .with_asset_count(32)
+            .with_shape(TreeShape::Binary)
+            .with_threads(4)
+            .with_update_cycles(50)
+    }
+
+    /// Heavy concurrent execution with mixed mutations.
+    pub fn concurrent_stress() -> FuzzConfig {
+        FuzzConfig::minimal()
+            .with_depth(6)
+            .with_asset_count(64)
+            .with_shape(TreeShape::NAry {
+                branching_factor: 4,
+            })
+            .with_threads(8)
+            .with_mutation_kind(MutationKind::Mixed {
+                remove_asset_prob: 0.1,
+                invalidate_asset_prob: 0.1,
+                remove_query_prob: 0.05,
+                invalidate_query_prob: 0.05,
+            })
+            .with_update_cycles(100)
+    }
+
     /// All presets as a list for iteration.
     pub fn all() -> Vec<(&'static str, FuzzConfig)> {
         vec![
@@ -133,6 +196,11 @@ impl Presets {
             ("random_dag", Self::random_dag()),
             ("batch_updates", Self::batch_updates()),
             ("benchmark_realistic", Self::benchmark_realistic()),
+            ("remove_asset", Self::remove_asset()),
+            ("remove_query", Self::remove_query()),
+            ("mixed_mutations", Self::mixed_mutations()),
+            ("concurrent", Self::concurrent()),
+            ("concurrent_stress", Self::concurrent_stress()),
         ]
     }
 }

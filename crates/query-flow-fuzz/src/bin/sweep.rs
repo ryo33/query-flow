@@ -1,7 +1,9 @@
 //! Parameter sweep binary for fuzzy testing.
 
 use clap::Parser;
-use query_flow_fuzz::{FuzzConfig, FuzzRunner, LogScale, Presets, TreeShape, UpdateBias};
+use query_flow_fuzz::{
+    FuzzConfig, FuzzRunner, LogScale, MutationKind, Presets, TreeShape, UpdateBias,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -35,6 +37,22 @@ struct Args {
     /// Tree shape filter (linked_list, binary, nary, complete_nary, random_dag)
     #[arg(long)]
     shape: Option<String>,
+
+    /// Number of threads for concurrent execution
+    #[arg(long, default_value = "1")]
+    threads: usize,
+
+    /// Mutation kind (update, remove_asset, invalidate_asset, remove_query, invalidate_query, mixed)
+    #[arg(long, default_value = "update")]
+    mutation: String,
+
+    /// Sweep thread counts (1, 2, 4, 8, 16, 32, 64)
+    #[arg(long)]
+    sweep_threads: bool,
+
+    /// Sweep mutation kinds
+    #[arg(long)]
+    sweep_mutations: bool,
 
     /// Enable verbose output
     #[arg(short, long)]
@@ -86,7 +104,11 @@ fn run_presets(args: &Args, seed: u64) {
     }
 
     for (name, config) in presets {
-        let config = config.with_seed(seed).with_recording(true);
+        let config = config
+            .with_seed(seed)
+            .with_recording(true)
+            .with_threads(args.threads)
+            .with_mutation_kind(parse_mutation_kind(&args.mutation));
         run_single_config(&args.output_dir, name, &config, args.verbose);
     }
 }
@@ -102,8 +124,11 @@ fn run_parameter_sweep(args: &Args, seed: u64) {
 
     let shapes = get_shapes(&args.shape);
     let update_biases = get_update_biases();
+    let threads_list = get_thread_counts(args);
+    let mutations_list = get_mutation_kinds(args);
 
-    let total = depths.len() * shapes.len() * update_biases.len();
+    let total =
+        depths.len() * shapes.len() * update_biases.len() * threads_list.len() * mutations_list.len();
     let mut completed = 0;
 
     for depth in &depths {
@@ -118,24 +143,37 @@ fn run_parameter_sweep(args: &Args, seed: u64) {
 
         for (shape_name, shape) in &shapes {
             for (bias_name, bias) in &update_biases {
-                completed += 1;
+                for threads in &threads_list {
+                    for (mutation_name, mutation) in &mutations_list {
+                        completed += 1;
 
-                let config = FuzzConfig::minimal()
-                    .with_depth(depth)
-                    .with_shape(*shape)
-                    .with_update_bias(bias.clone())
-                    .with_seed(seed)
-                    .with_recording(true)
-                    .with_update_cycles(if args.quick { 20 } else { 100 })
-                    .with_asset_count(calc_asset_count(depth, shape));
+                        let config = FuzzConfig::minimal()
+                            .with_depth(depth)
+                            .with_shape(*shape)
+                            .with_update_bias(bias.clone())
+                            .with_threads(*threads)
+                            .with_mutation_kind(mutation.clone())
+                            .with_seed(seed)
+                            .with_recording(true)
+                            .with_update_cycles(if args.quick { 20 } else { 100 })
+                            .with_asset_count(calc_asset_count(depth, shape));
 
-                let name = format!("depth{}_{}_{}", depth, shape_name, bias_name);
+                        let name = if *threads > 1 || mutations_list.len() > 1 {
+                            format!(
+                                "depth{}_{}_{}_{}_t{}",
+                                depth, shape_name, bias_name, mutation_name, threads
+                            )
+                        } else {
+                            format!("depth{}_{}_{}", depth, shape_name, bias_name)
+                        };
 
-                if args.verbose {
-                    println!("[{}/{}] Running: {}", completed, total, name);
+                        if args.verbose {
+                            println!("[{}/{}] Running: {}", completed, total, name);
+                        }
+
+                        run_single_config(&args.output_dir, &name, &config, args.verbose);
+                    }
                 }
-
-                run_single_config(&args.output_dir, &name, &config, args.verbose);
             }
         }
     }
@@ -242,5 +280,71 @@ fn calc_asset_count(depth: u32, shape: &TreeShape) -> u32 {
                 .min(256)
         }
         TreeShape::RandomDag { .. } => (depth * 5).min(100),
+    }
+}
+
+fn get_thread_counts(args: &Args) -> Vec<usize> {
+    if args.sweep_threads {
+        vec![1, 2, 4, 8, 16, 32, 64]
+    } else {
+        vec![args.threads]
+    }
+}
+
+fn get_mutation_kinds(args: &Args) -> Vec<(&'static str, MutationKind)> {
+    if args.sweep_mutations {
+        vec![
+            ("update", MutationKind::Update),
+            ("remove_asset", MutationKind::RemoveAsset),
+            ("invalidate_asset", MutationKind::InvalidateAsset),
+            ("remove_query", MutationKind::RemoveQuery),
+            ("invalidate_query", MutationKind::InvalidateQuery),
+            (
+                "mixed",
+                MutationKind::Mixed {
+                    remove_asset_prob: 0.1,
+                    invalidate_asset_prob: 0.1,
+                    remove_query_prob: 0.05,
+                    invalidate_query_prob: 0.05,
+                },
+            ),
+        ]
+    } else {
+        vec![(mutation_name(&args.mutation), parse_mutation_kind(&args.mutation))]
+    }
+}
+
+fn parse_mutation_kind(s: &str) -> MutationKind {
+    match s {
+        "update" => MutationKind::Update,
+        "remove_asset" => MutationKind::RemoveAsset,
+        "invalidate_asset" => MutationKind::InvalidateAsset,
+        "remove_query" => MutationKind::RemoveQuery,
+        "invalidate_query" => MutationKind::InvalidateQuery,
+        "mixed" => MutationKind::Mixed {
+            remove_asset_prob: 0.1,
+            invalidate_asset_prob: 0.1,
+            remove_query_prob: 0.05,
+            invalidate_query_prob: 0.05,
+        },
+        _ => {
+            eprintln!(
+                "Unknown mutation kind: {}. Available: update, remove_asset, invalidate_asset, remove_query, invalidate_query, mixed",
+                s
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn mutation_name(s: &str) -> &'static str {
+    match s {
+        "update" => "update",
+        "remove_asset" => "remove_asset",
+        "invalidate_asset" => "invalidate_asset",
+        "remove_query" => "remove_query",
+        "invalidate_query" => "invalidate_query",
+        "mixed" => "mixed",
+        _ => "unknown",
     }
 }

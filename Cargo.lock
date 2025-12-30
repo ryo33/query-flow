@@ -590,6 +590,7 @@ dependencies = [
  "query-flow",
  "query-flow-inspector",
  "rand",
+ "rayon",
  "serde",
  "serde_json",
 ]

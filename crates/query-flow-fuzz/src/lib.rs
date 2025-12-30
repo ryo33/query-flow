@@ -14,7 +14,9 @@ mod recorder;
 mod runner;
 mod validator;
 
-pub use config::{DataSize, FuzzConfig, QueryTimeBias, TimeDistribution, TreeShape, UpdateBias};
+pub use config::{
+    DataSize, FuzzConfig, MutationKind, QueryTimeBias, TimeDistribution, TreeShape, UpdateBias,
+};
 pub use distribution::LogScale;
 pub use generator::{DependencyTree, NodeId, NodeKind, TreeNode};
 pub use presets::Presets;

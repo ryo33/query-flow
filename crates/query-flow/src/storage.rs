@@ -327,6 +327,23 @@ impl QueryRegistry {
             Vec::new()
         }
     }
+
+    /// Remove a query from the registry. Returns `true` if it was present.
+    pub fn remove<Q: Query>(&self, key: &Q::CacheKey) -> bool {
+        let type_id = TypeId::of::<Q>();
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+
+        let entries_pinned = self.entries.pin();
+
+        if let Some(type_registry) = entries_pinned.get(&type_id) {
+            let queries_pinned = type_registry.queries.pin();
+            queries_pinned.remove(&key_hash).is_some()
+        } else {
+            false
+        }
+    }
 }
 
 /// Thread-safe registry for tracking asset keys by type.
@@ -491,7 +508,6 @@ impl VerifierStorage {
     }
 
     /// Remove a verifier.
-    #[allow(dead_code)]
     pub fn remove(&self, key: &FullCacheKey) -> bool {
         let pinned = self.verifiers.pin();
         pinned.remove(key).is_some()

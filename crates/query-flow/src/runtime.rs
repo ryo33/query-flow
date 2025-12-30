@@ -499,14 +499,19 @@ impl QueryRuntime {
                 let output = Arc::new(output);
 
                 // Check if output changed (for early cutoff)
-                // Also get the existing revision atomically for confirm_unchanged case
-                let (output_changed, existing_revision) = if let Some((CachedValue::Ok(old), rev)) =
+                // existing_revision is Some only when output is unchanged (can reuse revision)
+                let existing_revision = if let Some((CachedValue::Ok(old), rev)) =
                     self.get_cached_with_revision::<Q>(full_key)
                 {
-                    (!Q::output_eq(&old, &output), rev)
+                    if Q::output_eq(&old, &output) {
+                        Some(rev) // Same output - reuse revision
+                    } else {
+                        None // Different output
+                    }
                 } else {
-                    (true, 0) // No previous value or was error, so "changed"
+                    None // No previous Ok value
                 };
+                let output_changed = existing_revision.is_none();
 
                 // Emit early cutoff check event
                 #[cfg(feature = "inspector")]
@@ -521,7 +526,11 @@ impl QueryRuntime {
 
                 // Update whale with cached entry (atomic update of value + dependency state)
                 let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
-                let revision = if output_changed {
+                let revision = if let Some(existing_rev) = existing_revision {
+                    // confirm_unchanged doesn't change changed_at, use existing
+                    let _ = self.whale.confirm_unchanged(full_key, deps);
+                    existing_rev
+                } else {
                     // Use new_rev from register result
                     match self
                         .whale
@@ -534,10 +543,6 @@ impl QueryRuntime {
                             })
                         }
                     }
-                } else {
-                    // confirm_unchanged doesn't change changed_at, use existing
-                    let _ = self.whale.confirm_unchanged(full_key, deps);
-                    existing_revision
                 };
 
                 // Register query in registry for list_queries
@@ -1090,9 +1095,9 @@ impl QueryRuntime {
                         // Register with whale
                         let durability = Durability::new(key.durability().as_u8() as usize)
                             .unwrap_or(Durability::volatile());
-                        let _ = self
-                            .whale
-                            .register(full_cache_key, None, durability, vec![]);
+                        self.whale
+                            .register(full_cache_key, None, durability, vec![])
+                            .expect("register with no dependencies cannot fail");
 
                         match arc.downcast::<K::Asset>() {
                             Ok(value) => return Ok(LoadingState::Ready(value)),
@@ -1109,12 +1114,9 @@ impl QueryRuntime {
                         self.pending.insert::<K>(full_asset_key, key.clone());
 
                         // Register in whale so queries can depend on this asset
-                        let _ = self.whale.register(
-                            full_cache_key,
-                            None,
-                            Durability::volatile(),
-                            vec![],
-                        );
+                        self.whale
+                            .register(full_cache_key, None, Durability::volatile(), vec![])
+                            .expect("register with no dependencies cannot fail");
 
                         return Ok(LoadingState::Loading);
                     }
@@ -1138,9 +1140,9 @@ impl QueryRuntime {
             .insert::<K>(full_asset_key.clone(), key.clone());
 
         // Register in whale so queries can depend on this asset
-        let _ = self
-            .whale
-            .register(full_cache_key, None, Durability::volatile(), vec![]);
+        self.whale
+            .register(full_cache_key, None, Durability::volatile(), vec![])
+            .expect("register with no dependencies cannot fail");
 
         Ok(LoadingState::Loading)
     }

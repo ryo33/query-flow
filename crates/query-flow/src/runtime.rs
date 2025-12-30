@@ -191,6 +191,18 @@ impl QueryRuntime {
         let entry = node.data.as_ref()?;
         entry.to_cached_value::<Q::Output>()
     }
+
+    /// Get cached output along with its revision (single atomic access).
+    fn get_cached_with_revision<Q: Query>(
+        &self,
+        key: &FullCacheKey,
+    ) -> Option<(CachedValue<Arc<Q::Output>>, RevisionCounter)> {
+        let node = self.whale.get(key)?;
+        let revision = node.changed_at;
+        let entry = node.data.as_ref()?;
+        let cached = entry.to_cached_value::<Q::Output>()?;
+        Some((cached, revision))
+    }
 }
 
 impl QueryRuntime {
@@ -329,10 +341,8 @@ impl QueryRuntime {
 
         // Fast path: already verified at current revision
         if self.whale.is_verified_at(&full_key, &current_rev) {
-            if let Some(cached) = self.get_cached::<Q>(&full_key) {
-                // Get revision while we have the cache hit (atomic with value)
-                let revision = self.whale.get(&full_key).map(|n| n.changed_at).unwrap_or(0);
-
+            // Single atomic access to get both cached value and revision
+            if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::CacheCheck {
                     span_id: exec_ctx.span_id(),
@@ -357,7 +367,8 @@ impl QueryRuntime {
 
         // Check shallow validity (deps' changed_at ok) and try verify-then-decide
         if self.whale.is_valid(&full_key) {
-            if let Some(cached) = self.get_cached::<Q>(&full_key) {
+            // Single atomic access to get both cached value and revision
+            if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
                 // Shallow valid but not verified - verify deps first
                 let mut deps_verified = true;
                 if let Some(deps) = self.whale.get_dependency_ids(&full_key) {
@@ -376,9 +387,6 @@ impl QueryRuntime {
                 if deps_verified && self.whale.is_valid(&full_key) {
                     // Deps didn't change their changed_at, mark as verified and use cached
                     self.whale.mark_verified(&full_key, &current_rev);
-
-                    // Get revision while we have the cache hit (atomic with value)
-                    let revision = self.whale.get(&full_key).map(|n| n.changed_at).unwrap_or(0);
 
                     #[cfg(feature = "inspector")]
                     self.emit(|| FlowEvent::CacheCheck {
@@ -485,12 +493,14 @@ impl QueryRuntime {
                 let output = Arc::new(output);
 
                 // Check if output changed (for early cutoff)
-                let output_changed =
-                    if let Some(CachedValue::Ok(old)) = self.get_cached::<Q>(full_key) {
-                        !Q::output_eq(&old, &output)
-                    } else {
-                        true // No previous value or was error, so "changed"
-                    };
+                // Also get the existing revision atomically for confirm_unchanged case
+                let (output_changed, existing_revision) = if let Some((CachedValue::Ok(old), rev)) =
+                    self.get_cached_with_revision::<Q>(full_key)
+                {
+                    (!Q::output_eq(&old, &output), rev)
+                } else {
+                    (true, 0) // No previous value or was error, so "changed"
+                };
 
                 // Emit early cutoff check event
                 #[cfg(feature = "inspector")]
@@ -505,13 +515,17 @@ impl QueryRuntime {
 
                 // Update whale with cached entry (atomic update of value + dependency state)
                 let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
-                if output_changed {
-                    let _ = self
-                        .whale
-                        .register(full_key.clone(), Some(entry), durability, deps);
+                let revision = if output_changed {
+                    // Use new_rev from register result
+                    self.whale
+                        .register(full_key.clone(), Some(entry), durability, deps)
+                        .map(|r| r.new_rev)
+                        .unwrap_or(0)
                 } else {
+                    // confirm_unchanged doesn't change changed_at, use existing
                     let _ = self.whale.confirm_unchanged(full_key, deps);
-                }
+                    existing_revision
+                };
 
                 // Register query in registry for list_queries
                 let is_new_query = self.query_registry.register(query);
@@ -524,9 +538,6 @@ impl QueryRuntime {
 
                 // Store verifier for this query (for verify-then-decide pattern)
                 self.verifiers.insert(full_key.clone(), query.clone());
-
-                // Get revision immediately after registration (minimizes race window)
-                let revision = self.whale.get(full_key).map(|n| n.changed_at).unwrap_or(0);
 
                 Ok((output, output_changed, revision))
             }

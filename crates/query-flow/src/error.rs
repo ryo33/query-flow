@@ -3,6 +3,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::key::FullCacheKey;
+
 /// Query errors including both system-level and user errors.
 ///
 /// User errors can be propagated using the `?` operator, which automatically
@@ -34,6 +36,15 @@ pub enum QueryError {
         description: String,
     },
 
+    /// Dependencies were removed during query execution.
+    ///
+    /// This can happen if another thread removes queries or assets
+    /// while this query is being registered.
+    DependenciesRemoved {
+        /// Keys that were not found during registration.
+        missing_keys: Vec<FullCacheKey>,
+    },
+
     /// User-defined error.
     ///
     /// This variant allows user errors to be propagated through the query system
@@ -55,6 +66,13 @@ impl fmt::Display for QueryError {
             QueryError::Cancelled => write!(f, "query cancelled"),
             QueryError::MissingDependency { description } => {
                 write!(f, "missing dependency: {}", description)
+            }
+            QueryError::DependenciesRemoved { missing_keys } => {
+                write!(
+                    f,
+                    "dependencies removed during execution: {:?}",
+                    missing_keys
+                )
             }
             QueryError::UserError(e) => write!(f, "user error: {}", e),
         }

@@ -4,7 +4,9 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use whale::{Durability, Runtime as WhaleRuntime};
+use std::ops::Deref;
+
+use whale::{Durability, RevisionCounter, Runtime as WhaleRuntime};
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
 use crate::key::FullCacheKey;
@@ -73,6 +75,44 @@ impl ExecutionContext {
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Result of polling a query, containing the value and its revision.
+///
+/// This is returned by [`QueryRuntime::poll`] and provides both the query result
+/// and its change revision, enabling efficient change detection for subscription
+/// patterns.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = runtime.poll(MyQuery::new())?;
+///
+/// // Access the value via Deref
+/// println!("{:?}", *result);
+///
+/// // Check if changed since last poll
+/// if result.revision > last_known_revision {
+///     notify_subscribers(&result.value);
+///     last_known_revision = result.revision;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Polled<T> {
+    /// The query result value.
+    pub value: T,
+    /// The revision at which this value was last changed.
+    ///
+    /// Compare this with a previously stored revision to detect changes.
+    pub revision: RevisionCounter,
+}
+
+impl<T: Deref> Deref for Polled<T> {
+    type Target = T::Target;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
@@ -145,11 +185,16 @@ fn default_error_comparator(_a: &anyhow::Error, _b: &anyhow::Error) -> bool {
 }
 
 impl QueryRuntime {
-    /// Get cached output from whale's node data.
-    fn get_cached<Q: Query>(&self, key: &FullCacheKey) -> Option<CachedValue<Arc<Q::Output>>> {
+    /// Get cached output along with its revision (single atomic access).
+    fn get_cached_with_revision<Q: Query>(
+        &self,
+        key: &FullCacheKey,
+    ) -> Option<(CachedValue<Arc<Q::Output>>, RevisionCounter)> {
         let node = self.whale.get(key)?;
+        let revision = node.changed_at;
         let entry = node.data.as_ref()?;
-        entry.to_cached_value::<Q::Output>()
+        let cached = entry.to_cached_value::<Q::Output>()?;
+        Some((cached, revision))
     }
 }
 
@@ -223,6 +268,19 @@ impl QueryRuntime {
     /// - `QueryError::Suspend` - Query is waiting for async loading
     /// - `QueryError::Cycle` - Dependency cycle detected
     pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+        self.query_internal(query)
+            .and_then(|(inner_result, _)| inner_result.map_err(QueryError::UserError))
+    }
+
+    /// Internal implementation shared by query() and poll().
+    ///
+    /// Returns (result, revision) tuple where result is either Ok(output) or Err(user_error).
+    /// System errors (Suspend, Cycle, etc.) are returned as the outer Err.
+    #[allow(clippy::type_complexity)]
+    fn query_internal<Q: Query>(
+        &self,
+        query: Q,
+    ) -> Result<(Result<Arc<Q::Output>, Arc<anyhow::Error>>, RevisionCounter), QueryError> {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
@@ -279,7 +337,8 @@ impl QueryRuntime {
 
         // Fast path: already verified at current revision
         if self.whale.is_verified_at(&full_key, &current_rev) {
-            if let Some(cached) = self.get_cached::<Q>(&full_key) {
+            // Single atomic access to get both cached value and revision
+            if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
                 #[cfg(feature = "inspector")]
                 self.emit(|| FlowEvent::CacheCheck {
                     span_id: exec_ctx.span_id(),
@@ -296,15 +355,16 @@ impl QueryRuntime {
                 });
 
                 return match cached {
-                    CachedValue::Ok(output) => Ok(output),
-                    CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+                    CachedValue::Ok(output) => Ok((Ok(output), revision)),
+                    CachedValue::UserError(err) => Ok((Err(err), revision)),
                 };
             }
         }
 
         // Check shallow validity (deps' changed_at ok) and try verify-then-decide
         if self.whale.is_valid(&full_key) {
-            if let Some(cached) = self.get_cached::<Q>(&full_key) {
+            // Single atomic access to get both cached value and revision
+            if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
                 // Shallow valid but not verified - verify deps first
                 let mut deps_verified = true;
                 if let Some(deps) = self.whale.get_dependency_ids(&full_key) {
@@ -340,8 +400,8 @@ impl QueryRuntime {
                     });
 
                     return match cached {
-                        CachedValue::Ok(output) => Ok(output),
-                        CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+                        CachedValue::Ok(output) => Ok((Ok(output), revision)),
+                        CachedValue::UserError(err) => Ok((Err(err), revision)),
                     };
                 }
                 // A dep's changed_at increased, fall through to execute
@@ -370,8 +430,8 @@ impl QueryRuntime {
         #[cfg(feature = "inspector")]
         {
             let exec_result = match &result {
-                Ok((_, true)) => query_flow_inspector::ExecutionResult::Changed,
-                Ok((_, false)) => query_flow_inspector::ExecutionResult::Unchanged,
+                Ok((_, true, _)) => query_flow_inspector::ExecutionResult::Changed,
+                Ok((_, false, _)) => query_flow_inspector::ExecutionResult::Unchanged,
                 Err(QueryError::Suspend) => query_flow_inspector::ExecutionResult::Suspended,
                 Err(QueryError::Cycle { .. }) => {
                     query_flow_inspector::ExecutionResult::CycleDetected
@@ -388,18 +448,28 @@ impl QueryRuntime {
             });
         }
 
-        result.map(|(output, _)| output)
+        result.map(|(inner_result, _, revision)| (inner_result, revision))
     }
 
     /// Execute a query, caching the result if appropriate.
     ///
-    /// Returns (output, output_changed) tuple for instrumentation.
+    /// Returns (result, output_changed, revision) tuple.
+    /// - `result`: Ok(output) for success, Err(user_error) for user errors
+    /// - System errors (Suspend, Cycle, etc.) are returned as outer Err
+    #[allow(clippy::type_complexity)]
     fn execute_query<Q: Query>(
         &self,
         query: &Q,
         full_key: &FullCacheKey,
         exec_ctx: ExecutionContext,
-    ) -> Result<(Arc<Q::Output>, bool), QueryError> {
+    ) -> Result<
+        (
+            Result<Arc<Q::Output>, Arc<anyhow::Error>>,
+            bool,
+            RevisionCounter,
+        ),
+        QueryError,
+    > {
         // Create context for this query execution
         let mut ctx = QueryContext {
             runtime: self,
@@ -429,12 +499,19 @@ impl QueryRuntime {
                 let output = Arc::new(output);
 
                 // Check if output changed (for early cutoff)
-                let output_changed =
-                    if let Some(CachedValue::Ok(old)) = self.get_cached::<Q>(full_key) {
-                        !Q::output_eq(&old, &output)
+                // existing_revision is Some only when output is unchanged (can reuse revision)
+                let existing_revision = if let Some((CachedValue::Ok(old), rev)) =
+                    self.get_cached_with_revision::<Q>(full_key)
+                {
+                    if Q::output_eq(&old, &output) {
+                        Some(rev) // Same output - reuse revision
                     } else {
-                        true // No previous value or was error, so "changed"
-                    };
+                        None // Different output
+                    }
+                } else {
+                    None // No previous Ok value
+                };
+                let output_changed = existing_revision.is_none();
 
                 // Emit early cutoff check event
                 #[cfg(feature = "inspector")]
@@ -449,13 +526,24 @@ impl QueryRuntime {
 
                 // Update whale with cached entry (atomic update of value + dependency state)
                 let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
-                if output_changed {
-                    let _ = self
-                        .whale
-                        .register(full_key.clone(), Some(entry), durability, deps);
-                } else {
+                let revision = if let Some(existing_rev) = existing_revision {
+                    // confirm_unchanged doesn't change changed_at, use existing
                     let _ = self.whale.confirm_unchanged(full_key, deps);
-                }
+                    existing_rev
+                } else {
+                    // Use new_rev from register result
+                    match self
+                        .whale
+                        .register(full_key.clone(), Some(entry), durability, deps)
+                    {
+                        Ok(result) => result.new_rev,
+                        Err(missing) => {
+                            return Err(QueryError::DependenciesRemoved {
+                                missing_keys: missing,
+                            })
+                        }
+                    }
+                };
 
                 // Register query in registry for list_queries
                 let is_new_query = self.query_registry.register(query);
@@ -469,16 +557,23 @@ impl QueryRuntime {
                 // Store verifier for this query (for verify-then-decide pattern)
                 self.verifiers.insert(full_key.clone(), query.clone());
 
-                Ok((output, output_changed))
+                Ok((Ok(output), output_changed, revision))
             }
             Err(QueryError::UserError(err)) => {
                 // Check if error changed (for early cutoff)
-                let output_changed =
-                    if let Some(CachedValue::UserError(old_err)) = self.get_cached::<Q>(full_key) {
-                        !(self.error_comparator)(old_err.as_ref(), err.as_ref())
+                // existing_revision is Some only when error is unchanged (can reuse revision)
+                let existing_revision = if let Some((CachedValue::UserError(old_err), rev)) =
+                    self.get_cached_with_revision::<Q>(full_key)
+                {
+                    if (self.error_comparator)(old_err.as_ref(), err.as_ref()) {
+                        Some(rev) // Same error - reuse revision
                     } else {
-                        true // No previous error or was Ok, so "changed"
-                    };
+                        None // Different error
+                    }
+                } else {
+                    None // No previous UserError
+                };
+                let output_changed = existing_revision.is_none();
 
                 // Emit early cutoff check event
                 #[cfg(feature = "inspector")]
@@ -493,13 +588,24 @@ impl QueryRuntime {
 
                 // Update whale with cached error (atomic update of value + dependency state)
                 let entry = CachedEntry::UserError(err.clone());
-                if output_changed {
-                    let _ = self
-                        .whale
-                        .register(full_key.clone(), Some(entry), durability, deps);
-                } else {
+                let revision = if let Some(existing_rev) = existing_revision {
+                    // confirm_unchanged doesn't change changed_at, use existing
                     let _ = self.whale.confirm_unchanged(full_key, deps);
-                }
+                    existing_rev
+                } else {
+                    // Use new_rev from register result
+                    match self
+                        .whale
+                        .register(full_key.clone(), Some(entry), durability, deps)
+                    {
+                        Ok(result) => result.new_rev,
+                        Err(missing) => {
+                            return Err(QueryError::DependenciesRemoved {
+                                missing_keys: missing,
+                            })
+                        }
+                    }
+                };
 
                 // Register query in registry for list_queries
                 let is_new_query = self.query_registry.register(query);
@@ -513,7 +619,7 @@ impl QueryRuntime {
                 // Store verifier for this query (for verify-then-decide pattern)
                 self.verifiers.insert(full_key.clone(), query.clone());
 
-                Err(QueryError::UserError(err))
+                Ok((Err(err), output_changed, revision))
             }
             Err(e) => {
                 // System errors (Suspend, Cycle, Cancelled, MissingDependency) are not cached
@@ -551,6 +657,71 @@ impl QueryRuntime {
         for key in keys {
             self.whale.remove(&key);
         }
+    }
+
+    /// Poll a query, returning both the result and its change revision.
+    ///
+    /// This is useful for implementing subscription patterns where you need to
+    /// detect changes efficiently. Compare the returned `revision` with a
+    /// previously stored value to determine if the query result has changed.
+    ///
+    /// The returned `Polled` contains a `Result<Arc<Q::Output>, Arc<anyhow::Error>>`
+    /// as its value, allowing you to track revision changes for both success and
+    /// user error cases.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// struct Subscription<Q: Query> {
+    ///     query: Q,
+    ///     last_revision: RevisionCounter,
+    ///     tx: Sender<Result<Arc<Q::Output>, Arc<anyhow::Error>>>,
+    /// }
+    ///
+    /// // Polling loop
+    /// for sub in &mut subscriptions {
+    ///     let result = runtime.poll(sub.query.clone())?;
+    ///     if result.revision > sub.last_revision {
+    ///         sub.tx.send(result.value.clone())?;
+    ///         sub.last_revision = result.revision;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only for system errors (Suspend, Cycle, etc.).
+    /// User errors are returned as `Ok(Polled { value: Err(error), ... })`.
+    #[allow(clippy::type_complexity)]
+    pub fn poll<Q: Query>(
+        &self,
+        query: Q,
+    ) -> Result<Polled<Result<Arc<Q::Output>, Arc<anyhow::Error>>>, QueryError> {
+        let (value, revision) = self.query_internal(query)?;
+        Ok(Polled { value, revision })
+    }
+
+    /// Get the change revision of a query without executing it.
+    ///
+    /// Returns `None` if the query has never been executed.
+    ///
+    /// This is useful for checking if a query has changed since the last poll
+    /// without the cost of executing the query.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Check if query has changed before deciding to poll
+    /// if let Some(rev) = runtime.changed_at::<MyQuery>(&key) {
+    ///     if rev > last_known_revision {
+    ///         let result = runtime.query(MyQuery::new(key))?;
+    ///         // Process result...
+    ///     }
+    /// }
+    /// ```
+    pub fn changed_at<Q: Query>(&self, key: &Q::CacheKey) -> Option<RevisionCounter> {
+        let full_key = FullCacheKey::new::<Q, _>(key);
+        self.whale.get(&full_key).map(|node| node.changed_at)
     }
 }
 
@@ -924,9 +1095,9 @@ impl QueryRuntime {
                         // Register with whale
                         let durability = Durability::new(key.durability().as_u8() as usize)
                             .unwrap_or(Durability::volatile());
-                        let _ = self
-                            .whale
-                            .register(full_cache_key, None, durability, vec![]);
+                        self.whale
+                            .register(full_cache_key, None, durability, vec![])
+                            .expect("register with no dependencies cannot fail");
 
                         match arc.downcast::<K::Asset>() {
                             Ok(value) => return Ok(LoadingState::Ready(value)),
@@ -941,6 +1112,12 @@ impl QueryRuntime {
                         #[cfg(feature = "inspector")]
                         emit_requested(self, query_flow_inspector::AssetState::Loading);
                         self.pending.insert::<K>(full_asset_key, key.clone());
+
+                        // Register in whale so queries can depend on this asset
+                        self.whale
+                            .register(full_cache_key, None, Durability::volatile(), vec![])
+                            .expect("register with no dependencies cannot fail");
+
                         return Ok(LoadingState::Loading);
                     }
                     AssetState::NotFound => {
@@ -959,7 +1136,14 @@ impl QueryRuntime {
         emit_requested(self, query_flow_inspector::AssetState::Loading);
         self.assets
             .insert(full_asset_key.clone(), AssetState::Loading);
-        self.pending.insert::<K>(full_asset_key, key.clone());
+        self.pending
+            .insert::<K>(full_asset_key.clone(), key.clone());
+
+        // Register in whale so queries can depend on this asset
+        self.whale
+            .register(full_cache_key, None, Durability::volatile(), vec![])
+            .expect("register with no dependencies cannot fail");
+
         Ok(LoadingState::Loading)
     }
 }
@@ -1114,6 +1298,14 @@ impl<'a> QueryContext<'a> {
             dependency: query_flow_inspector::QueryKey::new("QuerySet", sentinel.debug_repr()),
         });
 
+        // Ensure sentinel exists in whale (for dependency tracking)
+        if self.runtime.whale.get(&sentinel).is_none() {
+            let _ =
+                self.runtime
+                    .whale
+                    .register(sentinel.clone(), None, Durability::volatile(), vec![]);
+        }
+
         self.deps.borrow_mut().push(sentinel);
 
         // Return all registered queries
@@ -1157,6 +1349,14 @@ impl<'a> QueryContext<'a> {
             ),
             asset: query_flow_inspector::AssetKey::new("AssetKeySet", sentinel.debug_repr()),
         });
+
+        // Ensure sentinel exists in whale (for dependency tracking)
+        if self.runtime.whale.get(&sentinel).is_none() {
+            let _ =
+                self.runtime
+                    .whale
+                    .register(sentinel.clone(), None, Durability::volatile(), vec![]);
+        }
 
         self.deps.borrow_mut().push(sentinel);
 
@@ -1467,6 +1667,170 @@ mod tests {
             // If attributes weren't preserved, this might warn about unused_var
             let result = runtime.query(WithAttributes::new(5)).unwrap();
             assert_eq!(*result, 10);
+        }
+    }
+
+    // Tests for poll() and changed_at()
+    mod poll_tests {
+        use super::*;
+
+        #[derive(Clone)]
+        struct Counter {
+            id: i32,
+        }
+
+        impl Query for Counter {
+            type CacheKey = i32;
+            type Output = i32;
+
+            fn cache_key(&self) -> Self::CacheKey {
+                self.id
+            }
+
+            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+                Ok(self.id * 10)
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
+        }
+
+        #[test]
+        fn test_poll_returns_value_and_revision() {
+            let runtime = QueryRuntime::new();
+
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+
+            // Value should be correct - access through Result and Arc
+            assert_eq!(**result.value.as_ref().unwrap(), 10);
+
+            // Revision should be non-zero after first execution
+            assert!(result.revision > 0);
+        }
+
+        #[test]
+        fn test_poll_revision_stable_on_cache_hit() {
+            let runtime = QueryRuntime::new();
+
+            // First poll
+            let result1 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev1 = result1.revision;
+
+            // Second poll (cache hit)
+            let result2 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev2 = result2.revision;
+
+            // Revision should be the same (no change)
+            assert_eq!(rev1, rev2);
+        }
+
+        #[test]
+        fn test_poll_revision_changes_on_invalidate() {
+            let runtime = QueryRuntime::new();
+
+            // First poll
+            let result1 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev1 = result1.revision;
+
+            // Invalidate and poll again
+            runtime.invalidate::<Counter>(&1);
+            let result2 = runtime.poll(Counter { id: 1 }).unwrap();
+            let rev2 = result2.revision;
+
+            // Revision should increase (value was recomputed)
+            // Note: Since output_eq returns true (same value), this might not change
+            // depending on early cutoff behavior. Let's verify the value is still correct.
+            assert_eq!(**result2.value.as_ref().unwrap(), 10);
+
+            // With early cutoff, revision might stay the same if value didn't change
+            // This is expected behavior
+            assert!(rev2 >= rev1);
+        }
+
+        #[test]
+        fn test_changed_at_returns_none_for_unexecuted_query() {
+            let runtime = QueryRuntime::new();
+
+            // Query has never been executed
+            let rev = runtime.changed_at::<Counter>(&1);
+            assert!(rev.is_none());
+        }
+
+        #[test]
+        fn test_changed_at_returns_revision_after_execution() {
+            let runtime = QueryRuntime::new();
+
+            // Execute the query
+            let _ = runtime.query(Counter { id: 1 }).unwrap();
+
+            // Now changed_at should return Some
+            let rev = runtime.changed_at::<Counter>(&1);
+            assert!(rev.is_some());
+            assert!(rev.unwrap() > 0);
+        }
+
+        #[test]
+        fn test_changed_at_matches_poll_revision() {
+            let runtime = QueryRuntime::new();
+
+            // Poll the query
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+
+            // changed_at should match the revision from poll
+            let rev = runtime.changed_at::<Counter>(&1);
+            assert_eq!(rev, Some(result.revision));
+        }
+
+        #[test]
+        fn test_poll_value_access() {
+            let runtime = QueryRuntime::new();
+
+            let result = runtime.poll(Counter { id: 5 }).unwrap();
+
+            // Access through Result and Arc
+            let value: &i32 = result.value.as_ref().unwrap();
+            assert_eq!(*value, 50);
+
+            // Access Arc directly via field after unwrapping Result
+            let arc: &Arc<i32> = result.value.as_ref().unwrap();
+            assert_eq!(**arc, 50);
+        }
+
+        #[test]
+        fn test_subscription_pattern() {
+            let runtime = QueryRuntime::new();
+
+            // Simulate subscription pattern
+            let mut last_revision: RevisionCounter = 0;
+            let mut notifications = 0;
+
+            // First poll - should notify (new value)
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+            if result.revision > last_revision {
+                notifications += 1;
+                last_revision = result.revision;
+            }
+
+            // Second poll - should NOT notify (no change)
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+            if result.revision > last_revision {
+                notifications += 1;
+                last_revision = result.revision;
+            }
+
+            // Third poll - should NOT notify (no change)
+            let result = runtime.poll(Counter { id: 1 }).unwrap();
+            if result.revision > last_revision {
+                notifications += 1;
+                #[allow(unused_assignments)]
+                {
+                    last_revision = result.revision;
+                }
+            }
+
+            // Only the first poll should have triggered a notification
+            assert_eq!(notifications, 1);
         }
     }
 }

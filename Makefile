@@ -10,7 +10,7 @@ check: clippy test test-no-default-features fmt-check
 	@echo "All checks passed."
 
 clippy:
-	@cargo clippy -q -- -D warnings && echo "clippy passed"
+	@cargo clippy -q --all-targets --all-features -- -D warnings && echo "clippy passed"
 
 test:
 	@if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run --all-targets --all-features --show-progress none --status-level fail --final-status-level fail; else cargo test -q --all-targets --all-features; fi && echo "test passed"

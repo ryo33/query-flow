@@ -523,10 +523,17 @@ impl QueryRuntime {
                 let entry = CachedEntry::Ok(output.clone() as Arc<dyn std::any::Any + Send + Sync>);
                 let revision = if output_changed {
                     // Use new_rev from register result
-                    self.whale
+                    match self
+                        .whale
                         .register(full_key.clone(), Some(entry), durability, deps)
-                        .map(|r| r.new_rev)
-                        .unwrap_or(0)
+                    {
+                        Ok(result) => result.new_rev,
+                        Err(missing) => {
+                            return Err(QueryError::DependenciesRemoved {
+                                missing_keys: missing,
+                            })
+                        }
+                    }
                 } else {
                     // confirm_unchanged doesn't change changed_at, use existing
                     let _ = self.whale.confirm_unchanged(full_key, deps);
@@ -582,10 +589,17 @@ impl QueryRuntime {
                     existing_rev
                 } else {
                     // Use new_rev from register result
-                    self.whale
+                    match self
+                        .whale
                         .register(full_key.clone(), Some(entry), durability, deps)
-                        .map(|r| r.new_rev)
-                        .unwrap_or(0)
+                    {
+                        Ok(result) => result.new_rev,
+                        Err(missing) => {
+                            return Err(QueryError::DependenciesRemoved {
+                                missing_keys: missing,
+                            })
+                        }
+                    }
                 };
 
                 // Register query in registry for list_queries
@@ -1093,6 +1107,15 @@ impl QueryRuntime {
                         #[cfg(feature = "inspector")]
                         emit_requested(self, query_flow_inspector::AssetState::Loading);
                         self.pending.insert::<K>(full_asset_key, key.clone());
+
+                        // Register in whale so queries can depend on this asset
+                        let _ = self.whale.register(
+                            full_cache_key,
+                            None,
+                            Durability::volatile(),
+                            vec![],
+                        );
+
                         return Ok(LoadingState::Loading);
                     }
                     AssetState::NotFound => {
@@ -1111,7 +1134,14 @@ impl QueryRuntime {
         emit_requested(self, query_flow_inspector::AssetState::Loading);
         self.assets
             .insert(full_asset_key.clone(), AssetState::Loading);
-        self.pending.insert::<K>(full_asset_key, key.clone());
+        self.pending
+            .insert::<K>(full_asset_key.clone(), key.clone());
+
+        // Register in whale so queries can depend on this asset
+        let _ = self
+            .whale
+            .register(full_cache_key, None, Durability::volatile(), vec![]);
+
         Ok(LoadingState::Loading)
     }
 }
@@ -1266,6 +1296,14 @@ impl<'a> QueryContext<'a> {
             dependency: query_flow_inspector::QueryKey::new("QuerySet", sentinel.debug_repr()),
         });
 
+        // Ensure sentinel exists in whale (for dependency tracking)
+        if self.runtime.whale.get(&sentinel).is_none() {
+            let _ =
+                self.runtime
+                    .whale
+                    .register(sentinel.clone(), None, Durability::volatile(), vec![]);
+        }
+
         self.deps.borrow_mut().push(sentinel);
 
         // Return all registered queries
@@ -1309,6 +1347,14 @@ impl<'a> QueryContext<'a> {
             ),
             asset: query_flow_inspector::AssetKey::new("AssetKeySet", sentinel.debug_repr()),
         });
+
+        // Ensure sentinel exists in whale (for dependency tracking)
+        if self.runtime.whale.get(&sentinel).is_none() {
+            let _ =
+                self.runtime
+                    .whale
+                    .register(sentinel.clone(), None, Durability::volatile(), vec![]);
+        }
 
         self.deps.borrow_mut().push(sentinel);
 

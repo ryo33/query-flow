@@ -41,7 +41,7 @@ mod storage;
 
 pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
 pub use error::QueryError;
-pub use key::Key;
+pub use key::{FullCacheKey, Key};
 pub use loading::LoadingState;
 pub use query::Query;
 pub use query_flow_macros::{asset_key, query};

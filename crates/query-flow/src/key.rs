@@ -24,12 +24,15 @@ struct QuerySetMarker;
 /// Marker type for asset key set sentinels (used by list_asset_keys).
 struct AssetKeySetMarker;
 
-/// Internal full cache key that includes query type information.
+/// Full cache key that includes query type information.
 ///
 /// This prevents collisions between different query types that might
 /// have the same `CacheKey` type (e.g., both use `u32`).
+///
+/// This type is used internally for dependency tracking, but is also
+/// exposed for error reporting and future GC functionality.
 #[derive(Clone)]
-pub(crate) struct FullCacheKey {
+pub struct FullCacheKey {
     /// Type ID of the query (or AssetKeyMarker for assets)
     query_type: TypeId,
     /// Hash of the user's cache key
@@ -56,7 +59,7 @@ impl FullCacheKey {
     ///
     /// This allows assets to participate in the same dependency graph as queries.
     /// Assets use a special marker type to namespace them separately from queries.
-    pub fn from_asset_key(asset_key: &FullAssetKey) -> Self {
+    pub(crate) fn from_asset_key(asset_key: &FullAssetKey) -> Self {
         // Combine asset key's type and hash to create a unique key
         let mut hasher = ahash::AHasher::default();
         asset_key.key_type().hash(&mut hasher);

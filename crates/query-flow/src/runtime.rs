@@ -185,13 +185,6 @@ fn default_error_comparator(_a: &anyhow::Error, _b: &anyhow::Error) -> bool {
 }
 
 impl QueryRuntime {
-    /// Get cached output from whale's node data.
-    fn get_cached<Q: Query>(&self, key: &FullCacheKey) -> Option<CachedValue<Arc<Q::Output>>> {
-        let node = self.whale.get(key)?;
-        let entry = node.data.as_ref()?;
-        entry.to_cached_value::<Q::Output>()
-    }
-
     /// Get cached output along with its revision (single atomic access).
     fn get_cached_with_revision<Q: Query>(
         &self,
@@ -275,16 +268,19 @@ impl QueryRuntime {
     /// - `QueryError::Suspend` - Query is waiting for async loading
     /// - `QueryError::Cycle` - Dependency cycle detected
     pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
-        self.query_internal(query).map(|(output, _)| output)
+        self.query_internal(query)
+            .and_then(|(inner_result, _)| inner_result.map_err(QueryError::UserError))
     }
 
     /// Internal implementation shared by query() and poll().
     ///
-    /// Returns (output, revision) tuple.
+    /// Returns (result, revision) tuple where result is either Ok(output) or Err(user_error).
+    /// System errors (Suspend, Cycle, etc.) are returned as the outer Err.
+    #[allow(clippy::type_complexity)]
     fn query_internal<Q: Query>(
         &self,
         query: Q,
-    ) -> Result<(Arc<Q::Output>, RevisionCounter), QueryError> {
+    ) -> Result<(Result<Arc<Q::Output>, Arc<anyhow::Error>>, RevisionCounter), QueryError> {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
@@ -359,8 +355,8 @@ impl QueryRuntime {
                 });
 
                 return match cached {
-                    CachedValue::Ok(output) => Ok((output, revision)),
-                    CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+                    CachedValue::Ok(output) => Ok((Ok(output), revision)),
+                    CachedValue::UserError(err) => Ok((Err(err), revision)),
                 };
             }
         }
@@ -404,8 +400,8 @@ impl QueryRuntime {
                     });
 
                     return match cached {
-                        CachedValue::Ok(output) => Ok((output, revision)),
-                        CachedValue::UserError(err) => Err(QueryError::UserError(err)),
+                        CachedValue::Ok(output) => Ok((Ok(output), revision)),
+                        CachedValue::UserError(err) => Ok((Err(err), revision)),
                     };
                 }
                 // A dep's changed_at increased, fall through to execute
@@ -452,18 +448,28 @@ impl QueryRuntime {
             });
         }
 
-        result.map(|(output, _, revision)| (output, revision))
+        result.map(|(inner_result, _, revision)| (inner_result, revision))
     }
 
     /// Execute a query, caching the result if appropriate.
     ///
-    /// Returns (output, output_changed, revision) tuple for instrumentation.
+    /// Returns (result, output_changed, revision) tuple.
+    /// - `result`: Ok(output) for success, Err(user_error) for user errors
+    /// - System errors (Suspend, Cycle, etc.) are returned as outer Err
+    #[allow(clippy::type_complexity)]
     fn execute_query<Q: Query>(
         &self,
         query: &Q,
         full_key: &FullCacheKey,
         exec_ctx: ExecutionContext,
-    ) -> Result<(Arc<Q::Output>, bool, RevisionCounter), QueryError> {
+    ) -> Result<
+        (
+            Result<Arc<Q::Output>, Arc<anyhow::Error>>,
+            bool,
+            RevisionCounter,
+        ),
+        QueryError,
+    > {
         // Create context for this query execution
         let mut ctx = QueryContext {
             runtime: self,
@@ -539,15 +545,21 @@ impl QueryRuntime {
                 // Store verifier for this query (for verify-then-decide pattern)
                 self.verifiers.insert(full_key.clone(), query.clone());
 
-                Ok((output, output_changed, revision))
+                Ok((Ok(output), output_changed, revision))
             }
             Err(QueryError::UserError(err)) => {
                 // Check if error changed (for early cutoff)
-                let output_changed =
-                    if let Some(CachedValue::UserError(old_err)) = self.get_cached::<Q>(full_key) {
-                        !(self.error_comparator)(old_err.as_ref(), err.as_ref())
+                // Also get the existing revision atomically for confirm_unchanged case
+                let (output_changed, existing_revision) =
+                    if let Some((CachedValue::UserError(old_err), rev)) =
+                        self.get_cached_with_revision::<Q>(full_key)
+                    {
+                        (
+                            !(self.error_comparator)(old_err.as_ref(), err.as_ref()),
+                            rev,
+                        )
                     } else {
-                        true // No previous error or was Ok, so "changed"
+                        (true, 0) // No previous error or was Ok, so "changed"
                     };
 
                 // Emit early cutoff check event
@@ -563,13 +575,17 @@ impl QueryRuntime {
 
                 // Update whale with cached error (atomic update of value + dependency state)
                 let entry = CachedEntry::UserError(err.clone());
-                if output_changed {
-                    let _ = self
-                        .whale
-                        .register(full_key.clone(), Some(entry), durability, deps);
+                let revision = if output_changed {
+                    // Use new_rev from register result
+                    self.whale
+                        .register(full_key.clone(), Some(entry), durability, deps)
+                        .map(|r| r.new_rev)
+                        .unwrap_or(0)
                 } else {
+                    // confirm_unchanged doesn't change changed_at, use existing
                     let _ = self.whale.confirm_unchanged(full_key, deps);
-                }
+                    existing_revision
+                };
 
                 // Register query in registry for list_queries
                 let is_new_query = self.query_registry.register(query);
@@ -583,7 +599,7 @@ impl QueryRuntime {
                 // Store verifier for this query (for verify-then-decide pattern)
                 self.verifiers.insert(full_key.clone(), query.clone());
 
-                Err(QueryError::UserError(err))
+                Ok((Err(err), output_changed, revision))
             }
             Err(e) => {
                 // System errors (Suspend, Cycle, Cancelled, MissingDependency) are not cached
@@ -629,13 +645,17 @@ impl QueryRuntime {
     /// detect changes efficiently. Compare the returned `revision` with a
     /// previously stored value to determine if the query result has changed.
     ///
+    /// The returned `Polled` contains a `Result<Arc<Q::Output>, Arc<anyhow::Error>>`
+    /// as its value, allowing you to track revision changes for both success and
+    /// user error cases.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// struct Subscription<Q: Query> {
     ///     query: Q,
     ///     last_revision: RevisionCounter,
-    ///     tx: Sender<Arc<Q::Output>>,
+    ///     tx: Sender<Result<Arc<Q::Output>, Arc<anyhow::Error>>>,
     /// }
     ///
     /// // Polling loop
@@ -650,8 +670,13 @@ impl QueryRuntime {
     ///
     /// # Errors
     ///
-    /// Same as [`QueryRuntime::query`].
-    pub fn poll<Q: Query>(&self, query: Q) -> Result<Polled<Arc<Q::Output>>, QueryError> {
+    /// Returns `Err` only for system errors (Suspend, Cycle, etc.).
+    /// User errors are returned as `Ok(Polled { value: Err(error), ... })`.
+    #[allow(clippy::type_complexity)]
+    pub fn poll<Q: Query>(
+        &self,
+        query: Q,
+    ) -> Result<Polled<Result<Arc<Q::Output>, Arc<anyhow::Error>>>, QueryError> {
         let (value, revision) = self.query_internal(query)?;
         Ok(Polled { value, revision })
     }
@@ -1628,10 +1653,8 @@ mod tests {
 
             let result = runtime.poll(Counter { id: 1 }).unwrap();
 
-            // Value should be correct (Deref goes through Arc)
-            assert_eq!(*result, 10);
-            // Access Arc directly via field
-            assert_eq!(*result.value, 10);
+            // Value should be correct - access through Result and Arc
+            assert_eq!(**result.value.as_ref().unwrap(), 10);
 
             // Revision should be non-zero after first execution
             assert!(result.revision > 0);
@@ -1669,7 +1692,7 @@ mod tests {
             // Revision should increase (value was recomputed)
             // Note: Since output_eq returns true (same value), this might not change
             // depending on early cutoff behavior. Let's verify the value is still correct.
-            assert_eq!(*result2, 10);
+            assert_eq!(**result2.value.as_ref().unwrap(), 10);
 
             // With early cutoff, revision might stay the same if value didn't change
             // This is expected behavior
@@ -1711,17 +1734,17 @@ mod tests {
         }
 
         #[test]
-        fn test_poll_deref() {
+        fn test_poll_value_access() {
             let runtime = QueryRuntime::new();
 
             let result = runtime.poll(Counter { id: 5 }).unwrap();
 
-            // Test Deref - goes through Arc to get the inner value directly
-            let value: &i32 = &result;
+            // Access through Result and Arc
+            let value: &i32 = result.value.as_ref().unwrap();
             assert_eq!(*value, 50);
 
-            // Access Arc directly via field
-            let arc: &Arc<i32> = &result.value;
+            // Access Arc directly via field after unwrapping Result
+            let arc: &Arc<i32> = result.value.as_ref().unwrap();
             assert_eq!(**arc, 50);
         }
 

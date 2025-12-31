@@ -154,16 +154,16 @@ fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     // Extract function attributes (e.g., #[tracing::instrument], #[inline])
     let attrs = input_fn.attrs.clone();
 
-    // Check that first param is ctx: &mut QueryContext
+    // Check that first param is db: &impl Db
     let mut iter = input_fn.sig.inputs.iter();
     let first_param = iter.next().ok_or_else(|| {
         Error::new(
             input_fn.sig.span(),
-            "query function must have `ctx: &mut QueryContext` as first parameter",
+            "query function must have `db: &impl Db` as first parameter",
         )
     })?;
 
-    validate_ctx_param(first_param)?;
+    validate_db_param(first_param)?;
 
     // Parse remaining params
     let mut params = Vec::new();
@@ -196,15 +196,15 @@ fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     })
 }
 
-fn validate_ctx_param(arg: &FnArg) -> Result<(), Error> {
+fn validate_db_param(arg: &FnArg) -> Result<(), Error> {
     match arg {
         FnArg::Typed(pat_type) => {
-            // Check parameter name is 'ctx'
+            // Check parameter name is 'db'
             if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                if pat_ident.ident != "ctx" {
+                if pat_ident.ident != "db" {
                     return Err(Error::new(
                         pat_ident.ident.span(),
-                        "first parameter must be named `ctx`",
+                        "first parameter must be named `db`",
                     ));
                 }
             }
@@ -213,7 +213,7 @@ fn validate_ctx_param(arg: &FnArg) -> Result<(), Error> {
         }
         FnArg::Receiver(_) => Err(Error::new(
             arg.span(),
-            "first parameter must be `ctx: &mut QueryContext`, not `self`",
+            "first parameter must be `db: &impl Db`, not `self`",
         )),
     }
 }
@@ -402,7 +402,7 @@ fn generate_query_impl(
             }
 
             #( #fn_attrs )*
-            fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+            fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                 #( #field_bindings )*
                 #fn_body
             }
@@ -432,7 +432,7 @@ mod tests {
         let input_fn: ItemFn = syn::parse_quote! {
             #[allow(unused_variables)]
             #[inline]
-            fn my_query(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
+            fn my_query(db: &impl Db, x: i32) -> Result<i32, QueryError> {
                 let unused = 42;
                 Ok(x * 2)
             }
@@ -464,7 +464,7 @@ mod tests {
 
                 #[allow(unused_variables)]
                 #[inline]
-                fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                     let x = self.x;
                     {
                         let unused = 42;
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn test_query_macro_without_attributes() {
         let input_fn: ItemFn = syn::parse_quote! {
-            fn simple(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+            fn simple(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
                 Ok(a + b)
             }
         };
@@ -514,7 +514,7 @@ mod tests {
                     (self.a.clone(), self.b.clone())
                 }
 
-                fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                     let a = self.a;
                     let b = self.b;
                     {
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn test_query_macro_no_params() {
         let input_fn: ItemFn = syn::parse_quote! {
-            fn no_params(ctx: &mut QueryContext) -> Result<i32, QueryError> {
+            fn no_params(db: &impl Db) -> Result<i32, QueryError> {
                 Ok(42)
             }
         };
@@ -568,7 +568,7 @@ mod tests {
                     // Empty body - evaluates to () without explicit unit expression
                 }
 
-                fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                     {
                         Ok(42)
                     }

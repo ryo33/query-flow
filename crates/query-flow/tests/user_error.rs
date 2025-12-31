@@ -57,8 +57,8 @@ fn test_user_error_from_custom_error() {
 // =============================================================================
 
 #[query]
-fn parse_number(ctx: &mut QueryContext, input: String) -> Result<i32, QueryError> {
-    let _ = ctx;
+fn parse_number(db: &impl Db, input: String) -> Result<i32, QueryError> {
+    let _ = db;
     // The ? operator converts ParseIntError to QueryError::UserError automatically
     let num: i32 = input.parse()?;
     Ok(num)
@@ -85,8 +85,8 @@ fn test_question_mark_propagation_error() {
 }
 
 #[query]
-fn fallible_io(ctx: &mut QueryContext, should_fail: bool) -> Result<String, QueryError> {
-    let _ = ctx;
+fn fallible_io(db: &impl Db, should_fail: bool) -> Result<String, QueryError> {
+    let _ = db;
     if should_fail {
         return Err(anyhow::anyhow!("not found").into());
     }
@@ -117,8 +117,8 @@ mod error_caching_error {
     static FALLIBLE_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
     #[query]
-    fn fallible_cached(ctx: &mut QueryContext, id: u32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn fallible_cached(db: &impl Db, id: u32) -> Result<i32, QueryError> {
+        let _ = db;
         FALLIBLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         if id == 0 {
@@ -151,8 +151,8 @@ mod error_caching_success {
     static FALLIBLE_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
     #[query]
-    fn fallible_cached(ctx: &mut QueryContext, id: u32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn fallible_cached(db: &impl Db, id: u32) -> Result<i32, QueryError> {
+        let _ = db;
         FALLIBLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         if id == 0 {
@@ -192,8 +192,8 @@ mod error_comparator_default {
 
     /// Level 1: Base query that may return an error
     #[query]
-    fn error_level1(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn error_level1(db: &impl Db, code: i32) -> Result<i32, QueryError> {
+        let _ = db;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         if code < 0 {
@@ -208,17 +208,17 @@ mod error_comparator_default {
 
     /// Level 2: Depends on Level 1
     #[query]
-    fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
+    fn error_level2(db: &impl Db, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel1::new(code))?;
+        let base = db.query(ErrorLevel1::new(code))?;
         Ok(*base + 1)
     }
 
     /// Level 3: Depends on Level 2 (transitively on Level 1)
     #[query]
-    fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
+    fn error_level3(db: &impl Db, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel2::new(code))?;
+        let base = db.query(ErrorLevel2::new(code))?;
         Ok(*base + 10)
     }
 
@@ -263,8 +263,8 @@ mod error_comparator_custom {
 
     /// Level 1: Base query that may return an error
     #[query]
-    fn error_level1(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn error_level1(db: &impl Db, code: i32) -> Result<i32, QueryError> {
+        let _ = db;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         if code < 0 {
@@ -279,17 +279,17 @@ mod error_comparator_custom {
 
     /// Level 2: Depends on Level 1
     #[query]
-    fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
+    fn error_level2(db: &impl Db, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel1::new(code))?;
+        let base = db.query(ErrorLevel1::new(code))?;
         Ok(*base + 1)
     }
 
     /// Level 3: Depends on Level 2 (transitively on Level 1)
     #[query]
-    fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
+    fn error_level3(db: &impl Db, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel2::new(code))?;
+        let base = db.query(ErrorLevel2::new(code))?;
         Ok(*base + 10)
     }
 
@@ -347,8 +347,8 @@ mod error_comparator_always_equal {
 
     /// Level 1: Base query that may return an error
     #[query]
-    fn error_level1(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn error_level1(db: &impl Db, code: i32) -> Result<i32, QueryError> {
+        let _ = db;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         if code < 0 {
@@ -363,17 +363,17 @@ mod error_comparator_always_equal {
 
     /// Level 2: Depends on Level 1
     #[query]
-    fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
+    fn error_level2(db: &impl Db, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel1::new(code))?;
+        let base = db.query(ErrorLevel1::new(code))?;
         Ok(*base + 1)
     }
 
     /// Level 3: Depends on Level 2 (transitively on Level 1)
     #[query]
-    fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
+    fn error_level3(db: &impl Db, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel2::new(code))?;
+        let base = db.query(ErrorLevel2::new(code))?;
         Ok(*base + 10)
     }
 
@@ -424,16 +424,16 @@ mod mixed_chain {
     static MIXED_TOP_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
     #[query]
-    fn mixed_base(ctx: &mut QueryContext, value: i32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn mixed_base(db: &impl Db, value: i32) -> Result<i32, QueryError> {
+        let _ = db;
         MIXED_BASE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         Ok(value * 2)
     }
 
     #[query]
-    fn mixed_middle(ctx: &mut QueryContext, value: i32) -> Result<i32, QueryError> {
+    fn mixed_middle(db: &impl Db, value: i32) -> Result<i32, QueryError> {
         MIXED_MIDDLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(MixedBase::new(value))?;
+        let base = db.query(MixedBase::new(value))?;
 
         if *base > 100 {
             return Err(anyhow::anyhow!("value too large: {}", base).into());
@@ -442,9 +442,9 @@ mod mixed_chain {
     }
 
     #[query]
-    fn mixed_top(ctx: &mut QueryContext, value: i32) -> Result<String, QueryError> {
+    fn mixed_top(db: &impl Db, value: i32) -> Result<String, QueryError> {
         MIXED_TOP_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let middle = ctx.query(MixedMiddle::new(value))?;
+        let middle = db.query(MixedMiddle::new(value))?;
         Ok(format!("result: {}", middle))
     }
 
@@ -483,8 +483,8 @@ mod error_downcast {
 
     /// Level 1: Base query that may return an error
     #[query]
-    fn error_level1(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn error_level1(db: &impl Db, code: i32) -> Result<i32, QueryError> {
+        let _ = db;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         if code < 0 {
@@ -531,8 +531,8 @@ mod transition_ok_to_error {
     static TRANSITION_DEPENDENT_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
     #[query]
-    fn transition_source(ctx: &mut QueryContext) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn transition_source(db: &impl Db) -> Result<i32, QueryError> {
+        let _ = db;
         TRANSITION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         let value = TRANSITION_VALUE.load(Ordering::SeqCst) as i32;
 
@@ -543,9 +543,9 @@ mod transition_ok_to_error {
     }
 
     #[query]
-    fn transition_dependent(ctx: &mut QueryContext) -> Result<i32, QueryError> {
+    fn transition_dependent(db: &impl Db) -> Result<i32, QueryError> {
         TRANSITION_DEPENDENT_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let source = ctx.query(TransitionSource::new())?;
+        let source = db.query(TransitionSource::new())?;
         Ok(*source * 2)
     }
 
@@ -584,8 +584,8 @@ mod transition_error_to_ok {
     static TRANSITION_DEPENDENT_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
     #[query]
-    fn transition_source(ctx: &mut QueryContext) -> Result<i32, QueryError> {
-        let _ = ctx;
+    fn transition_source(db: &impl Db) -> Result<i32, QueryError> {
+        let _ = db;
         TRANSITION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         let value = TRANSITION_VALUE.load(Ordering::SeqCst) as i32;
 
@@ -596,9 +596,9 @@ mod transition_error_to_ok {
     }
 
     #[query]
-    fn transition_dependent(ctx: &mut QueryContext) -> Result<i32, QueryError> {
+    fn transition_dependent(db: &impl Db) -> Result<i32, QueryError> {
         TRANSITION_DEPENDENT_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let source = ctx.query(TransitionSource::new())?;
+        let source = db.query(TransitionSource::new())?;
         Ok(*source * 2)
     }
 

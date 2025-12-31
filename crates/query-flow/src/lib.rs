@@ -30,6 +30,7 @@
 extern crate self as query_flow;
 
 mod asset;
+mod db;
 mod error;
 mod inspector;
 mod key;
@@ -40,6 +41,7 @@ mod runtime;
 mod storage;
 
 pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
+pub use db::Db;
 pub use error::QueryError;
 pub use key::{FullCacheKey, Key};
 pub use loading::AssetLoadingState;

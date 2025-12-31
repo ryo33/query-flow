@@ -3,7 +3,7 @@
 use super::asset::SyntheticAssetKey;
 use super::tree::compute_hash_output;
 use super::NodeId;
-use query_flow::{Query, QueryContext, QueryError};
+use query_flow::{Db, Query, QueryError};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -95,7 +95,7 @@ impl Query for SyntheticQuery {
         self.node_id
     }
 
-    fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+    fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
         // Collect dependency outputs
         let mut combined_data = Vec::new();
 
@@ -107,12 +107,12 @@ impl Query for SyntheticQuery {
                         // Fallback: create minimal query (should not happen in normal use)
                         SyntheticQuery::new(*dep_id, vec![], 0, 8)
                     });
-                    let output = ctx.query(dep_query)?;
+                    let output = db.query(dep_query)?;
                     combined_data.extend_from_slice(&output.data);
                 }
                 Dependency::Asset(asset_id) => {
                     let asset_key = SyntheticAssetKey(*asset_id);
-                    let data = ctx.asset(asset_key)?.suspend()?;
+                    let data = db.asset(asset_key)?.suspend()?;
                     combined_data.extend_from_slice(&data);
                 }
             }

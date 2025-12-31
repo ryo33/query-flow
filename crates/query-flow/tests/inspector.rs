@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use query_flow::{asset_key, query, QueryContext, QueryError, QueryRuntime};
+use query_flow::{asset_key, query, Db, QueryError, QueryRuntime};
 use query_flow_inspector::{
     to_kinds, AssetKey, AssetState, EventCollector, EventKind, ExecutionResult, QueryKey,
 };
@@ -16,21 +16,21 @@ use query_flow_inspector::{
 // ============================================================================
 
 #[query]
-fn simple_add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-    let _ = ctx;
+fn simple_add(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+    let _ = db;
     Ok(a + b)
 }
 
 #[query]
-fn double(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
-    let _ = ctx;
+fn double(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    let _ = db;
     Ok(x * 2)
 }
 
 #[query]
-fn add_then_double(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-    let sum = ctx.query(SimpleAdd::new(a, b))?;
-    let doubled = ctx.query(Double::new(*sum))?;
+fn add_then_double(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+    let sum = db.query(SimpleAdd::new(a, b))?;
+    let doubled = db.query(Double::new(*sum))?;
     Ok(*doubled)
 }
 
@@ -39,8 +39,8 @@ fn add_then_double(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryE
 pub struct TestSource(pub String);
 
 #[query]
-fn process_source(ctx: &mut QueryContext, name: String) -> Result<String, QueryError> {
-    let source = ctx.asset(TestSource(name.clone()))?.suspend()?;
+fn process_source(db: &impl Db, name: String) -> Result<String, QueryError> {
+    let source = db.asset(TestSource(name.clone()))?.suspend()?;
     Ok(format!("processed: {}", source))
 }
 
@@ -374,8 +374,8 @@ fn test_cycle_detection_events() {
             self.0
         }
 
-        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            let b = ctx.query(CycleB(self.0))?;
+        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            let b = db.query(CycleB(self.0))?;
             Ok(*b + 1)
         }
 
@@ -392,8 +392,8 @@ fn test_cycle_detection_events() {
             self.0
         }
 
-        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-            let a = ctx.query(CycleA(self.0))?;
+        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            let a = db.query(CycleA(self.0))?;
             Ok(*a + 1)
         }
 

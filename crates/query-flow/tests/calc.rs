@@ -6,7 +6,7 @@
 //! - Incremental recomputation
 //! - Early cutoff optimization
 
-use query_flow::{asset_key, query, Query, QueryContext, QueryError, QueryRuntime};
+use query_flow::{asset_key, query, Db, Query, QueryError, QueryRuntime};
 
 #[cfg(feature = "inspector")]
 use std::sync::Arc;
@@ -67,9 +67,9 @@ pub struct Variable(pub String);
 
 /// Parse source text into an expression.
 #[query]
-fn parse_expr(ctx: &mut QueryContext, file_name: String) -> Result<Expr, QueryError> {
+fn parse_expr(db: &impl Db, file_name: String) -> Result<Expr, QueryError> {
     // Get source from asset, default to empty string if not found
-    let source = ctx
+    let source = db
         .asset(SourceFile(file_name.clone()))?
         .into_inner()
         .map(|s| (*s).clone())
@@ -79,9 +79,9 @@ fn parse_expr(ctx: &mut QueryContext, file_name: String) -> Result<Expr, QueryEr
 
 /// Evaluate an expression from a file.
 #[query]
-fn eval_file(ctx: &mut QueryContext, file_name: String) -> Result<i64, QueryError> {
-    let expr = ctx.query(ParseExpr::new(file_name.clone()))?;
-    eval_expr(ctx, &expr)
+fn eval_file(db: &impl Db, file_name: String) -> Result<i64, QueryError> {
+    let expr = db.query(ParseExpr::new(file_name.clone()))?;
+    eval_expr(db, &expr)
 }
 
 // ============================================================================
@@ -189,12 +189,12 @@ fn parse_primary(input: &str) -> (Expr, &str) {
 // Evaluator
 // ============================================================================
 
-fn eval_expr(ctx: &mut QueryContext, expr: &Expr) -> Result<i64, QueryError> {
+fn eval_expr(db: &impl Db, expr: &Expr) -> Result<i64, QueryError> {
     match expr {
         Expr::Number(n) => Ok(*n),
         Expr::Variable(name) => {
             // Get variable from asset, default to 0 if not found
-            let value = ctx
+            let value = db
                 .asset(Variable(name.clone()))?
                 .into_inner()
                 .map(|v| *v)
@@ -202,8 +202,8 @@ fn eval_expr(ctx: &mut QueryContext, expr: &Expr) -> Result<i64, QueryError> {
             Ok(value)
         }
         Expr::BinOp { op, lhs, rhs } => {
-            let lhs_val = eval_expr(ctx, lhs)?;
-            let rhs_val = eval_expr(ctx, rhs)?;
+            let lhs_val = eval_expr(db, lhs)?;
+            let rhs_val = eval_expr(db, rhs)?;
             Ok(match op {
                 BinOp::Add => lhs_val + rhs_val,
                 BinOp::Sub => lhs_val - rhs_val,
@@ -500,9 +500,9 @@ fn test_caching() {
             self.file_name.clone()
         }
 
-        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
             PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
-            let source = ctx
+            let source = db
                 .asset(SourceFile(self.file_name.clone()))?
                 .into_inner()
                 .map(|s| (*s).clone())

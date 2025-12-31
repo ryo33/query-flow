@@ -85,8 +85,8 @@ fn test_resolve_asset_before_query() {
 
     // Define a query that uses the asset
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -102,8 +102,8 @@ fn test_pending_asset_flow() {
     runtime.register_asset_locator::<ConfigFile, _>(PendingLocator);
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -140,8 +140,8 @@ fn test_immediate_locator() {
     });
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -157,8 +157,8 @@ fn test_not_found_asset() {
     runtime.register_asset_locator::<ConfigFile, _>(NotFoundLocator);
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -175,8 +175,8 @@ fn test_invalidate_asset() {
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "initial".to_string());
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -215,8 +215,8 @@ fn test_asset_caching() {
     runtime.register_asset_locator::<ConfigFile, _>(CountingLocator);
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -238,9 +238,9 @@ fn test_asset_dependency_tracking() {
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
 
     #[query]
-    fn process_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
+    fn process_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
         QUERY_CALLS.fetch_add(1, Ordering::SeqCst);
-        let content = ctx.asset(path.clone())?.suspend()?;
+        let content = db.asset(path.clone())?.suspend()?;
         Ok(format!("processed: {}", content))
     }
 
@@ -273,9 +273,9 @@ fn test_asset_early_cutoff() {
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "same_value".to_string());
 
     #[query]
-    fn process_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
+    fn process_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
         DOWNSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
-        let content = ctx.asset(path.clone())?.suspend()?;
+        let content = db.asset(path.clone())?.suspend()?;
         Ok(format!("processed: {}", content))
     }
 
@@ -305,8 +305,8 @@ fn test_resolve_asset_with_durability() {
     );
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -328,8 +328,8 @@ fn test_remove_asset() {
     );
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -357,12 +357,12 @@ fn test_multiple_asset_types() {
 
     #[query]
     fn process_files(
-        ctx: &mut QueryContext,
+        db: &impl Db,
         config_path: ConfigFile,
         binary_path: BinaryFile,
     ) -> Result<(String, usize), QueryError> {
-        let config = ctx.asset(config_path.clone())?.suspend()?;
-        let binary = ctx.asset(binary_path.clone())?.suspend()?;
+        let config = db.asset(config_path.clone())?.suspend()?;
+        let binary = db.asset(binary_path.clone())?.suspend()?;
         Ok(((*config).clone(), binary.len()))
     }
 
@@ -382,8 +382,8 @@ fn test_no_locator_pending() {
     // No locator registered
 
     #[query]
-    fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path.clone())?.suspend()?;
+    fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 

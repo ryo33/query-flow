@@ -9,6 +9,7 @@ use std::ops::Deref;
 use whale::{Durability, RevisionCounter, Runtime as WhaleRuntime};
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
+use crate::db::Db;
 use crate::key::FullCacheKey;
 use crate::loading::AssetLoadingState;
 use crate::query::Query;
@@ -471,7 +472,7 @@ impl QueryRuntime {
         QueryError,
     > {
         // Create context for this query execution
-        let mut ctx = QueryContext {
+        let ctx = QueryContext {
             runtime: self,
             current_key: full_key.clone(),
             #[cfg(feature = "inspector")]
@@ -485,7 +486,7 @@ impl QueryRuntime {
         let _ = exec_ctx;
 
         // Execute the query (clone because query() takes ownership)
-        let result = query.clone().query(&mut ctx);
+        let result = query.clone().query(&ctx);
 
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
@@ -1176,6 +1177,24 @@ impl QueryRuntime {
     }
 }
 
+impl Db for QueryRuntime {
+    fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+        QueryRuntime::query(self, query)
+    }
+
+    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        self.get_asset_internal(key)
+    }
+
+    fn list_queries<Q: Query>(&self) -> Vec<Q> {
+        self.query_registry.get_all::<Q>()
+    }
+
+    fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
+        self.asset_key_registry.get_all::<K>()
+    }
+}
+
 /// Context provided to queries during execution.
 ///
 /// Use this to access dependencies via `query()`.
@@ -1198,12 +1217,12 @@ impl<'a> QueryContext<'a> {
     /// # Example
     ///
     /// ```ignore
-    /// fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-    ///     let dep_result = ctx.query(OtherQuery { id: self.id })?;
+    /// fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+    ///     let dep_result = db.query(OtherQuery { id: self.id })?;
     ///     Ok(process(&dep_result))
     /// }
     /// ```
-    pub fn query<Q: Query>(&mut self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+    pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
@@ -1241,8 +1260,8 @@ impl<'a> QueryContext<'a> {
     ///
     /// ```ignore
     /// #[query]
-    /// fn process_file(ctx: &mut QueryContext, path: FilePath) -> Result<Output, QueryError> {
-    ///     let content = ctx.asset(path)?.suspend()?;
+    /// fn process_file(db: &impl Db, path: FilePath) -> Result<Output, QueryError> {
+    ///     let content = db.asset(path)?.suspend()?;
     ///     // Process content...
     ///     Ok(output)
     /// }
@@ -1251,7 +1270,7 @@ impl<'a> QueryContext<'a> {
     /// # Errors
     ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
-    pub fn asset<K: AssetKey>(&mut self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+    pub fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
@@ -1303,16 +1322,16 @@ impl<'a> QueryContext<'a> {
     ///
     /// ```ignore
     /// #[query]
-    /// fn all_results(ctx: &mut QueryContext) -> Result<Vec<i32>, QueryError> {
-    ///     let queries = ctx.list_queries::<MyQuery>();
+    /// fn all_results(db: &impl Db) -> Result<Vec<i32>, QueryError> {
+    ///     let queries = db.list_queries::<MyQuery>();
     ///     let mut results = Vec::new();
     ///     for q in queries {
-    ///         results.push(*ctx.query(q)?);
+    ///         results.push(*db.query(q)?);
     ///     }
     ///     Ok(results)
     /// }
     /// ```
-    pub fn list_queries<Q: Query>(&mut self) -> Vec<Q> {
+    pub fn list_queries<Q: Query>(&self) -> Vec<Q> {
         // Record dependency on the sentinel (set-level dependency)
         let sentinel = FullCacheKey::query_set_sentinel::<Q>();
 
@@ -1348,23 +1367,23 @@ impl<'a> QueryContext<'a> {
     /// - An asset of type K is removed via remove_asset
     ///
     /// The calling query will NOT be invalidated when:
-    /// - An individual asset's value changes (use `ctx.asset()` for that)
+    /// - An individual asset's value changes (use `db.asset()` for that)
     ///
     /// # Example
     ///
     /// ```ignore
     /// #[query]
-    /// fn all_configs(ctx: &mut QueryContext) -> Result<Vec<String>, QueryError> {
-    ///     let keys = ctx.list_asset_keys::<ConfigFile>();
+    /// fn all_configs(db: &impl Db) -> Result<Vec<String>, QueryError> {
+    ///     let keys = db.list_asset_keys::<ConfigFile>();
     ///     let mut contents = Vec::new();
     ///     for key in keys {
-    ///         let content = ctx.asset(&key)?.suspend()?;
+    ///         let content = db.asset(&key)?.suspend()?;
     ///         contents.push((*content).clone());
     ///     }
     ///     Ok(contents)
     /// }
     /// ```
-    pub fn list_asset_keys<K: AssetKey>(&mut self) -> Vec<K> {
+    pub fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
         // Record dependency on the sentinel (set-level dependency)
         let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
 
@@ -1393,6 +1412,24 @@ impl<'a> QueryContext<'a> {
     }
 }
 
+impl<'a> Db for QueryContext<'a> {
+    fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+        QueryContext::query(self, query)
+    }
+
+    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        QueryContext::asset(self, key)
+    }
+
+    fn list_queries<Q: Query>(&self) -> Vec<Q> {
+        QueryContext::list_queries(self)
+    }
+
+    fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
+        QueryContext::list_asset_keys(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1413,7 +1450,7 @@ mod tests {
                 (self.a, self.b)
             }
 
-            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
                 Ok(self.a + self.b)
             }
 
@@ -1447,7 +1484,7 @@ mod tests {
                 self.value
             }
 
-            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
                 Ok(self.value * 2)
             }
 
@@ -1469,8 +1506,8 @@ mod tests {
                 self.base_value
             }
 
-            fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-                let base = ctx.query(Base {
+            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+                let base = db.query(Base {
                     value: self.base_value,
                 })?;
                 Ok(*base + 10)
@@ -1507,8 +1544,8 @@ mod tests {
                 self.id
             }
 
-            fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-                let b = ctx.query(CycleB { id: self.id })?;
+            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+                let b = db.query(CycleB { id: self.id })?;
                 Ok(*b + 1)
             }
 
@@ -1525,8 +1562,8 @@ mod tests {
                 self.id
             }
 
-            fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-                let a = ctx.query(CycleA { id: self.id })?;
+            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+                let a = db.query(CycleA { id: self.id })?;
                 Ok(*a + 1)
             }
 
@@ -1556,7 +1593,7 @@ mod tests {
                 self.input.clone()
             }
 
-            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
                 Ok(self.input.parse())
             }
 
@@ -1590,8 +1627,8 @@ mod tests {
         use crate::query;
 
         #[query]
-        fn add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-            let _ = ctx; // silence unused warning
+        fn add(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+            let _ = db; // silence unused warning
             Ok(a + b)
         }
 
@@ -1603,8 +1640,8 @@ mod tests {
         }
 
         #[query(durability = 2)]
-        fn with_durability(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
-            let _ = ctx;
+        fn with_durability(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+            let _ = db;
             Ok(x * 2)
         }
 
@@ -1617,11 +1654,11 @@ mod tests {
 
         #[query(keys(id))]
         fn with_key_selection(
-            ctx: &mut QueryContext,
+            db: &impl Db,
             id: u32,
             include_extra: bool,
         ) -> Result<String, QueryError> {
-            let _ = ctx;
+            let _ = db;
             Ok(format!("id={}, extra={}", id, include_extra))
         }
 
@@ -1639,8 +1676,8 @@ mod tests {
         }
 
         #[query]
-        fn dependent(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-            let sum = ctx.query(Add::new(a, b))?;
+        fn dependent(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+            let sum = db.query(Add::new(a, b))?;
             Ok(*sum * 2)
         }
 
@@ -1652,8 +1689,8 @@ mod tests {
         }
 
         #[query(output_eq)]
-        fn with_output_eq(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
-            let _ = ctx;
+        fn with_output_eq(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+            let _ = db;
             Ok(x * 2)
         }
 
@@ -1665,8 +1702,8 @@ mod tests {
         }
 
         #[query(name = "CustomName")]
-        fn original_name(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
-            let _ = ctx;
+        fn original_name(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+            let _ = db;
             Ok(x)
         }
 
@@ -1683,7 +1720,7 @@ mod tests {
         #[allow(unused_variables)]
         #[inline]
         #[query]
-        fn with_attributes(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
+        fn with_attributes(db: &impl Db, x: i32) -> Result<i32, QueryError> {
             // This would warn without #[allow(unused_variables)] on the generated method
             let unused_var = 42;
             Ok(x * 2)
@@ -1715,7 +1752,7 @@ mod tests {
                 self.id
             }
 
-            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
                 Ok(self.id * 10)
             }
 

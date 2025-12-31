@@ -1,7 +1,7 @@
 //! Query trait definition.
 
+use crate::db::Db;
 use crate::key::Key;
-use crate::runtime::QueryContext;
 use crate::QueryError;
 
 /// A query that can be executed and cached.
@@ -9,7 +9,7 @@ use crate::QueryError;
 /// Queries are the fundamental unit of computation in query-flow. Each query:
 /// - Has a cache key that uniquely identifies the computation
 /// - Produces an output value
-/// - Can depend on other queries via `QueryContext::query()`
+/// - Can depend on other queries via `db.query()`
 ///
 /// # Sync by Design
 ///
@@ -28,7 +28,7 @@ use crate::QueryError;
 /// # Example
 ///
 /// ```ignore
-/// use query_flow::{Query, QueryContext, QueryError, Key};
+/// use query_flow::{Query, Db, QueryError, Key};
 ///
 /// // Simple infallible query
 /// struct Add { a: i32, b: i32 }
@@ -41,7 +41,7 @@ use crate::QueryError;
 ///         (self.a, self.b)
 ///     }
 ///
-///     fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+///     fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
 ///         Ok(self.a + self.b)
 ///     }
 /// }
@@ -57,7 +57,7 @@ use crate::QueryError;
 ///         self.input.clone()
 ///     }
 ///
-///     fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+///     fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
 ///         Ok(self.input.parse())  // Ok(Ok(n)) or Ok(Err(parse_error))
 ///     }
 /// }
@@ -81,14 +81,14 @@ pub trait Query: Clone + Send + Sync + 'static {
     ///
     /// # Arguments
     ///
-    /// * `ctx` - The query context for accessing dependencies
+    /// * `db` - The database for accessing dependencies
     ///
     /// # Returns
     ///
     /// * `Ok(output)` - Query completed successfully
     /// * `Err(QueryError::Suspend)` - Query is waiting for async loading
     /// * `Err(QueryError::Cycle)` - Dependency cycle detected
-    fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError>;
+    fn query(self, db: &impl Db) -> Result<Self::Output, QueryError>;
 
     /// Durability hint for this query.
     ///

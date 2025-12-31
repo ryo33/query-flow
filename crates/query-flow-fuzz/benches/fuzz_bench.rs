@@ -6,16 +6,22 @@ use query_flow_fuzz::{FuzzConfig, FuzzRunner, LogScale, Presets, TreeShape, Upda
 fn bench_tree_depth(c: &mut Criterion) {
     let mut group = c.benchmark_group("tree_depth");
 
+    // Use a fixed asset count to isolate the effect of tree depth.
+    // Previously, 2^(depth-1) caused overflow at depth=100, resulting in asset_count=0.
+    let asset_count = 32u32;
+    let update_cycles = 20u32;
+
     for depth in LogScale::new(10, 0, 2).values() {
-        let depth = depth as u32;
+        let depth = (depth as u32).max(2); // Ensure depth >= 2 for meaningful tree
         let config = FuzzConfig::minimal()
             .with_depth(depth)
             .with_shape(TreeShape::Binary)
-            .with_asset_count(2u32.pow(depth.saturating_sub(1)).min(64))
-            .with_update_cycles(20)
+            .with_asset_count(asset_count)
+            .with_update_cycles(update_cycles)
             .with_seed(42);
 
-        group.throughput(Throughput::Elements(depth as u64));
+        // Throughput based on total update operations performed
+        group.throughput(Throughput::Elements((asset_count * update_cycles) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(depth), &config, |b, config| {
             b.iter_batched(
                 || FuzzRunner::new(config.clone()),
@@ -31,33 +37,34 @@ fn bench_tree_depth(c: &mut Criterion) {
 fn bench_tree_shape(c: &mut Criterion) {
     let mut group = c.benchmark_group("tree_shape");
 
+    // Use consistent asset_count for fair comparison across shapes.
+    // Note: LinkedList ignores asset_count and always has 1 leaf (chain structure).
+    let asset_count = 32u32;
+
     let shapes = [
-        ("linked_list", TreeShape::LinkedList, 1),
-        ("binary", TreeShape::Binary, 16),
+        ("linked_list", TreeShape::LinkedList),
+        ("binary", TreeShape::Binary),
         (
             "nary4",
             TreeShape::NAry {
                 branching_factor: 4,
             },
-            64,
         ),
         (
             "complete_nary4",
             TreeShape::CompleteNAry {
                 branching_factor: 4,
             },
-            64,
         ),
         (
             "random_dag",
             TreeShape::RandomDag {
                 expected_fan_out: 3.0,
             },
-            32,
         ),
     ];
 
-    for (name, shape, asset_count) in shapes {
+    for (name, shape) in shapes {
         let config = FuzzConfig::minimal()
             .with_depth(5)
             .with_shape(shape)

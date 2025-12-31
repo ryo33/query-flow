@@ -39,7 +39,7 @@ impl FuzzResult {
     pub fn unexpected_failures(&self) -> Vec<&(NodeId, QueryError)> {
         self.query_failures
             .iter()
-            .filter(|(_, e)| !matches!(e, QueryError::Suspend))
+            .filter(|(_, e)| !matches!(e, QueryError::Suspend { .. }))
             .collect()
     }
 
@@ -341,7 +341,7 @@ impl FuzzRunner {
                             .query_successes
                             .push((root_id, start.elapsed()));
                     }
-                    Err(QueryError::Suspend) => {
+                    Err(QueryError::Suspend { .. }) => {
                         // Expected when assets are removed/invalidated
                     }
                     Err(e) => {

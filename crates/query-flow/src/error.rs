@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::asset::PendingAsset;
 use crate::key::FullCacheKey;
 
 /// Query errors including both system-level and user errors.
@@ -16,7 +17,13 @@ pub enum QueryError {
     /// This is returned when a dependency is still loading via a background task.
     /// Use `runtime.query_async()` to wait for loading to complete, or handle
     /// explicitly in your query logic.
-    Suspend,
+    ///
+    /// The `asset` field contains information about the pending asset, which can
+    /// be downcast to the original key type using `asset.key::<K>()`.
+    Suspend {
+        /// The pending asset that caused the suspension.
+        asset: PendingAsset,
+    },
 
     /// Dependency cycle detected.
     ///
@@ -59,7 +66,9 @@ pub enum QueryError {
 impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            QueryError::Suspend => write!(f, "query suspended: waiting for async loading"),
+            QueryError::Suspend { asset } => {
+                write!(f, "query suspended: waiting for {}", asset.debug_repr())
+            }
             QueryError::Cycle { path } => {
                 write!(f, "dependency cycle detected: {}", path.join(" -> "))
             }

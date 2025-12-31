@@ -143,6 +143,7 @@ pub trait AssetLocator<K: AssetKey>: Send + Sync + 'static {
 }
 
 /// A pending asset request that needs to be resolved.
+#[derive(Clone)]
 pub struct PendingAsset {
     /// Type-erased key for the asset (stored as Arc for efficient cloning)
     key: Arc<dyn Any + Send + Sync>,
@@ -154,8 +155,7 @@ pub struct PendingAsset {
 
 impl PendingAsset {
     /// Create a new pending asset.
-    #[allow(dead_code)] // Reserved for direct construction if needed
-    pub(crate) fn new<K: AssetKey>(key: K) -> Self {
+    pub fn new<K: AssetKey>(key: K) -> Self {
         Self {
             debug_repr: format!("{:?}", key),
             key_type: TypeId::of::<K>(),

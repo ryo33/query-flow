@@ -7,7 +7,7 @@
 //!
 //! - **Async-agnostic queries**: Write sync query logic, run with sync or async runtime
 //! - **Automatic caching**: Query results are cached and invalidated based on dependencies
-//! - **Suspense pattern**: Handle async loading with `LoadingState` without coloring functions
+//! - **Suspense pattern**: Handle async loading with `AssetLoadingState` without coloring functions
 //! - **Type-safe**: Per-query-type caching with compile-time guarantees
 //! - **Early cutoff**: Skip downstream recomputation when values don't change
 //!
@@ -42,7 +42,7 @@ mod storage;
 pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
 pub use error::QueryError;
 pub use key::{FullCacheKey, Key};
-pub use loading::LoadingState;
+pub use loading::AssetLoadingState;
 pub use query::Query;
 pub use query_flow_macros::{asset_key, query};
 pub use runtime::{ErrorComparator, Polled, QueryContext, QueryRuntime, QueryRuntimeBuilder};

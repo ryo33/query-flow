@@ -70,9 +70,9 @@ pub struct Variable(pub String);
 fn parse_expr(ctx: &mut QueryContext, file_name: String) -> Result<Expr, QueryError> {
     // Get source from asset, default to empty string if not found
     let source = ctx
-        .asset(&SourceFile(file_name.clone()))?
+        .asset(SourceFile(file_name.clone()))?
+        .into_inner()
         .map(|s| (*s).clone())
-        .suspend()
         .unwrap_or_default();
     Ok(parse(&source))
 }
@@ -195,9 +195,9 @@ fn eval_expr(ctx: &mut QueryContext, expr: &Expr) -> Result<i64, QueryError> {
         Expr::Variable(name) => {
             // Get variable from asset, default to 0 if not found
             let value = ctx
-                .asset(&Variable(name.clone()))?
+                .asset(Variable(name.clone()))?
+                .into_inner()
                 .map(|v| *v)
-                .suspend()
                 .unwrap_or(0);
             Ok(value)
         }
@@ -503,9 +503,9 @@ fn test_caching() {
         fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
             let source = ctx
-                .asset(&SourceFile(self.file_name.clone()))?
+                .asset(SourceFile(self.file_name.clone()))?
+                .into_inner()
                 .map(|s| (*s).clone())
-                .suspend()
                 .unwrap_or_default();
             Ok(parse(&source))
         }

@@ -381,8 +381,9 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut results = Vec::new();
             for key in keys {
-                if let Some(content) = ctx.asset(&key)?.get() {
-                    results.push((key.0.clone(), (**content).clone()));
+                let key_name = key.0.clone();
+                if let Some(content) = ctx.asset(key)?.get() {
+                    results.push((key_name, (**content).clone()));
                 }
             }
             results.sort();

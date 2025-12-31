@@ -3,8 +3,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use query_flow::{
-    asset_key, query, AssetKey, AssetLocator, DurabilityLevel, LoadingState, LocateResult,
-    QueryError, QueryRuntime,
+    asset_key, query, AssetKey, AssetLocator, DurabilityLevel, LocateResult, QueryError,
+    QueryRuntime,
 };
 
 // ============================================================================
@@ -86,7 +86,7 @@ fn test_resolve_asset_before_query() {
     // Define a query that uses the asset
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -103,13 +103,13 @@ fn test_pending_asset_flow() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
     // First query should suspend
     let result = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
-    assert!(matches!(result, Err(QueryError::Suspend)));
+    assert!(matches!(result, Err(QueryError::Suspend { .. })));
 
     // Check pending assets
     assert!(runtime.has_pending_assets());
@@ -141,7 +141,7 @@ fn test_immediate_locator() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -158,7 +158,7 @@ fn test_not_found_asset() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -176,7 +176,7 @@ fn test_invalidate_asset() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -189,7 +189,7 @@ fn test_invalidate_asset() {
 
     // Query should now suspend
     let result = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
-    assert!(matches!(result, Err(QueryError::Suspend)));
+    assert!(matches!(result, Err(QueryError::Suspend { .. })));
 
     // Resolve with new value
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "updated".to_string());
@@ -216,7 +216,7 @@ fn test_asset_caching() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -240,7 +240,7 @@ fn test_asset_dependency_tracking() {
     #[query]
     fn process_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
         QUERY_CALLS.fetch_add(1, Ordering::SeqCst);
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok(format!("processed: {}", content))
     }
 
@@ -275,7 +275,7 @@ fn test_asset_early_cutoff() {
     #[query]
     fn process_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
         DOWNSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok(format!("processed: {}", content))
     }
 
@@ -306,7 +306,7 @@ fn test_resolve_asset_with_durability() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -329,7 +329,7 @@ fn test_remove_asset() {
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
@@ -361,8 +361,8 @@ fn test_multiple_asset_types() {
         config_path: ConfigFile,
         binary_path: BinaryFile,
     ) -> Result<(String, usize), QueryError> {
-        let config = ctx.asset(config_path)?.suspend()?;
-        let binary = ctx.asset(binary_path)?.suspend()?;
+        let config = ctx.asset(config_path.clone())?.suspend()?;
+        let binary = ctx.asset(binary_path.clone())?.suspend()?;
         Ok(((*config).clone(), binary.len()))
     }
 
@@ -377,34 +377,19 @@ fn test_multiple_asset_types() {
 }
 
 #[test]
-fn test_loading_state_methods() {
-    let loading: LoadingState<String> = LoadingState::Loading;
-    assert!(loading.is_loading());
-    assert!(!loading.is_ready());
-    assert!(loading.get().is_none());
-    assert!(loading.suspend().is_err());
-
-    let ready: LoadingState<String> = LoadingState::Ready("value".to_string());
-    assert!(!ready.is_loading());
-    assert!(ready.is_ready());
-    assert_eq!(ready.get(), Some(&"value".to_string()));
-    assert_eq!(ready.suspend().unwrap(), "value");
-}
-
-#[test]
 fn test_no_locator_pending() {
     let runtime = QueryRuntime::new();
     // No locator registered
 
     #[query]
     fn read_config(ctx: &mut QueryContext, path: ConfigFile) -> Result<String, QueryError> {
-        let content = ctx.asset(path)?.suspend()?;
+        let content = ctx.asset(path.clone())?.suspend()?;
         Ok((*content).clone())
     }
 
     // Without a locator, asset should be marked as pending
     let result = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
-    assert!(matches!(result, Err(QueryError::Suspend)));
+    assert!(matches!(result, Err(QueryError::Suspend { .. })));
 
     // Check that it's in pending
     assert!(runtime.has_pending_assets());
@@ -421,7 +406,7 @@ fn test_get_asset_ready() {
     let runtime = QueryRuntime::new();
     runtime.resolve_asset(ConfigFile("app.json".to_string()), "content".to_string());
 
-    let result = runtime.get_asset(&ConfigFile("app.json".to_string()));
+    let result = runtime.get_asset(ConfigFile("app.json".to_string()));
     assert!(result.is_ok());
     let state = result.unwrap();
     assert!(state.is_ready());
@@ -433,7 +418,7 @@ fn test_get_asset_loading_no_locator() {
     let runtime = QueryRuntime::new();
     // No asset resolved, no locator registered
 
-    let result = runtime.get_asset(&ConfigFile("missing.json".to_string()));
+    let result = runtime.get_asset(ConfigFile("missing.json".to_string()));
     assert!(result.is_ok());
     let state = result.unwrap();
     assert!(state.is_loading());
@@ -452,7 +437,7 @@ fn test_get_asset_immediate_locator() {
         content: "from_locator".to_string(),
     });
 
-    let result = runtime.get_asset(&ConfigFile("any.json".to_string()));
+    let result = runtime.get_asset(ConfigFile("any.json".to_string()));
     assert!(result.is_ok());
     let state = result.unwrap();
     assert!(state.is_ready());
@@ -464,6 +449,6 @@ fn test_get_asset_not_found() {
     let runtime = QueryRuntime::new();
     runtime.register_asset_locator::<ConfigFile, _>(NotFoundLocator);
 
-    let result = runtime.get_asset(&ConfigFile("missing.json".to_string()));
+    let result = runtime.get_asset(ConfigFile("missing.json".to_string()));
     assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
 }

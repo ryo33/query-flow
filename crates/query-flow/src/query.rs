@@ -15,7 +15,7 @@ use crate::QueryError;
 ///
 /// The `query` method is intentionally synchronous. This avoids the "function
 /// coloring" problem where async infects the entire call stack. For async
-/// operations, use the suspense pattern with `LoadingState`.
+/// operations, use the suspense pattern with `AssetLoadingState`.
 ///
 /// # Error Handling
 ///

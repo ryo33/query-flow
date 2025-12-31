@@ -1,128 +1,102 @@
 //! Loading state for async resource handling.
 
+use std::sync::Arc;
+
+use crate::asset::{AssetKey, PendingAsset};
 use crate::QueryError;
 
-/// Represents the loading state of an async resource.
+/// Loading state with asset key information for error reporting.
 ///
-/// Use this as your `Query::Output` type when the query needs to load
-/// data asynchronously (e.g., file I/O, network requests).
+/// This is returned by `ctx.asset()` and provides information about
+/// whether an asset is loading or ready, along with the key for
+/// error reporting on suspend.
 ///
 /// # Example
 ///
 /// ```ignore
-/// struct LoadFile { path: PathBuf }
-///
-/// impl Query for LoadFile {
-///     type CacheKey = PathBuf;
-///     type Output = LoadingState<String>;
-///
-///     fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-///         // Check if already loaded
-///         if let Some(content) = ctx.get_loaded(&self.path) {
-///             return Ok(LoadingState::Ready(content));
-///         }
-///
-///         // Spawn background loader
-///         ctx.spawn_loader(self.cache_key(), async {
-///             tokio::fs::read_to_string(&self.path).await.unwrap()
-///         });
-///
-///         Err(QueryError::Suspend)
-///     }
+/// #[query]
+/// fn process_file(ctx: &mut QueryContext, path: FilePath) -> Result<Output, QueryError> {
+///     let content = ctx.asset(path)?.suspend()?;
+///     // Process content...
+///     Ok(output)
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum LoadingState<T> {
-    /// Resource is still loading.
-    #[default]
-    Loading,
-    /// Resource is ready with the given value.
-    Ready(T),
+pub struct AssetLoadingState<K: AssetKey> {
+    value: Option<Arc<K::Asset>>,
+    key: K,
 }
 
-impl<T> LoadingState<T> {
+impl<K: AssetKey> AssetLoadingState<K> {
+    /// Create a loading state (asset not yet available).
+    pub fn loading(key: K) -> Self {
+        Self { value: None, key }
+    }
+
+    /// Create a ready state with the asset value.
+    pub fn ready(key: K, value: Arc<K::Asset>) -> Self {
+        Self {
+            value: Some(value),
+            key,
+        }
+    }
+
     /// Check if the resource is still loading.
     pub fn is_loading(&self) -> bool {
-        matches!(self, LoadingState::Loading)
+        self.value.is_none()
     }
 
     /// Check if the resource is ready.
     pub fn is_ready(&self) -> bool {
-        matches!(self, LoadingState::Ready(_))
+        self.value.is_some()
     }
 
     /// Get the value if ready, None if loading.
-    pub fn get(&self) -> Option<&T> {
-        match self {
-            LoadingState::Loading => None,
-            LoadingState::Ready(t) => Some(t),
-        }
+    pub fn get(&self) -> Option<&Arc<K::Asset>> {
+        self.value.as_ref()
     }
 
     /// Get the value if ready, None if loading (consuming version).
-    pub fn into_inner(self) -> Option<T> {
-        match self {
-            LoadingState::Loading => None,
-            LoadingState::Ready(t) => Some(t),
-        }
+    pub fn into_inner(self) -> Option<Arc<K::Asset>> {
+        self.value
     }
 
     /// Convert to Result - Loading becomes Err(QueryError::Suspend).
     ///
     /// Use this with the `?` operator to propagate loading state upward.
+    /// The returned error includes the asset key for debugging.
     ///
     /// # Example
     ///
     /// ```ignore
     /// fn query(&self, ctx: &mut QueryContext) -> Result<MyOutput, QueryError> {
-    ///     let data = ctx.query(LoadData { id: self.id })?.suspend()?;
+    ///     let data = ctx.asset(key)?.suspend()?;
     ///     // `data` is guaranteed to be ready here
     ///     Ok(process(data))
     /// }
     /// ```
-    pub fn suspend(self) -> Result<T, QueryError> {
-        match self {
-            LoadingState::Loading => Err(QueryError::Suspend),
-            LoadingState::Ready(t) => Ok(t),
+    pub fn suspend(self) -> Result<Arc<K::Asset>, QueryError> {
+        match self.value {
+            None => Err(QueryError::Suspend {
+                asset: PendingAsset::new(self.key),
+            }),
+            Some(v) => Ok(v),
         }
     }
 
-    /// Reference version of suspend.
-    pub fn suspend_ref(&self) -> Result<&T, QueryError> {
-        match self {
-            LoadingState::Loading => Err(QueryError::Suspend),
-            LoadingState::Ready(t) => Ok(t),
-        }
-    }
-
-    /// Map the inner value if ready.
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> LoadingState<U> {
-        match self {
-            LoadingState::Loading => LoadingState::Loading,
-            LoadingState::Ready(t) => LoadingState::Ready(f(t)),
-        }
-    }
-
-    /// Flat map the inner value if ready.
-    pub fn and_then<U, F: FnOnce(T) -> LoadingState<U>>(self, f: F) -> LoadingState<U> {
-        match self {
-            LoadingState::Loading => LoadingState::Loading,
-            LoadingState::Ready(t) => f(t),
-        }
+    /// Get a reference to the key.
+    pub fn key(&self) -> &K {
+        &self.key
     }
 }
 
-impl<T> From<T> for LoadingState<T> {
-    fn from(value: T) -> Self {
-        LoadingState::Ready(value)
-    }
-}
-
-impl<T> From<Option<T>> for LoadingState<T> {
-    fn from(opt: Option<T>) -> Self {
-        match opt {
-            Some(t) => LoadingState::Ready(t),
-            None => LoadingState::Loading,
+impl<K: AssetKey> std::fmt::Debug for AssetLoadingState<K>
+where
+    K::Asset: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.value {
+            None => write!(f, "AssetLoadingState::Loading({:?})", self.key),
+            Some(v) => write!(f, "AssetLoadingState::Ready({:?}, {:?})", self.key, v),
         }
     }
 }

@@ -10,7 +10,7 @@ use whale::{Durability, RevisionCounter, Runtime as WhaleRuntime};
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
 use crate::key::FullCacheKey;
-use crate::loading::LoadingState;
+use crate::loading::AssetLoadingState;
 use crate::query::Query;
 use crate::storage::{
     AssetKeyRegistry, AssetState, AssetStorage, CachedEntry, CachedValue, LocatorStorage,
@@ -432,7 +432,7 @@ impl QueryRuntime {
             let exec_result = match &result {
                 Ok((_, true, _)) => query_flow_inspector::ExecutionResult::Changed,
                 Ok((_, false, _)) => query_flow_inspector::ExecutionResult::Unchanged,
-                Err(QueryError::Suspend) => query_flow_inspector::ExecutionResult::Suspended,
+                Err(QueryError::Suspend { .. }) => query_flow_inspector::ExecutionResult::Suspended,
                 Err(QueryError::Cycle { .. }) => {
                     query_flow_inspector::ExecutionResult::CycleDetected
                 }
@@ -1054,27 +1054,21 @@ impl QueryRuntime {
     ///
     /// # Returns
     ///
-    /// - `Ok(LoadingState::Ready(value))` - Asset is loaded and ready
-    /// - `Ok(LoadingState::Loading)` - Asset is still loading (added to pending)
+    /// - `Ok(AssetLoadingState::ready(...))` - Asset is loaded and ready
+    /// - `Ok(AssetLoadingState::loading(...))` - Asset is still loading (added to pending)
     /// - `Err(QueryError::MissingDependency)` - Asset was not found
-    pub fn get_asset<K: AssetKey>(
-        &self,
-        key: &K,
-    ) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
+    pub fn get_asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         self.get_asset_internal(key)
     }
 
     /// Internal: Get asset state, checking cache and locator.
-    fn get_asset_internal<K: AssetKey>(
-        &self,
-        key: &K,
-    ) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
-        let full_asset_key = FullAssetKey::new(key);
+    fn get_asset_internal<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
         // Helper to emit AssetRequested event
         #[cfg(feature = "inspector")]
-        let emit_requested = |runtime: &Self, state: query_flow_inspector::AssetState| {
+        let emit_requested = |runtime: &Self, key: &K, state: query_flow_inspector::AssetState| {
             runtime.emit(|| FlowEvent::AssetRequested {
                 asset: query_flow_inspector::AssetKey::new(
                     std::any::type_name::<K>(),
@@ -1091,14 +1085,14 @@ impl QueryRuntime {
                 return match state {
                     AssetState::Loading => {
                         #[cfg(feature = "inspector")]
-                        emit_requested(self, query_flow_inspector::AssetState::Loading);
-                        Ok(LoadingState::Loading)
+                        emit_requested(self, &key, query_flow_inspector::AssetState::Loading);
+                        Ok(AssetLoadingState::loading(key))
                     }
                     AssetState::Ready(arc) => {
                         #[cfg(feature = "inspector")]
-                        emit_requested(self, query_flow_inspector::AssetState::Ready);
+                        emit_requested(self, &key, query_flow_inspector::AssetState::Ready);
                         match arc.downcast::<K::Asset>() {
-                            Ok(value) => Ok(LoadingState::Ready(value)),
+                            Ok(value) => Ok(AssetLoadingState::ready(key, value)),
                             Err(_) => Err(QueryError::MissingDependency {
                                 description: format!("Asset type mismatch: {:?}", key),
                             }),
@@ -1106,7 +1100,7 @@ impl QueryRuntime {
                     }
                     AssetState::NotFound => {
                         #[cfg(feature = "inspector")]
-                        emit_requested(self, query_flow_inspector::AssetState::NotFound);
+                        emit_requested(self, &key, query_flow_inspector::AssetState::NotFound);
                         Err(QueryError::MissingDependency {
                             description: format!("Asset not found: {:?}", key),
                         })
@@ -1117,14 +1111,14 @@ impl QueryRuntime {
 
         // Check if there's a registered locator
         if let Some(locator) = self.locators.get(TypeId::of::<K>()) {
-            if let Some(state) = locator.locate_any(key) {
+            if let Some(state) = locator.locate_any(&key) {
                 // Store the state
                 self.assets.insert(full_asset_key.clone(), state.clone());
 
                 match state {
                     AssetState::Ready(arc) => {
                         #[cfg(feature = "inspector")]
-                        emit_requested(self, query_flow_inspector::AssetState::Ready);
+                        emit_requested(self, &key, query_flow_inspector::AssetState::Ready);
 
                         // Register with whale
                         let durability = Durability::new(key.durability().as_u8() as usize)
@@ -1134,7 +1128,7 @@ impl QueryRuntime {
                             .expect("register with no dependencies cannot fail");
 
                         match arc.downcast::<K::Asset>() {
-                            Ok(value) => return Ok(LoadingState::Ready(value)),
+                            Ok(value) => return Ok(AssetLoadingState::ready(key, value)),
                             Err(_) => {
                                 return Err(QueryError::MissingDependency {
                                     description: format!("Asset type mismatch: {:?}", key),
@@ -1144,7 +1138,7 @@ impl QueryRuntime {
                     }
                     AssetState::Loading => {
                         #[cfg(feature = "inspector")]
-                        emit_requested(self, query_flow_inspector::AssetState::Loading);
+                        emit_requested(self, &key, query_flow_inspector::AssetState::Loading);
                         self.pending.insert::<K>(full_asset_key, key.clone());
 
                         // Register in whale so queries can depend on this asset
@@ -1152,11 +1146,11 @@ impl QueryRuntime {
                             .register(full_cache_key, None, Durability::volatile(), vec![])
                             .expect("register with no dependencies cannot fail");
 
-                        return Ok(LoadingState::Loading);
+                        return Ok(AssetLoadingState::loading(key));
                     }
                     AssetState::NotFound => {
                         #[cfg(feature = "inspector")]
-                        emit_requested(self, query_flow_inspector::AssetState::NotFound);
+                        emit_requested(self, &key, query_flow_inspector::AssetState::NotFound);
                         return Err(QueryError::MissingDependency {
                             description: format!("Asset not found: {:?}", key),
                         });
@@ -1167,7 +1161,7 @@ impl QueryRuntime {
 
         // No locator registered or locator returned None - mark as pending
         #[cfg(feature = "inspector")]
-        emit_requested(self, query_flow_inspector::AssetState::Loading);
+        emit_requested(self, &key, query_flow_inspector::AssetState::Loading);
         self.assets
             .insert(full_asset_key.clone(), AssetState::Loading);
         self.pending
@@ -1178,7 +1172,7 @@ impl QueryRuntime {
             .register(full_cache_key, None, Durability::volatile(), vec![])
             .expect("register with no dependencies cannot fail");
 
-        Ok(LoadingState::Loading)
+        Ok(AssetLoadingState::loading(key))
     }
 }
 
@@ -1236,16 +1230,19 @@ impl<'a> QueryContext<'a> {
 
     /// Access an asset, tracking it as a dependency.
     ///
-    /// Returns `LoadingState<Arc<K::Asset>>`:
-    /// - `LoadingState::Loading` if the asset is still being loaded
-    /// - `LoadingState::Ready(value)` if the asset is available
+    /// Returns `AssetLoadingState<K>`:
+    /// - `is_loading()` if the asset is still being loaded
+    /// - `is_ready()` if the asset is available
+    ///
+    /// Use `.suspend()?` to convert to `Result<Arc<K::Asset>, QueryError>`,
+    /// which returns `Err(QueryError::Suspend { asset })` if still loading.
     ///
     /// # Example
     ///
     /// ```ignore
     /// #[query]
     /// fn process_file(ctx: &mut QueryContext, path: FilePath) -> Result<Output, QueryError> {
-    ///     let content = ctx.asset(&path)?.suspend()?;
+    ///     let content = ctx.asset(path)?.suspend()?;
     ///     // Process content...
     ///     Ok(output)
     /// }
@@ -1254,11 +1251,8 @@ impl<'a> QueryContext<'a> {
     /// # Errors
     ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
-    pub fn asset<K: AssetKey>(
-        &mut self,
-        key: &K,
-    ) -> Result<LoadingState<Arc<K::Asset>>, QueryError> {
-        let full_asset_key = FullAssetKey::new(key);
+    pub fn asset<K: AssetKey>(&mut self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
         // Emit asset dependency registered event

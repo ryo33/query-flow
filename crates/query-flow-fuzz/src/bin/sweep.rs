@@ -127,8 +127,11 @@ fn run_parameter_sweep(args: &Args, seed: u64) {
     let threads_list = get_thread_counts(args);
     let mutations_list = get_mutation_kinds(args);
 
-    let total =
-        depths.len() * shapes.len() * update_biases.len() * threads_list.len() * mutations_list.len();
+    let total = depths.len()
+        * shapes.len()
+        * update_biases.len()
+        * threads_list.len()
+        * mutations_list.len();
     let mut completed = 0;
 
     for depth in &depths {
@@ -310,7 +313,10 @@ fn get_mutation_kinds(args: &Args) -> Vec<(&'static str, MutationKind)> {
             ),
         ]
     } else {
-        vec![(mutation_name(&args.mutation), parse_mutation_kind(&args.mutation))]
+        vec![(
+            mutation_name(&args.mutation),
+            parse_mutation_kind(&args.mutation),
+        )]
     }
 }
 

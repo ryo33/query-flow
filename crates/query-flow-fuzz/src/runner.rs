@@ -192,7 +192,6 @@ impl FuzzRunner {
 
     /// Run update cycles concurrently (multi-threaded).
     fn run_concurrent(&self, result: &Arc<Mutex<FuzzResult>>) {
-
         // Install rayon thread-local registry on worker threads
         let registry = self.query_registry.clone();
 
@@ -337,7 +336,10 @@ impl FuzzRunner {
 
                 match self.runtime.query(query.clone()) {
                     Ok(_output) => {
-                        result.lock().query_successes.push((root_id, start.elapsed()));
+                        result
+                            .lock()
+                            .query_successes
+                            .push((root_id, start.elapsed()));
                     }
                     Err(QueryError::Suspend) => {
                         // Expected when assets are removed/invalidated
@@ -510,8 +512,10 @@ impl FuzzRunner {
                 drop(rng);
                 total += self.mutate_remove_queries(1);
                 rng = self.rng.lock();
-            } else if r
-                < remove_asset_prob + invalidate_asset_prob + remove_query_prob + invalidate_query_prob
+            } else if r < remove_asset_prob
+                + invalidate_asset_prob
+                + remove_query_prob
+                + invalidate_query_prob
             {
                 drop(rng);
                 total += self.mutate_invalidate_queries(1);
@@ -545,7 +549,13 @@ impl FuzzRunner {
             UpdateBias::HotSpot {
                 hot_fraction,
                 hot_probability,
-            } => self.select_hotspot_with_rng(leaves, count, *hot_fraction, *hot_probability, &mut *rng),
+            } => self.select_hotspot_with_rng(
+                leaves,
+                count,
+                *hot_fraction,
+                *hot_probability,
+                &mut *rng,
+            ),
             UpdateBias::RoundRobin => {
                 let mut selected = vec![];
                 for _ in 0..count {
@@ -602,7 +612,13 @@ impl FuzzRunner {
     }
 
     /// Select items using Zipf distribution.
-    fn select_zipf_with_rng<R: Rng>(&self, items: &[NodeId], count: usize, s: f64, rng: &mut R) -> Vec<NodeId> {
+    fn select_zipf_with_rng<R: Rng>(
+        &self,
+        items: &[NodeId],
+        count: usize,
+        s: f64,
+        rng: &mut R,
+    ) -> Vec<NodeId> {
         let n = items.len();
         if n == 0 || count == 0 {
             return vec![];

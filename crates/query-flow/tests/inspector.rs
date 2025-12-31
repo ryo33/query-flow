@@ -40,10 +40,7 @@ pub struct TestSource(pub String);
 
 #[query]
 fn process_source(ctx: &mut QueryContext, name: String) -> Result<String, QueryError> {
-    let source = ctx
-        .asset(&TestSource(name.clone()))?
-        .map(|s| (*s).clone())
-        .suspend()?;
+    let source = ctx.asset(TestSource(name.clone()))?.suspend()?;
     Ok(format!("processed: {}", source))
 }
 

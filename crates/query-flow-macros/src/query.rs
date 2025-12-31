@@ -353,13 +353,13 @@ fn generate_query_impl(
         }
     };
 
-    // Generate query() body - bind fields to local variables
+    // Generate query() body - bind fields to local variables (take ownership)
     let field_bindings: Vec<_> = parsed
         .params
         .iter()
         .map(|p| {
             let name = &p.name;
-            quote! { let #name = &self.#name; }
+            quote! { let #name = self.#name; }
         })
         .collect();
 
@@ -402,7 +402,7 @@ fn generate_query_impl(
             }
 
             #( #fn_attrs )*
-            fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+            fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                 #( #field_bindings )*
                 #fn_body
             }
@@ -464,8 +464,8 @@ mod tests {
 
                 #[allow(unused_variables)]
                 #[inline]
-                fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    let x = &self.x;
+                fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                    let x = self.x;
                     {
                         let unused = 42;
                         Ok(x * 2)
@@ -514,9 +514,9 @@ mod tests {
                     (self.a.clone(), self.b.clone())
                 }
 
-                fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    let a = &self.a;
-                    let b = &self.b;
+                fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                    let a = self.a;
+                    let b = self.b;
                     {
                         Ok(a + b)
                     }
@@ -568,7 +568,7 @@ mod tests {
                     // Empty body - evaluates to () without explicit unit expression
                 }
 
-                fn query(&self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
+                fn query(self, ctx: &mut ::query_flow::QueryContext) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
                     {
                         Ok(42)
                     }

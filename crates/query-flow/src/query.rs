@@ -41,7 +41,7 @@ use crate::QueryError;
 ///         (self.a, self.b)
 ///     }
 ///
-///     fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+///     fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
 ///         Ok(self.a + self.b)
 ///     }
 /// }
@@ -57,7 +57,7 @@ use crate::QueryError;
 ///         self.input.clone()
 ///     }
 ///
-///     fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+///     fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
 ///         Ok(self.input.parse())  // Ok(Ok(n)) or Ok(Err(parse_error))
 ///     }
 /// }
@@ -88,7 +88,7 @@ pub trait Query: Clone + Send + Sync + 'static {
     /// * `Ok(output)` - Query completed successfully
     /// * `Err(QueryError::Suspend)` - Query is waiting for async loading
     /// * `Err(QueryError::Cycle)` - Dependency cycle detected
-    fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError>;
+    fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError>;
 
     /// Durability hint for this query.
     ///

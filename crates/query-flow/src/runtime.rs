@@ -484,8 +484,8 @@ impl QueryRuntime {
         #[cfg(not(feature = "inspector"))]
         let _ = exec_ctx;
 
-        // Execute the query
-        let result = query.query(&mut ctx);
+        // Execute the query (clone because query() takes ownership)
+        let result = query.clone().query(&mut ctx);
 
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
@@ -1198,7 +1198,7 @@ impl<'a> QueryContext<'a> {
     /// # Example
     ///
     /// ```ignore
-    /// fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+    /// fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
     ///     let dep_result = ctx.query(OtherQuery { id: self.id })?;
     ///     Ok(process(&dep_result))
     /// }
@@ -1413,7 +1413,7 @@ mod tests {
                 (self.a, self.b)
             }
 
-            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.a + self.b)
             }
 
@@ -1447,7 +1447,7 @@ mod tests {
                 self.value
             }
 
-            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.value * 2)
             }
 
@@ -1469,7 +1469,7 @@ mod tests {
                 self.base_value
             }
 
-            fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 let base = ctx.query(Base {
                     value: self.base_value,
                 })?;
@@ -1507,7 +1507,7 @@ mod tests {
                 self.id
             }
 
-            fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 let b = ctx.query(CycleB { id: self.id })?;
                 Ok(*b + 1)
             }
@@ -1525,7 +1525,7 @@ mod tests {
                 self.id
             }
 
-            fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 let a = ctx.query(CycleA { id: self.id })?;
                 Ok(*a + 1)
             }
@@ -1556,7 +1556,7 @@ mod tests {
                 self.input.clone()
             }
 
-            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.input.parse())
             }
 
@@ -1640,7 +1640,7 @@ mod tests {
 
         #[query]
         fn dependent(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-            let sum = ctx.query(Add::new(*a, *b))?;
+            let sum = ctx.query(Add::new(a, b))?;
             Ok(*sum * 2)
         }
 
@@ -1654,7 +1654,7 @@ mod tests {
         #[query(output_eq)]
         fn with_output_eq(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
             let _ = ctx;
-            Ok(*x * 2)
+            Ok(x * 2)
         }
 
         #[test]
@@ -1667,7 +1667,7 @@ mod tests {
         #[query(name = "CustomName")]
         fn original_name(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
             let _ = ctx;
-            Ok(*x)
+            Ok(x)
         }
 
         #[test]
@@ -1686,7 +1686,7 @@ mod tests {
         fn with_attributes(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
             // This would warn without #[allow(unused_variables)] on the generated method
             let unused_var = 42;
-            Ok(*x * 2)
+            Ok(x * 2)
         }
 
         #[test]
@@ -1715,7 +1715,7 @@ mod tests {
                 self.id
             }
 
-            fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+            fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
                 Ok(self.id * 10)
             }
 

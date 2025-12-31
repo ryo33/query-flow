@@ -29,7 +29,7 @@ fn double(ctx: &mut QueryContext, x: i32) -> Result<i32, QueryError> {
 
 #[query]
 fn add_then_double(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-    let sum = ctx.query(SimpleAdd::new(*a, *b))?;
+    let sum = ctx.query(SimpleAdd::new(a, b))?;
     let doubled = ctx.query(Double::new(*sum))?;
     Ok(*doubled)
 }
@@ -374,7 +374,7 @@ fn test_cycle_detection_events() {
             self.0
         }
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             let b = ctx.query(CycleB(self.0))?;
             Ok(*b + 1)
         }
@@ -392,7 +392,7 @@ fn test_cycle_detection_events() {
             self.0
         }
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             let a = ctx.query(CycleA(self.0))?;
             Ok(*a + 1)
         }

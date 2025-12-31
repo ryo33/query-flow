@@ -87,7 +87,7 @@ fn test_question_mark_propagation_error() {
 #[query]
 fn fallible_io(ctx: &mut QueryContext, should_fail: bool) -> Result<String, QueryError> {
     let _ = ctx;
-    if *should_fail {
+    if should_fail {
         return Err(anyhow::anyhow!("not found").into());
     }
     Ok("success".to_string())
@@ -121,10 +121,10 @@ mod error_caching_error {
         let _ = ctx;
         FALLIBLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        if *id == 0 {
+        if id == 0 {
             return Err(anyhow::anyhow!("id cannot be zero").into());
         }
-        Ok(*id as i32 * 10)
+        Ok(id as i32 * 10)
     }
 
     #[test]
@@ -155,10 +155,10 @@ mod error_caching_success {
         let _ = ctx;
         FALLIBLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        if *id == 0 {
+        if id == 0 {
             return Err(anyhow::anyhow!("id cannot be zero").into());
         }
-        Ok(*id as i32 * 10)
+        Ok(id as i32 * 10)
     }
 
     #[test]
@@ -196,21 +196,21 @@ mod error_comparator_default {
         let _ = ctx;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        if *code < 0 {
+        if code < 0 {
             return Err(CustomError {
-                code: *code,
+                code,
                 message: "negative code".to_string(),
             }
             .into());
         }
-        Ok(*code * 2)
+        Ok(code * 2)
     }
 
     /// Level 2: Depends on Level 1
     #[query]
     fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel1::new(*code))?;
+        let base = ctx.query(ErrorLevel1::new(code))?;
         Ok(*base + 1)
     }
 
@@ -218,7 +218,7 @@ mod error_comparator_default {
     #[query]
     fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel2::new(*code))?;
+        let base = ctx.query(ErrorLevel2::new(code))?;
         Ok(*base + 10)
     }
 
@@ -267,21 +267,21 @@ mod error_comparator_custom {
         let _ = ctx;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        if *code < 0 {
+        if code < 0 {
             return Err(CustomError {
-                code: *code,
+                code,
                 message: "negative code".to_string(),
             }
             .into());
         }
-        Ok(*code * 2)
+        Ok(code * 2)
     }
 
     /// Level 2: Depends on Level 1
     #[query]
     fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel1::new(*code))?;
+        let base = ctx.query(ErrorLevel1::new(code))?;
         Ok(*base + 1)
     }
 
@@ -289,7 +289,7 @@ mod error_comparator_custom {
     #[query]
     fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel2::new(*code))?;
+        let base = ctx.query(ErrorLevel2::new(code))?;
         Ok(*base + 10)
     }
 
@@ -351,21 +351,21 @@ mod error_comparator_always_equal {
         let _ = ctx;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        if *code < 0 {
+        if code < 0 {
             return Err(CustomError {
-                code: *code,
+                code,
                 message: "negative code".to_string(),
             }
             .into());
         }
-        Ok(*code * 2)
+        Ok(code * 2)
     }
 
     /// Level 2: Depends on Level 1
     #[query]
     fn error_level2(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL2_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel1::new(*code))?;
+        let base = ctx.query(ErrorLevel1::new(code))?;
         Ok(*base + 1)
     }
 
@@ -373,7 +373,7 @@ mod error_comparator_always_equal {
     #[query]
     fn error_level3(ctx: &mut QueryContext, code: i32) -> Result<i32, QueryError> {
         ERROR_LEVEL3_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(ErrorLevel2::new(*code))?;
+        let base = ctx.query(ErrorLevel2::new(code))?;
         Ok(*base + 10)
     }
 
@@ -433,7 +433,7 @@ mod mixed_chain {
     #[query]
     fn mixed_middle(ctx: &mut QueryContext, value: i32) -> Result<i32, QueryError> {
         MIXED_MIDDLE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let base = ctx.query(MixedBase::new(*value))?;
+        let base = ctx.query(MixedBase::new(value))?;
 
         if *base > 100 {
             return Err(anyhow::anyhow!("value too large: {}", base).into());
@@ -444,7 +444,7 @@ mod mixed_chain {
     #[query]
     fn mixed_top(ctx: &mut QueryContext, value: i32) -> Result<String, QueryError> {
         MIXED_TOP_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let middle = ctx.query(MixedMiddle::new(*value))?;
+        let middle = ctx.query(MixedMiddle::new(value))?;
         Ok(format!("result: {}", middle))
     }
 
@@ -487,14 +487,14 @@ mod error_downcast {
         let _ = ctx;
         ERROR_LEVEL1_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        if *code < 0 {
+        if code < 0 {
             return Err(CustomError {
-                code: *code,
+                code,
                 message: "negative code".to_string(),
             }
             .into());
         }
-        Ok(*code * 2)
+        Ok(code * 2)
     }
 
     #[test]

@@ -18,7 +18,7 @@ impl Query for DoubleQuery {
         self.value
     }
 
-    fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+    fn query(self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
         Ok(self.value * 2)
     }
 
@@ -49,7 +49,7 @@ impl Query for ListConfigsQuery {
 
     fn cache_key(&self) -> Self::CacheKey {}
 
-    fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+    fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
         let keys = ctx.list_asset_keys::<ConfigFile>();
         let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
         names.sort();
@@ -73,7 +73,7 @@ fn test_list_queries_basic() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             let queries = ctx.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
@@ -114,7 +114,7 @@ fn test_list_queries_invalidation_on_add() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
             let queries = ctx.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
@@ -170,7 +170,7 @@ fn test_list_queries_no_invalidation_on_value_change() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
             let queries = ctx.list_queries::<DoubleQuery>();
             // Just count, don't query individual ones
@@ -215,7 +215,7 @@ fn test_list_queries_individual_dependency() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             let queries = ctx.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
@@ -277,7 +277,7 @@ fn test_list_asset_keys_invalidation_on_remove() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
@@ -329,7 +329,7 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
@@ -376,7 +376,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             CONTENT_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut results = Vec::new();
@@ -426,7 +426,7 @@ fn test_list_queries_empty() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             let queries = ctx.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
@@ -470,7 +470,7 @@ fn test_list_asset_keys_invalidation_on_add() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = ctx.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();

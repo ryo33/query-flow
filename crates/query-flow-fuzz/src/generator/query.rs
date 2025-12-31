@@ -95,7 +95,7 @@ impl Query for SyntheticQuery {
         self.node_id
     }
 
-    fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+    fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
         // Collect dependency outputs
         let mut combined_data = Vec::new();
 

@@ -500,7 +500,7 @@ fn test_caching() {
             self.file_name.clone()
         }
 
-        fn query(&self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
+        fn query(self, ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
             PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
             let source = ctx
                 .asset(SourceFile(self.file_name.clone()))?

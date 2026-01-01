@@ -3,9 +3,10 @@
 //! This module provides `EventSinkTracer`, which implements the `Tracer` trait
 //! from query-flow and forwards events to an `EventSink` as `FlowEvent` instances.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use query_flow::{
     ExecutionResult as TracerExecutionResult, InvalidationReason as TracerInvalidationReason,
@@ -42,12 +43,16 @@ static SPAN_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// ```
 pub struct EventSinkTracer {
     sink: Arc<dyn EventSink>,
+    start_times: Mutex<HashMap<SpanId, Instant>>,
 }
 
 impl EventSinkTracer {
     /// Create a new EventSinkTracer wrapping the given sink.
     pub fn new(sink: Arc<dyn EventSink>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            start_times: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -59,6 +64,10 @@ impl Tracer for EventSinkTracer {
 
     #[inline]
     fn on_query_start(&self, span_id: SpanId, query: TracerQueryKey) {
+        self.start_times
+            .lock()
+            .unwrap()
+            .insert(span_id, Instant::now());
         self.sink.emit(FlowEvent::QueryStart {
             span_id,
             query: query.into(),
@@ -75,13 +84,14 @@ impl Tracer for EventSinkTracer {
     }
 
     #[inline]
-    fn on_query_end(
-        &self,
-        span_id: SpanId,
-        query: TracerQueryKey,
-        result: TracerExecutionResult,
-        duration: Duration,
-    ) {
+    fn on_query_end(&self, span_id: SpanId, query: TracerQueryKey, result: TracerExecutionResult) {
+        let duration = self
+            .start_times
+            .lock()
+            .unwrap()
+            .remove(&span_id)
+            .map(|start| start.elapsed())
+            .unwrap_or(Duration::ZERO);
         self.sink.emit(FlowEvent::QueryEnd {
             span_id,
             query: query.into(),
@@ -190,12 +200,7 @@ mod tests {
 
         tracer.on_query_start(span_id, query.clone());
         tracer.on_cache_check(span_id, query.clone(), false);
-        tracer.on_query_end(
-            span_id,
-            query,
-            TracerExecutionResult::Changed,
-            Duration::from_millis(10),
-        );
+        tracer.on_query_end(span_id, query, TracerExecutionResult::Changed);
 
         // Check events were collected
         let events = collector.events();

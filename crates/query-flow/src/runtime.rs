@@ -4,7 +4,6 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::Instant;
 
 use whale::{Durability, RevisionCounter, Runtime as WhaleRuntime};
 
@@ -250,7 +249,6 @@ impl<T: Tracer> QueryRuntime<T> {
         // Create execution context and emit start event
         let span_id = self.tracer.new_span_id();
         let exec_ctx = ExecutionContext::new(span_id);
-        let start_time = Instant::now();
         let query_key = TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr());
 
         self.tracer.on_query_start(span_id, query_key.clone());
@@ -275,12 +273,8 @@ impl<T: Tracer> QueryRuntime<T> {
                     .map(|s| TracerQueryKey::new("", s.clone()))
                     .collect(),
             );
-            self.tracer.on_query_end(
-                span_id,
-                query_key.clone(),
-                ExecutionResult::CycleDetected,
-                start_time.elapsed(),
-            );
+            self.tracer
+                .on_query_end(span_id, query_key.clone(), ExecutionResult::CycleDetected);
 
             return Err(QueryError::Cycle { path });
         }
@@ -293,12 +287,8 @@ impl<T: Tracer> QueryRuntime<T> {
             // Single atomic access to get both cached value and revision
             if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
                 self.tracer.on_cache_check(span_id, query_key.clone(), true);
-                self.tracer.on_query_end(
-                    span_id,
-                    query_key.clone(),
-                    ExecutionResult::CacheHit,
-                    start_time.elapsed(),
-                );
+                self.tracer
+                    .on_query_end(span_id, query_key.clone(), ExecutionResult::CacheHit);
 
                 return match cached {
                     CachedValue::Ok(output) => Ok((Ok(output), revision)),
@@ -331,12 +321,8 @@ impl<T: Tracer> QueryRuntime<T> {
                     self.whale.mark_verified(&full_key, &current_rev);
 
                     self.tracer.on_cache_check(span_id, query_key.clone(), true);
-                    self.tracer.on_query_end(
-                        span_id,
-                        query_key.clone(),
-                        ExecutionResult::CacheHit,
-                        start_time.elapsed(),
-                    );
+                    self.tracer
+                        .on_query_end(span_id, query_key.clone(), ExecutionResult::CacheHit);
 
                     return match cached {
                         CachedValue::Ok(output) => Ok((Ok(output), revision)),
@@ -371,12 +357,8 @@ impl<T: Tracer> QueryRuntime<T> {
                 message: format!("{:?}", e),
             },
         };
-        self.tracer.on_query_end(
-            span_id,
-            query_key.clone(),
-            exec_result,
-            start_time.elapsed(),
-        );
+        self.tracer
+            .on_query_end(span_id, query_key.clone(), exec_result);
 
         result.map(|(inner_result, _, revision)| (inner_result, revision))
     }

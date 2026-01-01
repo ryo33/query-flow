@@ -27,7 +27,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 /// Unique identifier for a query execution span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -143,14 +142,7 @@ pub trait Tracer: Send + Sync + 'static {
 
     /// Called when a query execution ends.
     #[inline]
-    fn on_query_end(
-        &self,
-        _span_id: SpanId,
-        _query: TracerQueryKey,
-        _result: ExecutionResult,
-        _duration: Duration,
-    ) {
-    }
+    fn on_query_end(&self, _span_id: SpanId, _query: TracerQueryKey, _result: ExecutionResult) {}
 
     /// Called when a query dependency is registered during execution.
     #[inline]
@@ -252,13 +244,7 @@ mod tests {
             self.start_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn on_query_end(
-            &self,
-            _span_id: SpanId,
-            _query: TracerQueryKey,
-            _result: ExecutionResult,
-            _duration: Duration,
-        ) {
+        fn on_query_end(&self, _span_id: SpanId, _query: TracerQueryKey, _result: ExecutionResult) {
             self.end_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -278,12 +264,7 @@ mod tests {
 
         tracer.on_query_start(SpanId(1), key.clone());
         tracer.on_query_start(SpanId(2), key.clone());
-        tracer.on_query_end(
-            SpanId(1),
-            key,
-            ExecutionResult::Changed,
-            Duration::from_millis(10),
-        );
+        tracer.on_query_end(SpanId(1), key, ExecutionResult::Changed);
 
         assert_eq!(tracer.start_count.load(Ordering::Relaxed), 2);
         assert_eq!(tracer.end_count.load(Ordering::Relaxed), 1);

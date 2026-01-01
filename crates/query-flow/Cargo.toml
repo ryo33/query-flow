@@ -20,4 +20,3 @@ serde.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-query-flow-inspector.workspace = true

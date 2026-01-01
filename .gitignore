@@ -6,6 +6,7 @@
 !Cargo.lock
 !src/**/*.rs
 !crates/**/*.rs
+!examples/**/*.rs
 
 !.gitignore
 !README.md

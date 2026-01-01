@@ -13,6 +13,7 @@ default = []
 tracing = ["dep:tracing"]
 
 [dependencies]
+query-flow.workspace = true
 parking_lot = "0.12"
 tracing = { version = "0.1", optional = true }
 serde.workspace = true

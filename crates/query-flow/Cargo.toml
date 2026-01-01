@@ -10,18 +10,13 @@ keywords = ["reactive", "incremental"]
 description = "A high-level query framework built on whale for incremental computation."
 categories = []
 
-[features]
-default = []
-inspector = ["dep:query-flow-inspector", "dep:parking_lot"]
-
 [dependencies]
 whale.workspace = true
 ahash.workspace = true
 papaya.workspace = true
 anyhow.workspace = true
 query-flow-macros.workspace = true
-query-flow-inspector = { workspace = true, optional = true }
-parking_lot = { version = "0.12", optional = true }
+serde.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

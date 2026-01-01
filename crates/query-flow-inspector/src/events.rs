@@ -6,9 +6,14 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Unique identifier for a query execution span.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SpanId(pub u64);
+// Re-export SpanId from query-flow
+pub use query_flow::SpanId;
+
+// Import tracer types for From impls
+use query_flow::{
+    ExecutionResult as TracerExecutionResult, InvalidationReason as TracerInvalidationReason,
+    TracerAssetKey, TracerAssetState, TracerQueryKey,
+};
 
 /// Represents a query key in a type-erased manner.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,6 +29,15 @@ impl QueryKey {
         Self {
             query_type: query_type.into(),
             cache_key_debug: cache_key_debug.into(),
+        }
+    }
+}
+
+impl From<TracerQueryKey> for QueryKey {
+    fn from(key: TracerQueryKey) -> Self {
+        Self {
+            query_type: key.query_type.to_string(),
+            cache_key_debug: key.cache_key_debug,
         }
     }
 }
@@ -46,6 +60,15 @@ impl AssetKey {
     }
 }
 
+impl From<TracerAssetKey> for AssetKey {
+    fn from(key: TracerAssetKey) -> Self {
+        Self {
+            asset_type: key.asset_type.to_string(),
+            key_debug: key.key_debug,
+        }
+    }
+}
+
 /// Reason for cache invalidation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InvalidationReason {
@@ -57,6 +80,23 @@ pub enum InvalidationReason {
     ManualInvalidation,
     /// An asset was removed.
     AssetRemoved { asset: AssetKey },
+}
+
+impl From<TracerInvalidationReason> for InvalidationReason {
+    fn from(reason: TracerInvalidationReason) -> Self {
+        match reason {
+            TracerInvalidationReason::DependencyChanged { dep } => {
+                InvalidationReason::DependencyChanged { dep: dep.into() }
+            }
+            TracerInvalidationReason::AssetChanged { asset } => InvalidationReason::AssetChanged {
+                asset: asset.into(),
+            },
+            TracerInvalidationReason::ManualInvalidation => InvalidationReason::ManualInvalidation,
+            TracerInvalidationReason::AssetRemoved { asset } => InvalidationReason::AssetRemoved {
+                asset: asset.into(),
+            },
+        }
+    }
 }
 
 /// Query execution result classification.
@@ -76,6 +116,19 @@ pub enum ExecutionResult {
     Error { message: String },
 }
 
+impl From<TracerExecutionResult> for ExecutionResult {
+    fn from(result: TracerExecutionResult) -> Self {
+        match result {
+            TracerExecutionResult::Changed => ExecutionResult::Changed,
+            TracerExecutionResult::Unchanged => ExecutionResult::Unchanged,
+            TracerExecutionResult::CacheHit => ExecutionResult::CacheHit,
+            TracerExecutionResult::Suspended => ExecutionResult::Suspended,
+            TracerExecutionResult::CycleDetected => ExecutionResult::CycleDetected,
+            TracerExecutionResult::Error { message } => ExecutionResult::Error { message },
+        }
+    }
+}
+
 /// Asset loading state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AssetState {
@@ -85,6 +138,16 @@ pub enum AssetState {
     Ready,
     /// Asset was not found.
     NotFound,
+}
+
+impl From<TracerAssetState> for AssetState {
+    fn from(state: TracerAssetState) -> Self {
+        match state {
+            TracerAssetState::Loading => AssetState::Loading,
+            TracerAssetState::Ready => AssetState::Ready,
+            TracerAssetState::NotFound => AssetState::NotFound,
+        }
+    }
 }
 
 /// Events emitted during query-flow execution.

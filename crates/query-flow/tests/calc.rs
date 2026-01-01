@@ -6,22 +6,18 @@
 //! - Incremental recomputation
 //! - Early cutoff optimization
 
-use query_flow::{asset_key, query, Db, Query, QueryError, QueryRuntime};
-
-#[cfg(feature = "inspector")]
 use std::sync::Arc;
 
-#[cfg(feature = "inspector")]
+use query_flow::{asset_key, query, Db, Query, QueryError, QueryRuntime};
 use query_flow_inspector::{
-    to_kinds, AssetKey, AssetState, EventCollector, EventKind, ExecutionResult, QueryKey,
+    to_kinds, AssetKey, AssetState, EventCollector, EventKind, EventSinkTracer, ExecutionResult,
+    QueryKey,
 };
 
-#[cfg(feature = "inspector")]
 fn q(query_type: &str, cache_key_debug: &str) -> QueryKey {
     QueryKey::new(query_type, cache_key_debug)
 }
 
-#[cfg(feature = "inspector")]
 fn a(asset_type: &str, key_debug: &str) -> AssetKey {
     AssetKey::new(asset_type, key_debug)
 }
@@ -226,13 +222,9 @@ fn eval_expr(db: &impl Db, expr: &Expr) -> Result<i64, QueryError> {
 
 #[test]
 fn test_simple_expression() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2 * 3".to_string());
 
@@ -241,7 +233,6 @@ fn test_simple_expression() {
     // 1 + (2 * 3) = 7
     assert_eq!(*result, 7);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -302,13 +293,9 @@ fn test_simple_expression() {
 
 #[test]
 fn test_with_variables() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("main".to_string()), "x + y * 2".to_string());
     runtime.resolve_asset(Variable("x".to_string()), 10);
@@ -319,7 +306,6 @@ fn test_with_variables() {
     // 10 + (5 * 2) = 20
     assert_eq!(*result, 20);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -406,13 +392,9 @@ fn test_with_variables() {
 
 #[test]
 fn test_parentheses() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("main".to_string()), "(1 + 2) * 3".to_string());
 
@@ -421,7 +403,6 @@ fn test_parentheses() {
     // (1 + 2) * 3 = 9
     assert_eq!(*result, 9);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -537,13 +518,9 @@ fn test_caching() {
 
 #[test]
 fn test_complex_expression() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(
         SourceFile("main".to_string()),
@@ -555,7 +532,6 @@ fn test_complex_expression() {
     // ((2 + 3) * 4 - 5) / 3 = (5 * 4 - 5) / 3 = (20 - 5) / 3 = 15 / 3 = 5
     assert_eq!(*result, 5);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -616,13 +592,9 @@ fn test_complex_expression() {
 
 #[test]
 fn test_multiple_files() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("a".to_string()), "10".to_string());
     runtime.resolve_asset(SourceFile("b".to_string()), "20 + 5".to_string());
@@ -636,7 +608,6 @@ fn test_multiple_files() {
     assert_eq!(*result_b, 25);
     assert_eq!(*result_c, 9);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -797,13 +768,9 @@ fn test_dependency_chain() {
     // SourceFile asset -> parse_expr query -> eval_file query
     // Variable assets -> eval_file query
 
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("expr".to_string()), "a * b + c".to_string());
     runtime.resolve_asset(Variable("a".to_string()), 2);
@@ -815,7 +782,6 @@ fn test_dependency_chain() {
     // 2 * 3 + 4 = 10
     assert_eq!(*result, 10);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -915,13 +881,9 @@ fn test_dependency_chain() {
 
 #[test]
 fn test_subtraction_and_division() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("main".to_string()), "100 - 50 / 2".to_string());
 
@@ -930,7 +892,6 @@ fn test_subtraction_and_division() {
     // 100 - (50 / 2) = 100 - 25 = 75
     assert_eq!(*result, 75);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -991,13 +952,9 @@ fn test_subtraction_and_division() {
 
 #[test]
 fn test_variable_only() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(SourceFile("main".to_string()), "answer".to_string());
     runtime.resolve_asset(Variable("answer".to_string()), 42);
@@ -1006,7 +963,6 @@ fn test_variable_only() {
 
     assert_eq!(*result, 42);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;
@@ -1079,13 +1035,9 @@ fn test_variable_only() {
 
 #[test]
 fn test_empty_source() {
-    #[cfg(feature = "inspector")]
     let collector = Arc::new(EventCollector::new());
-
-    let runtime = QueryRuntime::new();
-
-    #[cfg(feature = "inspector")]
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     // Don't set any source - should get empty string -> 0
 
@@ -1095,7 +1047,6 @@ fn test_empty_source() {
 
     assert_eq!(*result, 0);
 
-    #[cfg(feature = "inspector")]
     {
         use EventKind::*;
         use ExecutionResult::*;

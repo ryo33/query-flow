@@ -10,15 +10,19 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use query_flow_inspector::{EventCollector, FlowEvent, ExecutionResult};
+//! use query_flow::QueryRuntime;
+//! use query_flow_inspector::{EventCollector, EventSinkTracer, FlowEvent, ExecutionResult};
 //! use std::sync::Arc;
 //!
-//! // Create a collector and attach to runtime
+//! // Create a collector and tracer
 //! let collector = Arc::new(EventCollector::new());
-//! runtime.set_sink(Some(collector.clone()));
+//! let tracer = EventSinkTracer::new(collector.clone());
+//!
+//! // Create runtime with tracer
+//! let runtime = QueryRuntime::with_tracer(tracer);
 //!
 //! // Run queries - events are automatically collected
-//! runtime.query(MyQuery::new(args));
+//! runtime.query(MyQuery::new(args))?;
 //!
 //! // Inspect collected events
 //! let trace = collector.trace();
@@ -42,16 +46,14 @@
 //!
 //! # Architecture
 //!
-//! The sink is stored in `QueryRuntime` rather than thread-local state,
-//! which means:
-//! - Multi-threaded query execution works naturally
-//! - No global state to manage
-//! - Simple API: just call `runtime.set_sink(Some(collector))`
+//! The runtime uses a generic `Tracer` parameter for observability.
+//! `EventSinkTracer` bridges the `Tracer` trait to `EventSink` implementations.
 
 mod collector;
 mod events;
 mod sink;
 mod span_context;
+mod tracer_impl;
 
 pub use collector::EventCollector;
 pub use events::{
@@ -60,6 +62,7 @@ pub use events::{
 };
 pub use sink::{EventSink, FilterSink, MultiplexSink, NullSink};
 pub use span_context::new_span_id;
+pub use tracer_impl::EventSinkTracer;
 
 #[cfg(test)]
 mod tests {

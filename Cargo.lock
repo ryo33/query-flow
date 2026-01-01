@@ -572,9 +572,9 @@ dependencies = [
  "ahash",
  "anyhow",
  "papaya",
- "parking_lot",
  "query-flow-inspector",
  "query-flow-macros",
+ "serde",
  "tokio",
  "whale",
 ]
@@ -600,6 +600,7 @@ name = "query-flow-inspector"
 version = "0.8.0"
 dependencies = [
  "parking_lot",
+ "query-flow",
  "serde",
  "serde_json",
  "tracing",

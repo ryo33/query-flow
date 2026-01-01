@@ -445,28 +445,39 @@ impl AssetKeyRegistry {
 /// Allows re-executing a query to verify it hasn't changed.
 pub(crate) trait AnyVerifier: Send + Sync + 'static {
     /// Verify the query by re-executing it.
-    fn verify(&self, runtime: &crate::QueryRuntime) -> Result<(), crate::QueryError>;
+    /// The runtime is passed as `&dyn Any` and will be downcast to the correct type.
+    fn verify(&self, runtime: &dyn std::any::Any) -> Result<(), crate::QueryError>;
 }
 
 /// Concrete verifier for a specific query type.
-pub(crate) struct QueryVerifier<Q: Query> {
+pub(crate) struct QueryVerifier<Q: Query, T: crate::Tracer> {
     query: Q,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl<Q: Query> QueryVerifier<Q> {
+impl<Q: Query, T: crate::Tracer> QueryVerifier<Q, T> {
     pub fn new(query: Q) -> Self {
-        Self { query }
+        Self {
+            query,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
-impl<Q: Query> AnyVerifier for QueryVerifier<Q> {
-    fn verify(&self, runtime: &crate::QueryRuntime) -> Result<(), crate::QueryError> {
-        match runtime.query(self.query.clone()) {
-            Ok(_) => Ok(()),
-            // UserError is a valid cached result, verification succeeded
-            Err(crate::QueryError::UserError(_)) => Ok(()),
-            // System errors mean verification failed
-            Err(e) => Err(e),
+impl<Q: Query, T: crate::Tracer + 'static> AnyVerifier for QueryVerifier<Q, T> {
+    fn verify(&self, runtime: &dyn std::any::Any) -> Result<(), crate::QueryError> {
+        // Downcast to the correct runtime type
+        if let Some(runtime) = runtime.downcast_ref::<crate::QueryRuntime<T>>() {
+            match runtime.query(self.query.clone()) {
+                Ok(_) => Ok(()),
+                // UserError is a valid cached result, verification succeeded
+                Err(crate::QueryError::UserError(_)) => Ok(()),
+                // System errors mean verification failed
+                Err(e) => Err(e),
+            }
+        } else {
+            // This should never happen if used correctly
+            Ok(())
         }
     }
 }
@@ -496,9 +507,9 @@ impl VerifierStorage {
     }
 
     /// Register a verifier for a query.
-    pub fn insert<Q: Query>(&self, key: FullCacheKey, query: Q) {
+    pub fn insert<Q: Query, T: crate::Tracer + 'static>(&self, key: FullCacheKey, query: Q) {
         let pinned = self.verifiers.pin();
-        pinned.insert(key, Arc::new(QueryVerifier::new(query)));
+        pinned.insert(key, Arc::new(QueryVerifier::<Q, T>::new(query)));
     }
 
     /// Get a verifier for a query key.

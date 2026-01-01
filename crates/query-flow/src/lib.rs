@@ -32,13 +32,13 @@ extern crate self as query_flow;
 mod asset;
 mod db;
 mod error;
-mod inspector;
 mod key;
 mod loading;
 pub mod output_eq;
 mod query;
 mod runtime;
 mod storage;
+pub mod tracer;
 
 pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
 pub use db::Db;
@@ -48,6 +48,10 @@ pub use loading::AssetLoadingState;
 pub use query::Query;
 pub use query_flow_macros::{asset_key, query};
 pub use runtime::{ErrorComparator, Polled, QueryContext, QueryRuntime, QueryRuntimeBuilder};
+pub use tracer::{
+    ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetKey,
+    TracerAssetState, TracerQueryKey,
+};
 
 // Re-export RevisionCounter from whale for use with poll() and changed_at()
 pub use whale::RevisionCounter;

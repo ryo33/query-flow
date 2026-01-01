@@ -1,7 +1,7 @@
 //! Result validation using oracle-based approach.
 
 use crate::generator::{DependencyTree, NodeId};
-use query_flow::{QueryError, QueryRuntime};
+use query_flow::{QueryError, QueryRuntime, Tracer};
 use std::collections::HashMap;
 
 /// Validation failure information.
@@ -13,13 +13,13 @@ pub struct ValidationFailure {
 }
 
 /// Validator for checking query results against expected values.
-pub struct Validator<'a> {
+pub struct Validator<'a, T: Tracer> {
     tree: &'a DependencyTree,
-    runtime: &'a QueryRuntime,
+    runtime: &'a QueryRuntime<T>,
 }
 
-impl<'a> Validator<'a> {
-    pub fn new(tree: &'a DependencyTree, runtime: &'a QueryRuntime) -> Self {
+impl<'a, T: Tracer> Validator<'a, T> {
+    pub fn new(tree: &'a DependencyTree, runtime: &'a QueryRuntime<T>) -> Self {
         Self { tree, runtime }
     }
 

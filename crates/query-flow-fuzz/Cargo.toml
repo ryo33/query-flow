@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Parameterized fuzzy testing and benchmarking suite for query-flow"
 
 [dependencies]
-query-flow = { workspace = true, features = ["inspector"] }
+query-flow.workspace = true
 query-flow-inspector.workspace = true
 ahash.workspace = true
 serde.workspace = true

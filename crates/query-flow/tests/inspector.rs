@@ -2,13 +2,12 @@
 //!
 //! These tests verify that events are correctly emitted during query execution.
 
-#![cfg(feature = "inspector")]
-
 use std::sync::Arc;
 
 use query_flow::{asset_key, query, Db, QueryError, QueryRuntime};
 use query_flow_inspector::{
-    to_kinds, AssetKey, AssetState, EventCollector, EventKind, ExecutionResult, QueryKey,
+    to_kinds, AssetKey, AssetState, EventCollector, EventKind, EventSinkTracer, ExecutionResult,
+    QueryKey,
 };
 
 // ============================================================================
@@ -66,8 +65,8 @@ fn test_simple_query_events() {
     use ExecutionResult::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     let result = runtime.query(SimpleAdd::new(1, 2)).unwrap();
     assert_eq!(*result, 3);
@@ -100,13 +99,14 @@ fn test_cached_query_events() {
     use ExecutionResult::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
-    // First query to populate cache (without tracing)
+    // First query to populate cache (clear events after)
     let _ = runtime.query(SimpleAdd::new(1, 2));
+    collector.clear();
 
-    // Second query should hit cache (with tracing)
-    runtime.set_sink(Some(collector.clone()));
+    // Second query should hit cache
     let result = runtime.query(SimpleAdd::new(1, 2)).unwrap();
     assert_eq!(*result, 3);
 
@@ -134,8 +134,8 @@ fn test_dependent_query_events() {
     use ExecutionResult::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     let result = runtime.query(AddThenDouble::new(2, 3)).unwrap();
     assert_eq!(*result, 10); // (2+3)*2 = 10
@@ -227,12 +227,13 @@ fn test_asset_events() {
     use ExecutionResult::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
-    // Resolve asset first
+    // Resolve asset first (clear events after)
     runtime.resolve_asset(TestSource("test".to_string()), "hello".to_string());
+    collector.clear();
 
-    runtime.set_sink(Some(collector.clone()));
     let result = runtime
         .query(ProcessSource::new("test".to_string()))
         .unwrap();
@@ -288,8 +289,8 @@ fn test_asset_resolution_events() {
     use EventKind::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(TestSource("new".to_string()), "content".to_string());
 
@@ -307,11 +308,12 @@ fn test_asset_invalidation_events() {
     use EventKind::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     runtime.resolve_asset(TestSource("test".to_string()), "content".to_string());
+    collector.clear();
 
-    runtime.set_sink(Some(collector.clone()));
     runtime.invalidate_asset(&TestSource("test".to_string()));
 
     assert_eq!(
@@ -328,8 +330,8 @@ fn test_early_cutoff_events() {
     use ExecutionResult::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     let result = runtime.query(SimpleAdd::new(5, 5)).unwrap();
     assert_eq!(*result, 10);
@@ -403,8 +405,8 @@ fn test_cycle_detection_events() {
     }
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
-    runtime.set_sink(Some(collector.clone()));
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
     let result = runtime.query(CycleA(1));
     assert!(matches!(result, Err(QueryError::Cycle { .. })));
@@ -502,13 +504,14 @@ fn test_query_invalidation_events() {
     use EventKind::*;
 
     let collector = Arc::new(EventCollector::new());
-    let runtime = QueryRuntime::new();
+    let tracer = EventSinkTracer::new(collector.clone());
+    let runtime = QueryRuntime::with_tracer(tracer);
 
-    // Populate cache
+    // Populate cache (clear events after)
     runtime.query(SimpleAdd::new(1, 2)).unwrap();
+    collector.clear();
 
-    // Invalidate with tracing
-    runtime.set_sink(Some(collector.clone()));
+    // Invalidate
     runtime.invalidate::<SimpleAdd>(&(1, 2));
 
     assert_eq!(

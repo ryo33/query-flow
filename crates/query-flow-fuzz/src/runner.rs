@@ -9,13 +9,16 @@ use crate::generator::{
 use crate::recorder::{FuzzEventRecorder, FuzzRunRecord, RunMetadata, RunStats};
 use crate::validator::{ValidationFailure, ValidationResult, Validator};
 use parking_lot::Mutex;
-use query_flow::{QueryError, QueryRuntime};
+use query_flow::QueryError;
+use query_flow_inspector::{EventSinkTracer, NullSink};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+type FuzzRuntime = query_flow::QueryRuntime<EventSinkTracer>;
 
 /// Result of a fuzz test run.
 #[derive(Debug, Default, Clone)]
@@ -67,7 +70,7 @@ impl FuzzResult {
 pub struct FuzzRunner {
     config: FuzzConfig,
     rng: Mutex<SmallRng>,
-    runtime: QueryRuntime,
+    runtime: FuzzRuntime,
     tree: DependencyTree,
     /// Current asset values (for validation).
     asset_values: Mutex<HashMap<NodeId, Vec<u8>>>,
@@ -92,14 +95,14 @@ impl FuzzRunner {
         let mut generator = TreeGenerator::new(config.clone(), SmallRng::seed_from_u64(seed));
         let tree = generator.generate();
 
-        // Create runtime with inspector if recording
-        let runtime = QueryRuntime::new();
-        let recorder = if config.record_events {
+        // Create runtime with tracer (FuzzEventRecorder or NullSink)
+        let (runtime, recorder) = if config.record_events {
             let recorder = Arc::new(FuzzEventRecorder::new());
-            runtime.set_sink(Some(recorder.clone()));
-            Some(recorder)
+            let tracer = EventSinkTracer::new(recorder.clone());
+            (FuzzRuntime::with_tracer(tracer), Some(recorder))
         } else {
-            None
+            let tracer = EventSinkTracer::new(Arc::new(NullSink));
+            (FuzzRuntime::with_tracer(tracer), None)
         };
 
         // Initialize query registry
@@ -294,7 +297,7 @@ impl FuzzRunner {
     }
 
     /// Get the query runtime.
-    pub fn runtime(&self) -> &QueryRuntime {
+    pub fn runtime(&self) -> &FuzzRuntime {
         &self.runtime
     }
 

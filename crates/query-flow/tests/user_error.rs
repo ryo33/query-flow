@@ -1,6 +1,6 @@
 //! Tests for QueryError::UserError functionality.
 
-use query_flow::{query, QueryError, QueryRuntime};
+use query_flow::{query, Db, QueryError, QueryRuntime};
 
 // =============================================================================
 // Basic Error Conversion Tests
@@ -657,7 +657,7 @@ fn test_error_source() {
 // =============================================================================
 
 mod downcast_err_tests {
-    use query_flow::{query, QueryError, QueryResultExt, QueryRuntime};
+    use query_flow::{query, Db, QueryError, QueryResultExt, QueryRuntime};
 
     #[derive(Debug, Clone, PartialEq)]
     struct MyError {

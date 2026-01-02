@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use query_flow::{
-    asset_key, query, AssetKey, AssetLocator, DurabilityLevel, LocateResult, QueryError,
+    asset_key, query, AssetKey, AssetLocator, Db, DurabilityLevel, LocateResult, QueryError,
     QueryRuntime,
 };
 

@@ -100,9 +100,6 @@ struct ParsedFn {
     name: Ident,
     params: Vec<Param>,
     output_ty: Type,
-    body: TokenStream,
-    /// Attributes from the original function (e.g., #[tracing::instrument])
-    attrs: Vec<syn::Attribute>,
 }
 
 pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, Error> {
@@ -143,6 +140,7 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
     let query_impl = generate_query_impl(&parsed, &struct_name, &key_params, &attr)?;
 
     Ok(quote! {
+        #input_fn
         #struct_def
         #query_impl
     })
@@ -151,8 +149,6 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
 fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     let vis = input_fn.vis.clone();
     let name = input_fn.sig.ident.clone();
-    // Extract function attributes (e.g., #[tracing::instrument], #[inline])
-    let attrs = input_fn.attrs.clone();
 
     // Check that first param is db: &impl Db
     let mut iter = input_fn.sig.inputs.iter();
@@ -182,17 +178,11 @@ fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     // Parse return type - must be Result<T, QueryError>
     let output_ty = parse_return_type(&input_fn.sig.output)?;
 
-    // Get function body
-    let body = &input_fn.block;
-    let body_tokens = quote! { #body };
-
     Ok(ParsedFn {
         vis,
         name,
         params,
         output_ty,
-        body: body_tokens,
-        attrs,
     })
 }
 
@@ -353,17 +343,9 @@ fn generate_query_impl(
         }
     };
 
-    // Generate query() body - bind fields to local variables (take ownership)
-    let field_bindings: Vec<_> = parsed
-        .params
-        .iter()
-        .map(|p| {
-            let name = &p.name;
-            quote! { let #name = self.#name; }
-        })
-        .collect();
-
-    let fn_body = &parsed.body;
+    // Generate query() body - call the original function
+    let fn_name = &parsed.name;
+    let field_names: Vec<_> = parsed.params.iter().map(|p| &p.name).collect();
 
     // Generate optional trait methods
     let durability_impl = attr.durability.map(|d| {
@@ -389,9 +371,6 @@ fn generate_query_impl(
         },
     };
 
-    // Attributes from the original function to apply to the query method
-    let fn_attrs = &parsed.attrs;
-
     Ok(quote! {
         impl ::query_flow::Query for #struct_name {
             type CacheKey = #cache_key_ty;
@@ -401,10 +380,8 @@ fn generate_query_impl(
                 #cache_key_body
             }
 
-            #( #fn_attrs )*
             fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                #( #field_bindings )*
-                #fn_body
+                #fn_name(db #(,self.#field_names )*)
             }
 
             #durability_impl
@@ -442,6 +419,13 @@ mod tests {
         let output = generate_query(attr, input_fn).unwrap();
 
         let expected = quote! {
+            #[allow(unused_variables)]
+            #[inline]
+            fn my_query(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+                let unused = 42;
+                Ok(x * 2)
+            }
+
             #[derive(Clone, Debug)]
             struct MyQuery {
                 pub x: i32
@@ -462,14 +446,8 @@ mod tests {
                     self.x.clone()
                 }
 
-                #[allow(unused_variables)]
-                #[inline]
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    let x = self.x;
-                    {
-                        let unused = 42;
-                        Ok(x * 2)
-                    }
+                    my_query(db, self.x)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -493,6 +471,10 @@ mod tests {
         let output = generate_query(attr, input_fn).unwrap();
 
         let expected = quote! {
+            fn simple(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+                Ok(a + b)
+            }
+
             #[derive(Clone, Debug)]
             struct Simple {
                 pub a: i32,
@@ -515,11 +497,7 @@ mod tests {
                 }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    let a = self.a;
-                    let b = self.b;
-                    {
-                        Ok(a + b)
-                    }
+                    simple(db, self.a, self.b)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -543,6 +521,10 @@ mod tests {
         let output = generate_query(attr, input_fn).unwrap();
 
         let expected = quote! {
+            fn no_params(db: &impl Db) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+
             #[derive(Clone, Debug)]
             struct NoParams {
             }
@@ -569,9 +551,7 @@ mod tests {
                 }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    {
-                        Ok(42)
-                    }
+                    no_params(db)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

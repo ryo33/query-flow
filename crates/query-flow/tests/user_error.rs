@@ -651,3 +651,217 @@ fn test_error_source() {
     // let source = query_err.source();
     // assert!(source.is_some());
 }
+
+// =============================================================================
+// QueryResultExt and downcast_err Tests
+// =============================================================================
+
+mod downcast_err_tests {
+    use query_flow::{query, QueryError, QueryResultExt, QueryRuntime};
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct MyError {
+        code: i32,
+        message: String,
+    }
+
+    impl std::fmt::Display for MyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MyError({}): {}", self.code, self.message)
+        }
+    }
+
+    impl std::error::Error for MyError {}
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct OtherError {
+        reason: String,
+    }
+
+    impl std::fmt::Display for OtherError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "OtherError: {}", self.reason)
+        }
+    }
+
+    impl std::error::Error for OtherError {}
+
+    #[query]
+    fn may_fail(db: &impl Db, code: i32) -> Result<String, QueryError> {
+        let _ = db;
+        if code < 0 {
+            return Err(MyError {
+                code,
+                message: "negative code".to_string(),
+            }
+            .into());
+        }
+        if code == 0 {
+            return Err(OtherError {
+                reason: "zero is not allowed".to_string(),
+            }
+            .into());
+        }
+        Ok(format!("success: {}", code))
+    }
+
+    #[test]
+    fn test_downcast_err_success() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(42)).downcast_err::<MyError>();
+
+        // Should be Ok(Ok(value))
+        let inner = result.expect("should not be system error");
+        let value = inner.expect("should be success");
+        assert_eq!(*value, "success: 42");
+    }
+
+    #[test]
+    fn test_downcast_err_matching_error() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(-1)).downcast_err::<MyError>();
+
+        // Should be Ok(Err(TypedErr<MyError>))
+        let inner = result.expect("should not be system error");
+        let typed_err = inner.expect_err("should be user error");
+
+        // TypedErr derefs to MyError
+        assert_eq!(typed_err.code, -1);
+        assert_eq!(typed_err.message, "negative code");
+
+        // Also works with explicit get()
+        assert_eq!(typed_err.get().code, -1);
+    }
+
+    #[test]
+    fn test_downcast_err_non_matching_error() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(0)).downcast_err::<MyError>();
+
+        // Should be Err(QueryError::UserError) because OtherError != MyError
+        let err = result.expect_err("should return error for non-matching type");
+        assert!(matches!(err, QueryError::UserError(_)));
+        assert!(err.to_string().contains("zero is not allowed"));
+    }
+
+    #[test]
+    fn test_downcast_err_with_question_mark() {
+        fn handle_query(runtime: &QueryRuntime) -> Result<String, QueryError> {
+            let result = runtime.query(MayFail::new(-5)).downcast_err::<MyError>()?;
+
+            match result {
+                Ok(value) => Ok(format!("got value: {}", value)),
+                Err(my_err) => Ok(format!("handled MyError with code {}", my_err.code)),
+            }
+        }
+
+        let runtime = QueryRuntime::new();
+        let result = handle_query(&runtime);
+        assert_eq!(result.unwrap(), "handled MyError with code -5");
+    }
+
+    #[test]
+    fn test_downcast_err_propagate_non_matching() {
+        fn handle_query(runtime: &QueryRuntime) -> Result<String, QueryError> {
+            // This will propagate OtherError as QueryError since it doesn't match MyError
+            let result = runtime.query(MayFail::new(0)).downcast_err::<MyError>()?;
+
+            match result {
+                Ok(value) => Ok(format!("got value: {}", value)),
+                Err(my_err) => Ok(format!("handled MyError with code {}", my_err.code)),
+            }
+        }
+
+        let runtime = QueryRuntime::new();
+        let result = handle_query(&runtime);
+
+        // Should propagate as error
+        let err = result.expect_err("should propagate non-matching error");
+        assert!(err.to_string().contains("zero is not allowed"));
+    }
+
+    #[test]
+    fn test_downcast_err_map_err_pattern() {
+        fn handle_query(runtime: &QueryRuntime, code: i32) -> Result<String, String> {
+            let result = runtime
+                .query(MayFail::new(code))
+                .downcast_err::<MyError>()
+                .map_err(|e| format!("system or other error: {}", e))?;
+
+            match result {
+                Ok(value) => Ok((*value).clone()),
+                Err(e) => Err(format!("MyError: code={}", e.code)),
+            }
+        }
+
+        let runtime = QueryRuntime::new();
+
+        // Success case
+        assert_eq!(handle_query(&runtime, 10).unwrap(), "success: 10");
+
+        // MyError case - handled via map_err
+        assert_eq!(handle_query(&runtime, -1).unwrap_err(), "MyError: code=-1");
+
+        // OtherError case - propagated as system error
+        assert!(handle_query(&runtime, 0)
+            .unwrap_err()
+            .contains("system or other error"));
+    }
+
+    #[test]
+    fn test_typed_err_display_and_debug() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(-42)).downcast_err::<MyError>();
+
+        let typed_err = result.unwrap().unwrap_err();
+
+        // Test Display
+        let display = format!("{}", typed_err);
+        assert!(display.contains("MyError"));
+        assert!(display.contains("-42"));
+
+        // Test Debug
+        let debug = format!("{:?}", typed_err);
+        assert!(debug.contains("MyError"));
+        assert!(debug.contains("-42"));
+    }
+
+    #[test]
+    fn test_typed_err_clone() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(-1)).downcast_err::<MyError>();
+
+        let typed_err = result.unwrap().unwrap_err();
+        let cloned = typed_err.clone();
+
+        assert_eq!(typed_err.code, cloned.code);
+        assert_eq!(typed_err.message, cloned.message);
+    }
+
+    #[test]
+    fn test_query_error_downcast_ref() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(-1));
+
+        let err = result.unwrap_err();
+
+        // Test downcast_ref on QueryError directly
+        assert!(err.is::<MyError>());
+        assert!(!err.is::<OtherError>());
+
+        let my_err = err.downcast_ref::<MyError>().unwrap();
+        assert_eq!(my_err.code, -1);
+    }
+
+    #[test]
+    fn test_query_error_user_error() {
+        let runtime = QueryRuntime::new();
+        let result = runtime.query(MayFail::new(-1));
+
+        let err = result.unwrap_err();
+
+        // Test user_error() method
+        let arc = err.user_error().expect("should be UserError");
+        assert!(arc.downcast_ref::<MyError>().is_some());
+    }
+}

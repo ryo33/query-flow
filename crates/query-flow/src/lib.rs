@@ -42,7 +42,7 @@ pub mod tracer;
 
 pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
 pub use db::Db;
-pub use error::QueryError;
+pub use error::{QueryError, QueryResultExt, TypedErr};
 pub use key::{FullCacheKey, Key};
 pub use loading::AssetLoadingState;
 pub use query::Query;

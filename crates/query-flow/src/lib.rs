@@ -10,6 +10,7 @@
 //! - **Suspense pattern**: Handle async loading with `AssetLoadingState` without coloring functions
 //! - **Type-safe**: Per-query-type caching with compile-time guarantees
 //! - **Early cutoff**: Skip downstream recomputation when values don't change
+//! - **External GC support**: Build custom garbage collection strategies using the Tracer API
 //!
 //! # Example
 //!
@@ -25,6 +26,17 @@
 //! let result = runtime.query(Add::new(1, 2)).unwrap();
 //! assert_eq!(*result, 3);
 //! ```
+//!
+//! # Garbage Collection
+//!
+//! Query-flow provides primitives for implementing custom GC strategies externally:
+//!
+//! - [`Tracer::on_query_key`] - Track query access for LRU/TTL algorithms
+//! - [`QueryRuntime::query_keys`] - Enumerate all cached queries
+//! - [`QueryRuntime::remove`] / [`QueryRuntime::remove_if_unused`] - Remove queries by [`FullCacheKey`]
+//! - [`QueryRuntime::remove_query`] / [`QueryRuntime::remove_query_if_unused`] - Remove queries by typed key
+//!
+//! See the [`tracer`] module and GC methods on [`QueryRuntime`] for details.
 
 // Allow the macro to reference query_flow types when used inside this crate
 extern crate self as query_flow;

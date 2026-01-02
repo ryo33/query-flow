@@ -28,6 +28,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::key::FullCacheKey;
+
 /// Unique identifier for a query execution span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanId(pub u64);
@@ -197,6 +199,35 @@ pub trait Tracer: Send + Sync + 'static {
     /// Called when a missing dependency error occurs.
     #[inline]
     fn on_missing_dependency(&self, _query: TracerQueryKey, _dependency_description: String) {}
+
+    /// Called when a query is accessed, providing the [`FullCacheKey`] for GC tracking.
+    ///
+    /// This is called at the start of each query execution, before `on_query_start`.
+    /// Use this to track access times or reference counts for garbage collection.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use query_flow::{FullCacheKey, Tracer, SpanId};
+    /// use std::collections::HashMap;
+    /// use std::sync::Mutex;
+    /// use std::time::Instant;
+    ///
+    /// struct GcTracer {
+    ///     access_times: Mutex<HashMap<FullCacheKey, Instant>>,
+    /// }
+    ///
+    /// impl Tracer for GcTracer {
+    ///     fn new_span_id(&self) -> SpanId { SpanId(0) }
+    ///
+    ///     fn on_query_key(&self, full_key: &FullCacheKey) {
+    ///         self.access_times.lock().unwrap()
+    ///             .insert(full_key.clone(), Instant::now());
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    fn on_query_key(&self, _full_key: &FullCacheKey) {}
 }
 
 /// Zero-cost tracer that discards all events.

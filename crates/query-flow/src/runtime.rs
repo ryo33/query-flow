@@ -246,6 +246,9 @@ impl<T: Tracer> QueryRuntime<T> {
         let key = query.cache_key();
         let full_key = FullCacheKey::new::<Q, _>(&key);
 
+        // Emit query key event for GC tracking (before other events)
+        self.tracer.on_query_key(&full_key);
+
         // Create execution context and emit start event
         let span_id = self.tracer.new_span_id();
         let exec_ctx = ExecutionContext::new(span_id);
@@ -649,6 +652,106 @@ impl<T: Tracer> QueryRuntime<T> {
     pub fn changed_at<Q: Query>(&self, key: &Q::CacheKey) -> Option<RevisionCounter> {
         let full_key = FullCacheKey::new::<Q, _>(key);
         self.whale.get(&full_key).map(|node| node.changed_at)
+    }
+}
+
+// ============================================================================
+// GC (Garbage Collection) API
+// ============================================================================
+
+impl<T: Tracer> QueryRuntime<T> {
+    /// Get all query keys currently in the cache.
+    ///
+    /// This is useful for implementing custom garbage collection strategies.
+    /// Use this in combination with [`Tracer::on_query_key`] to track access
+    /// times and implement LRU, TTL, or other GC algorithms externally.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Collect all keys that haven't been accessed recently
+    /// let stale_keys: Vec<_> = runtime.query_keys()
+    ///     .filter(|key| tracker.is_stale(key))
+    ///     .collect();
+    ///
+    /// // Remove stale queries that have no dependents
+    /// for key in stale_keys {
+    ///     runtime.remove_if_unused(&key);
+    /// }
+    /// ```
+    pub fn query_keys(&self) -> Vec<FullCacheKey> {
+        self.whale.keys()
+    }
+
+    /// Remove a query if it has no dependents.
+    ///
+    /// Returns `true` if the query was removed, `false` if it has dependents
+    /// or doesn't exist. This is the safe way to remove queries during GC,
+    /// as it won't break queries that depend on this one.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let key = FullCacheKey::new::<MyQuery, _>(&cache_key);
+    /// if runtime.remove_query_if_unused::<MyQuery>(&cache_key) {
+    ///     println!("Query removed");
+    /// } else {
+    ///     println!("Query has dependents, not removed");
+    /// }
+    /// ```
+    pub fn remove_query_if_unused<Q: Query>(&self, key: &Q::CacheKey) -> bool {
+        let full_key = FullCacheKey::new::<Q, _>(key);
+        self.remove_if_unused(&full_key)
+    }
+
+    /// Remove a query by its [`FullCacheKey`].
+    ///
+    /// This is the type-erased version of [`remove_query`](Self::remove_query).
+    /// Use this when you have a `FullCacheKey` from [`query_keys`](Self::query_keys)
+    /// or [`Tracer::on_query_key`].
+    ///
+    /// Returns `true` if the query was removed, `false` if it doesn't exist.
+    ///
+    /// # Warning
+    ///
+    /// This forcibly removes the query even if other queries depend on it.
+    /// Dependent queries will be recomputed on next access. For safe GC,
+    /// use [`remove_if_unused`](Self::remove_if_unused) instead.
+    pub fn remove(&self, key: &FullCacheKey) -> bool {
+        // Remove verifier if exists
+        self.verifiers.remove(key);
+
+        // Remove from whale storage
+        self.whale.remove(key).is_some()
+    }
+
+    /// Remove a query by its [`FullCacheKey`] if it has no dependents.
+    ///
+    /// This is the type-erased version of [`remove_query_if_unused`](Self::remove_query_if_unused).
+    /// Use this when you have a `FullCacheKey` from [`query_keys`](Self::query_keys)
+    /// or [`Tracer::on_query_key`].
+    ///
+    /// Returns `true` if the query was removed, `false` if it has dependents
+    /// or doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Implement LRU GC
+    /// for key in runtime.query_keys() {
+    ///     if tracker.is_expired(&key) {
+    ///         runtime.remove_if_unused(&key);
+    ///     }
+    /// }
+    /// ```
+    pub fn remove_if_unused(&self, key: &FullCacheKey) -> bool {
+        if self.whale.remove_if_unused(key.clone()).is_some() {
+            // Successfully removed - clean up verifier
+            self.verifiers.remove(key);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1752,6 +1855,230 @@ mod tests {
 
             // Only the first poll should have triggered a notification
             assert_eq!(notifications, 1);
+        }
+    }
+
+    // Tests for GC APIs
+    mod gc_tests {
+        use super::*;
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Leaf {
+            id: i32,
+        }
+
+        impl Query for Leaf {
+            type CacheKey = i32;
+            type Output = i32;
+
+            fn cache_key(&self) -> Self::CacheKey {
+                self.id
+            }
+
+            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
+                Ok(self.id * 10)
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
+        }
+
+        #[derive(Clone)]
+        struct Parent {
+            child_id: i32,
+        }
+
+        impl Query for Parent {
+            type CacheKey = i32;
+            type Output = i32;
+
+            fn cache_key(&self) -> Self::CacheKey {
+                self.child_id
+            }
+
+            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+                let child = db.query(Leaf { id: self.child_id })?;
+                Ok(*child + 1)
+            }
+
+            fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                old == new
+            }
+        }
+
+        #[test]
+        fn test_query_keys_returns_all_cached_queries() {
+            let runtime = QueryRuntime::new();
+
+            // Execute some queries
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+            let _ = runtime.query(Leaf { id: 2 }).unwrap();
+            let _ = runtime.query(Leaf { id: 3 }).unwrap();
+
+            // Get all keys
+            let keys = runtime.query_keys();
+
+            // Should have at least 3 keys (might have more due to sentinels)
+            assert!(keys.len() >= 3);
+        }
+
+        #[test]
+        fn test_remove_removes_query() {
+            let runtime = QueryRuntime::new();
+
+            // Execute a query
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+
+            // Get the key
+            let full_key = FullCacheKey::new::<Leaf, _>(&1);
+
+            // Query should exist
+            assert!(runtime.changed_at::<Leaf>(&1).is_some());
+
+            // Remove it
+            assert!(runtime.remove(&full_key));
+
+            // Query should no longer exist
+            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+        }
+
+        #[test]
+        fn test_remove_if_unused_removes_leaf_query() {
+            let runtime = QueryRuntime::new();
+
+            // Execute a leaf query (no dependents)
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+
+            // Should be removable since no other query depends on it
+            assert!(runtime.remove_query_if_unused::<Leaf>(&1));
+
+            // Query should no longer exist
+            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+        }
+
+        #[test]
+        fn test_remove_if_unused_does_not_remove_query_with_dependents() {
+            let runtime = QueryRuntime::new();
+
+            // Execute parent query (which depends on Leaf)
+            let _ = runtime.query(Parent { child_id: 1 }).unwrap();
+
+            // Leaf query should not be removable since Parent depends on it
+            assert!(!runtime.remove_query_if_unused::<Leaf>(&1));
+
+            // Leaf query should still exist
+            assert!(runtime.changed_at::<Leaf>(&1).is_some());
+
+            // But Parent should be removable (no dependents)
+            assert!(runtime.remove_query_if_unused::<Parent>(&1));
+        }
+
+        #[test]
+        fn test_remove_if_unused_with_full_cache_key() {
+            let runtime = QueryRuntime::new();
+
+            // Execute a leaf query
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+
+            let full_key = FullCacheKey::new::<Leaf, _>(&1);
+
+            // Should be removable via FullCacheKey
+            assert!(runtime.remove_if_unused(&full_key));
+
+            // Query should no longer exist
+            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+        }
+
+        // Test tracer receives on_query_key calls
+        struct GcTracker {
+            accessed_keys: Mutex<HashSet<String>>,
+            access_count: AtomicUsize,
+        }
+
+        impl GcTracker {
+            fn new() -> Self {
+                Self {
+                    accessed_keys: Mutex::new(HashSet::new()),
+                    access_count: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl Tracer for GcTracker {
+            fn new_span_id(&self) -> SpanId {
+                SpanId(1)
+            }
+
+            fn on_query_key(&self, full_key: &FullCacheKey) {
+                self.accessed_keys
+                    .lock()
+                    .unwrap()
+                    .insert(full_key.debug_repr().to_string());
+                self.access_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        #[test]
+        fn test_tracer_receives_on_query_key() {
+            let tracker = GcTracker::new();
+            let runtime = QueryRuntime::with_tracer(tracker);
+
+            // Execute some queries
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+            let _ = runtime.query(Leaf { id: 2 }).unwrap();
+
+            // Tracer should have received on_query_key calls
+            let count = runtime.tracer().access_count.load(Ordering::Relaxed);
+            assert_eq!(count, 2);
+
+            // Check that the keys were recorded
+            let keys = runtime.tracer().accessed_keys.lock().unwrap();
+            assert!(keys.iter().any(|k| k.contains("Leaf")));
+        }
+
+        #[test]
+        fn test_tracer_receives_on_query_key_for_cache_hits() {
+            let tracker = GcTracker::new();
+            let runtime = QueryRuntime::with_tracer(tracker);
+
+            // Execute query twice (second is cache hit)
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+
+            // Tracer should have received on_query_key for both calls
+            let count = runtime.tracer().access_count.load(Ordering::Relaxed);
+            assert_eq!(count, 2);
+        }
+
+        #[test]
+        fn test_gc_workflow() {
+            let tracker = GcTracker::new();
+            let runtime = QueryRuntime::with_tracer(tracker);
+
+            // Execute some queries
+            let _ = runtime.query(Leaf { id: 1 }).unwrap();
+            let _ = runtime.query(Leaf { id: 2 }).unwrap();
+            let _ = runtime.query(Leaf { id: 3 }).unwrap();
+
+            // Simulate GC: remove all queries that are not in use
+            let mut removed = 0;
+            for key in runtime.query_keys() {
+                if runtime.remove_if_unused(&key) {
+                    removed += 1;
+                }
+            }
+
+            // All leaf queries should be removable
+            assert!(removed >= 3);
+
+            // Queries should no longer exist
+            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+            assert!(runtime.changed_at::<Leaf>(&2).is_none());
+            assert!(runtime.changed_at::<Leaf>(&3).is_none());
         }
     }
 }

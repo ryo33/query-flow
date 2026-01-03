@@ -13,7 +13,7 @@ repository = "https://github.com/ryo33/query-flow"
 readme = "README.md"
 
 [workspace.dependencies]
-whale = { path = "crates/whale", version = "0.4.0" }
+whale = { path = "crates/whale", version = "0.5.0" }
 query-flow = { path = "crates/query-flow", version = "0.11.0" }
 query-flow-macros = { path = "crates/query-flow-macros", version = "0.11.0" }
 query-flow-inspector = { path = "crates/query-flow-inspector", version = "0.11.0" }

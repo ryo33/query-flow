@@ -406,14 +406,12 @@ impl<T: Tracer> QueryRuntime<T> {
 
         match result {
             Ok(output) => {
-                let output = Arc::new(output);
-
                 // Check if output changed (for early cutoff)
                 // existing_revision is Some only when output is unchanged (can reuse revision)
                 let existing_revision = if let Some((CachedValue::Ok(old), rev)) =
                     self.get_cached_with_revision::<Q>(full_key)
                 {
-                    if Q::output_eq(&old, &output) {
+                    if Q::output_eq(&*old, &*output) {
                         Some(rev) // Same output - reuse revision
                     } else {
                         None // Different output
@@ -1551,8 +1549,8 @@ mod tests {
                 (self.a, self.b)
             }
 
-            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-                Ok(self.a + self.b)
+            fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+                Ok(Arc::new(self.a + self.b))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -1585,8 +1583,8 @@ mod tests {
                 self.value
             }
 
-            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-                Ok(self.value * 2)
+            fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+                Ok(Arc::new(self.value * 2))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -1607,11 +1605,11 @@ mod tests {
                 self.base_value
             }
 
-            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let base = db.query(Base {
                     value: self.base_value,
                 })?;
-                Ok(*base + 10)
+                Ok(Arc::new(*base + 10))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -1645,9 +1643,9 @@ mod tests {
                 self.id
             }
 
-            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let b = db.query(CycleB { id: self.id })?;
-                Ok(*b + 1)
+                Ok(Arc::new(*b + 1))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -1663,9 +1661,9 @@ mod tests {
                 self.id
             }
 
-            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let a = db.query(CycleA { id: self.id })?;
-                Ok(*a + 1)
+                Ok(Arc::new(*a + 1))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -1694,8 +1692,8 @@ mod tests {
                 self.input.clone()
             }
 
-            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-                Ok(self.input.parse())
+            fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+                Ok(Arc::new(self.input.parse()))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -1853,8 +1851,8 @@ mod tests {
                 self.id
             }
 
-            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-                Ok(self.id * 10)
+            fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+                Ok(Arc::new(self.id * 10))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -2020,8 +2018,8 @@ mod tests {
                 self.id
             }
 
-            fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-                Ok(self.id * 10)
+            fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+                Ok(Arc::new(self.id * 10))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -2042,9 +2040,9 @@ mod tests {
                 self.child_id
             }
 
-            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let child = db.query(Leaf { id: self.child_id })?;
-                Ok(*child + 1)
+                Ok(Arc::new(*child + 1))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

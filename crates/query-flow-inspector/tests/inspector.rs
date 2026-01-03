@@ -388,9 +388,9 @@ fn test_cycle_detection_events() {
             self.0
         }
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let b = db.query(CycleB(self.0))?;
-            Ok(*b + 1)
+            Ok(Arc::new(*b + 1))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -406,9 +406,9 @@ fn test_cycle_detection_events() {
             self.0
         }
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let a = db.query(CycleA(self.0))?;
-            Ok(*a + 1)
+            Ok(Arc::new(*a + 1))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

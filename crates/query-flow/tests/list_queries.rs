@@ -1,6 +1,7 @@
 //! Tests for list_queries and list_asset_keys functionality.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use query_flow::{AssetKey, Db, DurabilityLevel, Query, QueryError, QueryRuntime};
 
@@ -18,8 +19,8 @@ impl Query for DoubleQuery {
         self.value
     }
 
-    fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-        Ok(self.value * 2)
+    fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+        Ok(Arc::new(self.value * 2))
     }
 
     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -49,11 +50,11 @@ impl Query for ListConfigsQuery {
 
     fn cache_key(&self) -> Self::CacheKey {}
 
-    fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+    fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
         let keys = db.list_asset_keys::<ConfigFile>();
         let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
         names.sort();
-        Ok(names)
+        Ok(Arc::new(names))
     }
 
     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -73,14 +74,14 @@ fn test_list_queries_basic() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let queries = db.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
                 results.push(*db.query(q)?);
             }
             results.sort();
-            Ok(results)
+            Ok(Arc::new(results))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -114,7 +115,7 @@ fn test_list_queries_invalidation_on_add() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
             let queries = db.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
@@ -122,7 +123,7 @@ fn test_list_queries_invalidation_on_add() {
                 results.push(*db.query(q)?);
             }
             results.sort();
-            Ok(results)
+            Ok(Arc::new(results))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -170,11 +171,11 @@ fn test_list_queries_no_invalidation_on_value_change() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
             let queries = db.list_queries::<DoubleQuery>();
             // Just count, don't query individual ones
-            Ok(queries.len())
+            Ok(Arc::new(queries.len()))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -215,14 +216,14 @@ fn test_list_queries_individual_dependency() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let queries = db.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
                 results.push(*db.query(q)?);
             }
             results.sort();
-            Ok(results)
+            Ok(Arc::new(results))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -285,12 +286,12 @@ fn test_list_asset_keys_invalidation_on_remove() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = db.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
             names.sort();
-            Ok(names)
+            Ok(Arc::new(names))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -345,12 +346,12 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = db.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
             names.sort();
-            Ok(names)
+            Ok(Arc::new(names))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -400,7 +401,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             CONTENT_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = db.list_asset_keys::<ConfigFile>();
             let mut results = Vec::new();
@@ -411,7 +412,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
                 }
             }
             results.sort();
-            Ok(results)
+            Ok(Arc::new(results))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -458,14 +459,14 @@ fn test_list_queries_empty() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let queries = db.list_queries::<DoubleQuery>();
             let mut results = Vec::new();
             for q in queries {
                 results.push(*db.query(q)?);
             }
             results.sort();
-            Ok(results)
+            Ok(Arc::new(results))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -502,12 +503,12 @@ fn test_list_asset_keys_invalidation_on_add() {
 
         fn cache_key(&self) -> Self::CacheKey {}
 
-        fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+        fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
             let keys = db.list_asset_keys::<ConfigFile>();
             let mut names: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
             names.sort();
-            Ok(names)
+            Ok(Arc::new(names))
         }
 
         fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

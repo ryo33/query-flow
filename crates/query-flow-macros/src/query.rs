@@ -252,6 +252,22 @@ fn extract_result_ok_type(ty: &Type) -> Result<Type, Error> {
     ))
 }
 
+/// Extract inner type T from Arc<T>, returns None if not an Arc type.
+fn extract_arc_inner(ty: &Type) -> Option<Type> {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Arc" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return Some(inner_ty.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn generate_struct(parsed: &ParsedFn, struct_name: &Ident) -> TokenStream {
     let vis = &parsed.vis;
     let fields: Vec<_> = parsed
@@ -311,6 +327,26 @@ fn generate_query_impl(
 ) -> Result<TokenStream, Error> {
     let output_ty = &parsed.output_ty;
 
+    // Check if the function returns Arc<T> - if so, Output = T and we pass through
+    // Otherwise, Output = T and we wrap with Arc::new
+    let (actual_output_ty, query_body) = if let Some(inner_ty) = extract_arc_inner(output_ty) {
+        // Function returns Arc<T>, so Output = T, pass through directly
+        let fn_name = &parsed.name;
+        let field_names: Vec<_> = parsed.params.iter().map(|p| &p.name).collect();
+        (
+            quote! { #inner_ty },
+            quote! { #fn_name(db #(,self.#field_names )*) },
+        )
+    } else {
+        // Function returns T, so Output = T, wrap with Arc::new
+        let fn_name = &parsed.name;
+        let field_names: Vec<_> = parsed.params.iter().map(|p| &p.name).collect();
+        (
+            quote! { #output_ty },
+            quote! { #fn_name(db #(,self.#field_names )*).map(::std::sync::Arc::new) },
+        )
+    };
+
     // Generate CacheKey type
     let cache_key_ty = match key_params.len() {
         0 => quote! { () },
@@ -339,10 +375,6 @@ fn generate_query_impl(
         }
     };
 
-    // Generate query() body - call the original function
-    let fn_name = &parsed.name;
-    let field_names: Vec<_> = parsed.params.iter().map(|p| &p.name).collect();
-
     let output_eq_impl = match &attr.output_eq {
         // Default: use PartialEq
         OutputEq::None | OutputEq::PartialEq => quote! {
@@ -361,14 +393,14 @@ fn generate_query_impl(
     Ok(quote! {
         impl ::query_flow::Query for #struct_name {
             type CacheKey = #cache_key_ty;
-            type Output = #output_ty;
+            type Output = #actual_output_ty;
 
             fn cache_key(&self) -> Self::CacheKey {
                 #cache_key_body
             }
 
-            fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                #fn_name(db #(,self.#field_names )*)
+            fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                #query_body
             }
 
             #output_eq_impl
@@ -432,8 +464,8 @@ mod tests {
                     self.x.clone()
                 }
 
-                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    my_query(db, self.x)
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    my_query(db, self.x).map(::std::sync::Arc::new)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -482,8 +514,8 @@ mod tests {
                     (self.a.clone(), self.b.clone())
                 }
 
-                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    simple(db, self.a, self.b)
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    simple(db, self.a, self.b).map(::std::sync::Arc::new)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -536,8 +568,57 @@ mod tests {
                     // Empty body - evaluates to () without explicit unit expression
                 }
 
-                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<Self::Output, ::query_flow::QueryError> {
-                    no_params(db)
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    no_params(db).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_arc_output() {
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn returns_arc(db: &impl Db, x: i32) -> Result<Arc<String>, QueryError> {
+                Ok(Arc::new(x.to_string()))
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn returns_arc(db: &impl Db, x: i32) -> Result<Arc<String>, QueryError> {
+                Ok(Arc::new(x.to_string()))
+            }
+
+            #[derive(Clone, Debug)]
+            struct ReturnsArc {
+                pub x: i32
+            }
+
+            impl ReturnsArc {
+                #[doc = r" Create a new query instance."]
+                fn new(x: i32) -> Self {
+                    Self { x }
+                }
+            }
+
+            impl ::query_flow::Query for ReturnsArc {
+                type CacheKey = i32;
+                type Output = String;
+
+                fn cache_key(&self) -> Self::CacheKey {
+                    self.x.clone()
+                }
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    returns_arc(db, self.x)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

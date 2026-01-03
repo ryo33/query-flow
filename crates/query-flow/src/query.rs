@@ -1,5 +1,7 @@
 //! Query trait definition.
 
+use std::sync::Arc;
+
 use crate::db::Db;
 use crate::key::Key;
 use crate::QueryError;
@@ -41,8 +43,8 @@ use crate::QueryError;
 ///         (self.a, self.b)
 ///     }
 ///
-///     fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-///         Ok(self.a + self.b)
+///     fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+///         Ok(Arc::new(self.a + self.b))
 ///     }
 /// }
 ///
@@ -57,8 +59,8 @@ use crate::QueryError;
 ///         self.input.clone()
 ///     }
 ///
-///     fn query(self, _db: &impl Db) -> Result<Self::Output, QueryError> {
-///         Ok(self.input.parse())  // Ok(Ok(n)) or Ok(Err(parse_error))
+///     fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+///         Ok(Arc::new(self.input.parse()))  // Ok(Arc(Ok(n))) or Ok(Arc(Err(parse_error)))
 ///     }
 /// }
 /// ```
@@ -77,7 +79,10 @@ pub trait Query: Clone + Send + Sync + 'static {
     /// Get the cache key for this query instance.
     fn cache_key(&self) -> Self::CacheKey;
 
-    /// Execute the query, returning the output or a system error.
+    /// Execute the query, returning the output wrapped in Arc or a system error.
+    ///
+    /// The result is wrapped in `Arc` for efficient sharing in the cache.
+    /// Use the `#[query]` macro to automatically handle Arc wrapping.
     ///
     /// # Arguments
     ///
@@ -85,10 +90,10 @@ pub trait Query: Clone + Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// * `Ok(output)` - Query completed successfully
+    /// * `Ok(arc_output)` - Query completed successfully
     /// * `Err(QueryError::Suspend)` - Query is waiting for async loading
     /// * `Err(QueryError::Cycle)` - Dependency cycle detected
-    fn query(self, db: &impl Db) -> Result<Self::Output, QueryError>;
+    fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError>;
 
     /// Compare two outputs for equality (for early cutoff optimization).
     ///

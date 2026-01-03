@@ -9,6 +9,8 @@
 #[cfg(test)]
 use query_flow::DurabilityLevel;
 use query_flow::{asset_key, query, Db, QueryError};
+#[cfg(test)]
+use std::sync::Arc;
 
 // ============================================================================
 // Expression AST
@@ -499,14 +501,14 @@ mod tests {
                 self.file_name.clone()
             }
 
-            fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+            fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
                 let source = db
                     .asset(SourceFile(self.file_name.clone()))?
                     .into_inner()
                     .map(|s| (*s).clone())
                     .unwrap_or_default();
-                Ok(parse(&source))
+                Ok(Arc::new(parse(&source)))
             }
 
             fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

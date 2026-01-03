@@ -47,4 +47,4 @@ mod runtime;
 
 pub use node::{Dep, Dependencies, Dependents, Node};
 pub use revision::{AtomicRevision, Durability, Revision, RevisionCounter};
-pub use runtime::{RegisterResult, Runtime};
+pub use runtime::{GetOrInsertResult, RegisterResult, Runtime, UpdateCompareResult};

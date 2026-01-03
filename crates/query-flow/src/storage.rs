@@ -28,18 +28,29 @@ pub enum CachedValue<T> {
 /// update of both cached value and dependency tracking state.
 #[derive(Clone)]
 pub enum CachedEntry {
-    /// Successful output (type-erased).
+    /// Successful query output (type-erased).
     Ok(Arc<dyn Any + Send + Sync>),
-    /// User error.
+    /// User error from query.
     UserError(Arc<anyhow::Error>),
+    /// Asset is ready with value (type-erased).
+    AssetReady(Arc<dyn Any + Send + Sync>),
+    /// Asset was not found.
+    AssetNotFound,
 }
 
 impl CachedEntry {
-    /// Convert to typed CachedValue by downcasting.
+    /// Convert to typed [`CachedValue`] by downcasting.
+    ///
+    /// This is intended for query results only. Returns `None` for asset variants
+    /// (`AssetReady`, `AssetNotFound`) because queries and assets have distinct
+    /// retrieval paths and type semantics:
+    /// - Queries use `CachedValue<Arc<T>>` with `Ok`/`UserError` variants
+    /// - Assets use dedicated methods like `to_asset_value()` or `is_asset_not_found()`
     pub fn to_cached_value<T: Send + Sync + 'static>(&self) -> Option<CachedValue<Arc<T>>> {
         match self {
             CachedEntry::Ok(arc) => arc.clone().downcast::<T>().ok().map(CachedValue::Ok),
             CachedEntry::UserError(e) => Some(CachedValue::UserError(e.clone())),
+            CachedEntry::AssetReady(_) | CachedEntry::AssetNotFound => None,
         }
     }
 }
@@ -53,67 +64,6 @@ pub(crate) enum AssetState {
     Ready(Arc<dyn Any + Send + Sync>),
     /// Asset could not be found.
     NotFound,
-}
-
-/// Thread-safe storage for cached asset values.
-pub(crate) struct AssetStorage {
-    /// Map from FullAssetKey to asset state
-    entries: HashMap<FullAssetKey, AssetState, ahash::RandomState>,
-}
-
-impl Default for AssetStorage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AssetStorage {
-    /// Create a new empty asset storage.
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::with_hasher(ahash::RandomState::new()),
-        }
-    }
-
-    /// Get a cached asset state if present.
-    pub fn get(&self, key: &FullAssetKey) -> Option<AssetState> {
-        let pinned = self.entries.pin();
-        pinned.get(key).cloned()
-    }
-
-    /// Get a cached asset value if ready.
-    pub fn get_ready<K: AssetKey>(&self, key: &FullAssetKey) -> Option<Arc<K::Asset>> {
-        let pinned = self.entries.pin();
-        pinned.get(key).and_then(|state| match state {
-            AssetState::Ready(arc) => arc.clone().downcast::<K::Asset>().ok(),
-            _ => None,
-        })
-    }
-
-    /// Insert an asset state.
-    pub fn insert(&self, key: FullAssetKey, state: AssetState) {
-        let pinned = self.entries.pin();
-        pinned.insert(key, state);
-    }
-
-    /// Insert a ready asset value.
-    pub fn insert_ready<K: AssetKey>(&self, key: FullAssetKey, value: Arc<K::Asset>) {
-        let pinned = self.entries.pin();
-        pinned.insert(key, AssetState::Ready(value as Arc<dyn Any + Send + Sync>));
-    }
-
-    /// Remove an asset from the cache.
-    pub fn remove(&self, key: &FullAssetKey) -> bool {
-        let pinned = self.entries.pin();
-        pinned.remove(key).is_some()
-    }
-
-    /// Clear all cached assets.
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        let pinned = self.entries.pin();
-        pinned.clear();
-    }
 }
 
 /// Type-erased wrapper for asset locators.

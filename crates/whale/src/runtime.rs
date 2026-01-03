@@ -61,6 +61,26 @@ pub struct RegisterResult<const N: usize> {
     pub level: u32,
 }
 
+/// Result of an update_with_compare operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCompareResult<const N: usize> {
+    /// Whether the value was considered changed by the compare function.
+    pub changed: bool,
+    /// The revision counter (new if changed, old if unchanged).
+    pub revision: RevisionCounter,
+    /// The effective durability.
+    pub effective_durability: Durability<N>,
+}
+
+/// Result of a get_or_insert operation.
+#[derive(Debug, Clone)]
+pub enum GetOrInsertResult<K, T, const N: usize> {
+    /// A new node was inserted.
+    Inserted(Node<K, T, N>),
+    /// An existing node was found.
+    Existing(Node<K, T, N>),
+}
+
 impl<K, T, const N: usize> Runtime<K, T, N>
 where
     K: Clone + PartialEq + Eq + std::hash::Hash + std::fmt::Debug,
@@ -500,6 +520,199 @@ where
         }
 
         false
+    }
+
+    /// Atomically update a node with a compare function to determine if the value changed.
+    ///
+    /// This is the primary API for updating cached values with early cutoff optimization.
+    /// The compare function receives the old data (if any) and new data, and returns
+    /// true if the value should be considered changed.
+    ///
+    /// Uses last-writer-wins semantics for concurrent updates.
+    ///
+    /// # Arguments
+    /// - `qid`: The node ID
+    /// - `new_data`: The new data to store
+    /// - `compare`: Function that returns true if old and new are different
+    /// - `durability`: Requested durability level
+    /// - `dep_ids`: Dependencies
+    ///
+    /// # Returns
+    /// - `Ok(UpdateCompareResult)` with changed flag and revision
+    /// - `Err(Vec<K>)` if dependencies are missing
+    pub fn update_with_compare<F>(
+        &self,
+        qid: K,
+        new_data: T,
+        compare: F,
+        durability: Durability<N>,
+        dep_ids: Vec<K>,
+    ) -> Result<UpdateCompareResult<N>, Vec<K>>
+    where
+        F: Fn(Option<&T>, &T) -> bool,
+    {
+        // Build dependency records first (outside the atomic operation)
+        let dep_records = self.build_dep_records(&dep_ids)?;
+        let effective_dur = self.calculate_effective_durability(durability, &dep_records);
+        let new_level = self.calculate_level(&dep_records);
+
+        // Use a cell to capture the result from inside the closure
+        let changed_cell = std::cell::Cell::new(false);
+
+        // Atomic compare-and-update
+        let pinned = self.nodes.pin();
+        let final_result = pinned.compute(qid.clone(), |existing| {
+            let old_data = existing.as_ref().map(|(_, n)| &n.data);
+
+            // Compare inside the atomic section
+            let changed = compare(old_data, &new_data);
+            changed_cell.set(changed);
+
+            let old_dependents = existing
+                .as_ref()
+                .map(|(_, n)| n.dependents.clone())
+                .unwrap_or_default();
+            let old_changed_at = existing.as_ref().map(|(_, n)| n.changed_at);
+
+            // Calculate revision values based on changed
+            let (new_changed_at, new_verified_at) = if changed {
+                let rev = self.increment_revision(effective_dur);
+                (rev, rev)
+            } else {
+                let verified = self.revision.get(effective_dur);
+                (old_changed_at.unwrap_or(verified), verified)
+            };
+
+            let node = Node {
+                id: qid.clone(),
+                data: new_data.clone(),
+                durability: effective_dur,
+                verified_at: new_verified_at,
+                changed_at: new_changed_at,
+                level: new_level,
+                dependencies: Dependencies::new(dep_records.clone()),
+                dependents: old_dependents,
+            };
+            Operation::<_, ()>::Insert(node)
+        });
+
+        let changed = changed_cell.get();
+
+        // Graph edge updates (dependents lists on dependency nodes).
+        // These run outside the atomic section for the following reasons:
+        // - Core correctness (changedAt/verifiedAt) is already atomic above
+        // - Edge updates are idempotent: re-adding to dependents list is a no-op
+        // - This provides eventual consistency for graph traversal
+        // - Validity checks use changedAt/verifiedAt, not edge traversal
+        if let Compute::Updated { old: (_, old_node), .. } = &final_result {
+            self.cleanup_stale_edges(&qid, &old_node.dependencies, &dep_ids);
+        }
+        self.update_graph_edges(&qid, &dep_records);
+
+        // Extract the result
+        match final_result {
+            Compute::Inserted(_, node) | Compute::Updated { new: (_, node), .. } => {
+                Ok(UpdateCompareResult {
+                    changed,
+                    revision: node.changed_at,
+                    effective_durability: node.durability,
+                })
+            }
+            _ => {
+                // Shouldn't happen with Insert operation
+                let verified = self.revision.get(effective_dur);
+                Ok(UpdateCompareResult {
+                    changed,
+                    revision: verified,
+                    effective_durability: effective_dur,
+                })
+            }
+        }
+    }
+
+    /// Atomically get an existing node or insert a new one.
+    ///
+    /// This is useful for cache-miss scenarios where multiple threads might
+    /// try to populate the cache simultaneously.
+    ///
+    /// # Arguments
+    /// - `qid`: The query/asset ID
+    /// - `data`: Data to insert if the node doesn't exist
+    /// - `durability`: Durability level for new node
+    /// - `dep_ids`: Dependencies for new node
+    ///
+    /// # Returns
+    /// - `Ok(GetOrInsertResult::Inserted(node))` if a new node was created
+    /// - `Ok(GetOrInsertResult::Existing(node))` if the node already existed
+    /// - `Err(Vec<K>)` if dependencies are missing (only checked on insert)
+    pub fn get_or_insert(
+        &self,
+        qid: K,
+        data: T,
+        durability: Durability<N>,
+        dep_ids: Vec<K>,
+    ) -> Result<GetOrInsertResult<K, T, N>, Vec<K>> {
+        let pinned = self.nodes.pin();
+
+        // Fast-path: check if node already exists before doing expensive work.
+        // This is an optimization only - correctness is ensured by the atomic
+        // compute() below, which re-checks existence inside the critical section.
+        if let Some(existing) = pinned.get(&qid) {
+            return Ok(GetOrInsertResult::Existing(existing.clone()));
+        }
+
+        // Build dependency records (only needed for insert)
+        let dep_records = self.build_dep_records(&dep_ids)?;
+        let effective_dur = self.calculate_effective_durability(durability, &dep_records);
+        let new_level = self.calculate_level(&dep_records);
+
+        // Use a cell to capture the revision from inside the closure
+        let rev_cell = std::cell::Cell::new(0);
+
+        // Atomic insert-if-absent
+        // Note: increment_revision is called inside the closure to avoid wasting
+        // revision numbers when another thread wins the race
+        let result = pinned.compute(qid.clone(), |existing| {
+            if let Some((_, node)) = existing {
+                // Already exists - abort insert, no revision increment
+                return Operation::Abort(node.clone());
+            }
+
+            // Only increment revision when actually inserting
+            let new_rev = self.increment_revision(effective_dur);
+            rev_cell.set(new_rev);
+
+            // Insert new node
+            let node = Node {
+                id: qid.clone(),
+                data: data.clone(),
+                durability: effective_dur,
+                verified_at: new_rev,
+                changed_at: new_rev,
+                level: new_level,
+                dependencies: Dependencies::new(dep_records.clone()),
+                dependents: Default::default(),
+            };
+            Operation::Insert(node)
+        });
+
+        match result {
+            Compute::Inserted(_, node) => {
+                // Update graph edges for the new node
+                self.update_graph_edges(&qid, &dep_records);
+                Ok(GetOrInsertResult::Inserted(node.clone()))
+            }
+            Compute::Aborted(existing) => Ok(GetOrInsertResult::Existing(existing)),
+            _ => {
+                // Shouldn't happen, but handle gracefully
+                if let Some(node) = pinned.get(&qid) {
+                    Ok(GetOrInsertResult::Existing(node.clone()))
+                } else {
+                    // Very unlikely - try again with regular get
+                    Ok(GetOrInsertResult::Existing(self.get(&qid).unwrap()))
+                }
+            }
+        }
     }
 }
 

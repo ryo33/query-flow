@@ -1,11 +1,11 @@
 //! Query runtime and context.
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use whale::{Durability, RevisionCounter, Runtime as WhaleRuntime};
+use whale::{Durability, GetOrInsertResult, RevisionCounter, Runtime as WhaleRuntime};
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
 use crate::db::Db;
@@ -13,8 +13,8 @@ use crate::key::FullCacheKey;
 use crate::loading::AssetLoadingState;
 use crate::query::Query;
 use crate::storage::{
-    AssetKeyRegistry, AssetState, AssetStorage, CachedEntry, CachedValue, LocatorStorage,
-    PendingStorage, QueryRegistry, VerifierStorage,
+    AssetKeyRegistry, AssetState, CachedEntry, CachedValue, LocatorStorage, PendingStorage,
+    QueryRegistry, VerifierStorage,
 };
 use crate::tracer::{
     ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetKey,
@@ -120,10 +120,8 @@ impl<T: Deref> Deref for Polled<T> {
 /// ```
 pub struct QueryRuntime<T: Tracer = NoopTracer> {
     /// Whale runtime for dependency tracking and cache storage.
-    /// Query outputs are stored in Node.data as Option<CachedEntry>.
+    /// Query outputs and asset values are stored in Node.data as Option<CachedEntry>.
     whale: WhaleRuntime<FullCacheKey, Option<CachedEntry>, DURABILITY_LEVELS>,
-    /// Asset cache and state storage
-    assets: Arc<AssetStorage>,
     /// Registered asset locators
     locators: Arc<LocatorStorage>,
     /// Pending asset requests
@@ -150,7 +148,6 @@ impl<T: Tracer> Clone for QueryRuntime<T> {
     fn clone(&self) -> Self {
         Self {
             whale: self.whale.clone(),
-            assets: self.assets.clone(),
             locators: self.locators.clone(),
             pending: self.pending.clone(),
             query_registry: self.query_registry.clone(),
@@ -828,7 +825,6 @@ impl<T: Tracer> QueryRuntimeBuilder<T> {
     pub fn build(self) -> QueryRuntime<T> {
         QueryRuntime {
             whale: WhaleRuntime::new(),
-            assets: Arc::new(AssetStorage::new()),
             locators: Arc::new(LocatorStorage::new()),
             pending: Arc::new(PendingStorage::new()),
             query_registry: Arc::new(QueryRegistry::new()),
@@ -935,39 +931,43 @@ impl<T: Tracer> QueryRuntime<T> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
-        // Check for early cutoff
-        let changed = if let Some(old_value) = self.assets.get_ready::<K>(&full_asset_key) {
-            !K::asset_eq(&old_value, &value)
-        } else {
-            true // Loading or NotFound -> Ready is a change
-        };
+        // Remove from pending BEFORE registering the value
+        self.pending.remove(&full_asset_key);
+
+        // Prepare the new entry
+        let value_arc: Arc<K::Asset> = Arc::new(value);
+        let entry = CachedEntry::AssetReady(value_arc.clone() as Arc<dyn Any + Send + Sync>);
+        let durability =
+            Durability::new(durability_level.as_u8() as usize).unwrap_or(Durability::volatile());
+
+        // Atomic compare-and-update
+        let result = self
+            .whale
+            .update_with_compare(
+                full_cache_key,
+                Some(entry),
+                |old_data, _new_data| {
+                    // Compare old and new values
+                    match old_data.and_then(|d| d.as_ref()) {
+                        Some(CachedEntry::AssetReady(old_arc)) => {
+                            match old_arc.clone().downcast::<K::Asset>() {
+                                Ok(old_value) => !K::asset_eq(&old_value, &value_arc),
+                                Err(_) => true, // Type mismatch, treat as changed
+                            }
+                        }
+                        _ => true, // Loading, NotFound, or not present -> changed
+                    }
+                },
+                durability,
+                vec![],
+            )
+            .expect("update_with_compare with no dependencies cannot fail");
 
         // Emit asset resolved event
         self.tracer.on_asset_resolved(
             TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
-            changed,
+            result.changed,
         );
-
-        // Store the new value
-        self.assets
-            .insert_ready::<K>(full_asset_key.clone(), Arc::new(value));
-
-        // Remove from pending
-        self.pending.remove(&full_asset_key);
-
-        // Update whale dependency tracking
-        let durability =
-            Durability::new(durability_level.as_u8() as usize).unwrap_or(Durability::volatile());
-
-        if changed {
-            // Register with new changed_at to invalidate dependents
-            let _ = self
-                .whale
-                .register(full_cache_key, None, durability, vec![]);
-        } else {
-            // Early cutoff - keep old changed_at
-            let _ = self.whale.confirm_unchanged(&full_cache_key, vec![]);
-        }
 
         // Register asset key in registry for list_asset_keys
         let is_new_asset = self.asset_key_registry.register(&key);
@@ -1003,14 +1003,12 @@ impl<T: Tracer> QueryRuntime<T> {
             format!("{:?}", key),
         ));
 
-        // Mark as loading
-        self.assets
-            .insert(full_asset_key.clone(), AssetState::Loading);
-
-        // Add to pending
+        // Add to pending FIRST (before clearing whale state)
+        // This ensures: readers see either old value, or Loading+pending
         self.pending.insert::<K>(full_asset_key, key.clone());
 
-        // Update whale to invalidate dependents (use volatile during loading)
+        // Atomic: clear cached value + invalidate dependents
+        // Using None for data means "needs to be loaded"
         let _ = self
             .whale
             .register(full_cache_key, None, Durability::volatile(), vec![]);
@@ -1024,17 +1022,11 @@ impl<T: Tracer> QueryRuntime<T> {
         let full_asset_key = FullAssetKey::new(key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
-        // First, register a change to invalidate dependents
-        // This ensures queries that depend on this asset will recompute
-        let _ = self
-            .whale
-            .register(full_cache_key.clone(), None, Durability::volatile(), vec![]);
-
-        // Then remove the asset from storage
-        self.assets.remove(&full_asset_key);
+        // Remove from pending first
         self.pending.remove(&full_asset_key);
 
-        // Finally remove from whale tracking
+        // Remove from whale (this also cleans up dependency edges)
+        // whale.remove() invalidates dependents before removing
         self.whale.remove(&full_cache_key);
 
         // Remove from registry and update sentinel for list_asset_keys
@@ -1074,52 +1066,14 @@ impl<T: Tracer> QueryRuntime<T> {
             );
         };
 
-        // Check cache first
-        if let Some(state) = self.assets.get(&full_asset_key) {
-            // Check if whale thinks it's valid
+        // Check whale cache first (single atomic read)
+        if let Some(node) = self.whale.get(&full_cache_key) {
+            // Check if valid at current revision
             if self.whale.is_valid(&full_cache_key) {
-                return match state {
-                    AssetState::Loading => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::Loading);
-                        Ok(AssetLoadingState::loading(key))
-                    }
-                    AssetState::Ready(arc) => {
+                match &node.data {
+                    Some(CachedEntry::AssetReady(arc)) => {
                         emit_requested(&self.tracer, &key, TracerAssetState::Ready);
-                        match arc.downcast::<K::Asset>() {
-                            Ok(value) => Ok(AssetLoadingState::ready(key, value)),
-                            Err(_) => Err(QueryError::MissingDependency {
-                                description: format!("Asset type mismatch: {:?}", key),
-                            }),
-                        }
-                    }
-                    AssetState::NotFound => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
-                        Err(QueryError::MissingDependency {
-                            description: format!("Asset not found: {:?}", key),
-                        })
-                    }
-                };
-            }
-        }
-
-        // Check if there's a registered locator
-        if let Some(locator) = self.locators.get(TypeId::of::<K>()) {
-            if let Some(state) = locator.locate_any(&key) {
-                // Store the state
-                self.assets.insert(full_asset_key.clone(), state.clone());
-
-                match state {
-                    AssetState::Ready(arc) => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::Ready);
-
-                        // Register with whale
-                        let durability = Durability::new(key.durability().as_u8() as usize)
-                            .unwrap_or(Durability::volatile());
-                        self.whale
-                            .register(full_cache_key, None, durability, vec![])
-                            .expect("register with no dependencies cannot fail");
-
-                        match arc.downcast::<K::Asset>() {
+                        match arc.clone().downcast::<K::Asset>() {
                             Ok(value) => return Ok(AssetLoadingState::ready(key, value)),
                             Err(_) => {
                                 return Err(QueryError::MissingDependency {
@@ -1128,19 +1082,122 @@ impl<T: Tracer> QueryRuntime<T> {
                             }
                         }
                     }
+                    Some(CachedEntry::AssetNotFound) => {
+                        emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
+                        return Err(QueryError::MissingDependency {
+                            description: format!("Asset not found: {:?}", key),
+                        });
+                    }
+                    None => {
+                        // Loading state - check if in pending
+                        emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                        return Ok(AssetLoadingState::loading(key));
+                    }
+                    _ => {
+                        // Query-related entries (Ok, UserError) shouldn't be here
+                        // Fall through to locator
+                    }
+                }
+            }
+        }
+
+        // Not in cache or invalid - try locator
+        if let Some(locator) = self.locators.get(TypeId::of::<K>()) {
+            if let Some(state) = locator.locate_any(&key) {
+                match state {
+                    AssetState::Ready(arc) => {
+                        emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+
+                        // Downcast to concrete type first - this must succeed since locator
+                        // returned this arc for our key type
+                        let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return Err(QueryError::MissingDependency {
+                                    description: format!("Asset type mismatch: {:?}", key),
+                                });
+                            }
+                        };
+
+                        // Store in whale atomically with early cutoff
+                        let entry = CachedEntry::AssetReady(typed_value.clone());
+                        let durability = Durability::new(key.durability().as_u8() as usize)
+                            .unwrap_or(Durability::volatile());
+                        let new_value = typed_value.clone();
+                        let _ = self.whale.update_with_compare(
+                            full_cache_key,
+                            Some(entry),
+                            |old_data, _new_data| {
+                                // Check if value actually changed (early cutoff)
+                                let Some(CachedEntry::AssetReady(old_arc)) =
+                                    old_data.and_then(|d| d.as_ref())
+                                else {
+                                    return true; // No previous value or different variant
+                                };
+                                let Ok(old_value) = old_arc.clone().downcast::<K::Asset>() else {
+                                    return true; // Type mismatch with previous value
+                                };
+                                !K::asset_eq(&old_value, &new_value)
+                            },
+                            durability,
+                            vec![],
+                        );
+
+                        return Ok(AssetLoadingState::ready(key, typed_value));
+                    }
                     AssetState::Loading => {
                         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+
+                        // Add to pending and use get_or_insert to avoid overwriting existing Ready
                         self.pending.insert::<K>(full_asset_key, key.clone());
-
-                        // Register in whale so queries can depend on this asset
-                        self.whale
-                            .register(full_cache_key, None, Durability::volatile(), vec![])
-                            .expect("register with no dependencies cannot fail");
-
-                        return Ok(AssetLoadingState::loading(key));
+                        match self
+                            .whale
+                            .get_or_insert(full_cache_key, None, Durability::volatile(), vec![])
+                            .expect("get_or_insert with no dependencies cannot fail")
+                        {
+                            GetOrInsertResult::Inserted(_) => {
+                                return Ok(AssetLoadingState::loading(key));
+                            }
+                            GetOrInsertResult::Existing(node) => {
+                                // Another thread already inserted a value - use it
+                                match &node.data {
+                                    Some(CachedEntry::AssetReady(arc)) => {
+                                        match arc.clone().downcast::<K::Asset>() {
+                                            Ok(value) => return Ok(AssetLoadingState::ready(key, value)),
+                                            Err(_) => return Ok(AssetLoadingState::loading(key)),
+                                        }
+                                    }
+                                    Some(CachedEntry::AssetNotFound) => {
+                                        return Err(QueryError::MissingDependency {
+                                            description: format!("Asset not found: {:?}", key),
+                                        });
+                                    }
+                                    _ => return Ok(AssetLoadingState::loading(key)),
+                                }
+                            }
+                        }
                     }
                     AssetState::NotFound => {
                         emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
+
+                        // Store NotFound in whale atomically (so we don't keep re-querying)
+                        let entry = CachedEntry::AssetNotFound;
+                        let durability = Durability::new(key.durability().as_u8() as usize)
+                            .unwrap_or(Durability::volatile());
+                        let _ = self.whale.update_with_compare(
+                            full_cache_key,
+                            Some(entry),
+                            |old_data, _new_data| {
+                                // Changed unless already NotFound
+                                !matches!(
+                                    old_data.and_then(|d| d.as_ref()),
+                                    Some(CachedEntry::AssetNotFound)
+                                )
+                            },
+                            durability,
+                            vec![],
+                        );
+
                         return Err(QueryError::MissingDependency {
                             description: format!("Asset not found: {:?}", key),
                         });
@@ -1151,17 +1208,32 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // No locator registered or locator returned None - mark as pending
         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
-        self.assets
-            .insert(full_asset_key.clone(), AssetState::Loading);
         self.pending
             .insert::<K>(full_asset_key.clone(), key.clone());
 
-        // Register in whale so queries can depend on this asset
-        self.whale
-            .register(full_cache_key, None, Durability::volatile(), vec![])
-            .expect("register with no dependencies cannot fail");
-
-        Ok(AssetLoadingState::loading(key))
+        // Use get_or_insert to avoid overwriting existing values
+        match self
+            .whale
+            .get_or_insert(full_cache_key, None, Durability::volatile(), vec![])
+            .expect("get_or_insert with no dependencies cannot fail")
+        {
+            GetOrInsertResult::Inserted(_) => Ok(AssetLoadingState::loading(key)),
+            GetOrInsertResult::Existing(node) => {
+                // Another thread already inserted a value - use it
+                match &node.data {
+                    Some(CachedEntry::AssetReady(arc)) => {
+                        match arc.clone().downcast::<K::Asset>() {
+                            Ok(value) => Ok(AssetLoadingState::ready(key, value)),
+                            Err(_) => Ok(AssetLoadingState::loading(key)),
+                        }
+                    }
+                    Some(CachedEntry::AssetNotFound) => Err(QueryError::MissingDependency {
+                        description: format!("Asset not found: {:?}", key),
+                    }),
+                    _ => Ok(AssetLoadingState::loading(key)),
+                }
+            }
+        }
     }
 }
 

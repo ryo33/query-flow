@@ -6,11 +6,7 @@
 //! - Incremental recomputation
 //! - Early cutoff optimization
 
-#[cfg(test)]
-use query_flow::DurabilityLevel;
 use query_flow::{asset_key, query, Db, QueryError};
-#[cfg(test)]
-use std::sync::Arc;
 
 // ============================================================================
 // Expression AST
@@ -213,6 +209,7 @@ fn eval_expr(db: &impl Db, expr: &Expr) -> Result<i64, QueryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use query_flow::DurabilityLevel;
     use query_flow::{Query, QueryRuntime};
     use query_flow_inspector::{
         to_kinds, AssetKey, AssetState, EventCollector, EventKind, EventSinkTracer,

@@ -54,6 +54,14 @@ pub enum QueryError {
         missing_keys: Vec<FullCacheKey>,
     },
 
+    /// Asset resolution occurred during query execution.
+    ///
+    /// This error is returned when `resolve_asset` is called while a query is
+    /// executing, and the resolved asset affects a dependency that the query
+    /// has already accessed. This would cause different parts of the query
+    /// to observe different asset values, violating consistency.
+    InconsistentAssetResolution,
+
     /// User-defined error.
     ///
     /// This variant allows user errors to be propagated through the query system
@@ -83,6 +91,12 @@ impl fmt::Display for QueryError {
                     f,
                     "dependencies removed during execution: {:?}",
                     missing_keys
+                )
+            }
+            QueryError::InconsistentAssetResolution => {
+                write!(
+                    f,
+                    "asset resolution occurred during query execution, causing inconsistent snapshot"
                 )
             }
             QueryError::UserError(e) => write!(f, "user error: {}", e),

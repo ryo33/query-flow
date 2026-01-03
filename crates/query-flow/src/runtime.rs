@@ -1,7 +1,7 @@
 //! Query runtime and context.
 
 use std::any::{Any, TypeId};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -389,6 +389,7 @@ impl<T: Tracer> QueryRuntime<T> {
             parent_query_type: std::any::type_name::<Q>(),
             exec_ctx,
             deps: RefCell::new(Vec::new()),
+            first_access_revision: Cell::new(None),
         };
 
         // Execute the query (clone because query() takes ownership)
@@ -1049,8 +1050,14 @@ impl<T: Tracer> QueryRuntime<T> {
         self.get_asset_internal(key)
     }
 
-    /// Internal: Get asset state, checking cache and locator.
-    fn get_asset_internal<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+    /// Internal: Get asset state and its changed_at revision atomically.
+    ///
+    /// Returns (AssetLoadingState, changed_at) where changed_at is from the same
+    /// whale node that provided the asset value.
+    fn get_asset_with_revision<K: AssetKey>(
+        &self,
+        key: K,
+    ) -> Result<(AssetLoadingState<K>, RevisionCounter), QueryError> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
@@ -1064,13 +1071,16 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // Check whale cache first (single atomic read)
         if let Some(node) = self.whale.get(&full_cache_key) {
+            let changed_at = node.changed_at;
             // Check if valid at current revision
             if self.whale.is_valid(&full_cache_key) {
                 match &node.data {
                     Some(CachedEntry::AssetReady(arc)) => {
                         emit_requested(&self.tracer, &key, TracerAssetState::Ready);
                         match arc.clone().downcast::<K::Asset>() {
-                            Ok(value) => return Ok(AssetLoadingState::ready(key, value)),
+                            Ok(value) => {
+                                return Ok((AssetLoadingState::ready(key, value), changed_at))
+                            }
                             Err(_) => {
                                 return Err(QueryError::MissingDependency {
                                     description: format!("Asset type mismatch: {:?}", key),
@@ -1085,9 +1095,9 @@ impl<T: Tracer> QueryRuntime<T> {
                         });
                     }
                     None => {
-                        // Loading state - check if in pending
+                        // Loading state
                         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
-                        return Ok(AssetLoadingState::loading(key));
+                        return Ok((AssetLoadingState::loading(key), changed_at));
                     }
                     _ => {
                         // Query-related entries (Ok, UserError) shouldn't be here
@@ -1107,8 +1117,6 @@ impl<T: Tracer> QueryRuntime<T> {
                     } => {
                         emit_requested(&self.tracer, &key, TracerAssetState::Ready);
 
-                        // Downcast to concrete type first - this must succeed since locator
-                        // returned this arc for our key type
                         let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                             Ok(v) => v,
                             Err(_) => {
@@ -1124,49 +1132,59 @@ impl<T: Tracer> QueryRuntime<T> {
                         let durability = Durability::new(durability_level.as_u8() as usize)
                             .unwrap_or(Durability::volatile());
                         let new_value = typed_value.clone();
-                        let _ = self.whale.update_with_compare(
-                            full_cache_key,
-                            Some(entry),
-                            |old_data, _new_data| {
-                                // Check if value actually changed (early cutoff)
-                                let Some(CachedEntry::AssetReady(old_arc)) =
-                                    old_data.and_then(|d| d.as_ref())
-                                else {
-                                    return true; // No previous value or different variant
-                                };
-                                let Ok(old_value) = old_arc.clone().downcast::<K::Asset>() else {
-                                    return true; // Type mismatch with previous value
-                                };
-                                !K::asset_eq(&old_value, &new_value)
-                            },
-                            durability,
-                            vec![],
-                        );
+                        let result = self
+                            .whale
+                            .update_with_compare(
+                                full_cache_key,
+                                Some(entry),
+                                |old_data, _new_data| {
+                                    let Some(CachedEntry::AssetReady(old_arc)) =
+                                        old_data.and_then(|d| d.as_ref())
+                                    else {
+                                        return true;
+                                    };
+                                    let Ok(old_value) = old_arc.clone().downcast::<K::Asset>()
+                                    else {
+                                        return true;
+                                    };
+                                    !K::asset_eq(&old_value, &new_value)
+                                },
+                                durability,
+                                vec![],
+                            )
+                            .expect("update_with_compare with no dependencies cannot fail");
 
-                        return Ok(AssetLoadingState::ready(key, typed_value));
+                        return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                     }
                     AssetState::Loading => {
                         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
 
-                        // Add to pending and use get_or_insert to avoid overwriting existing Ready
                         self.pending.insert::<K>(full_asset_key, key.clone());
                         match self
                             .whale
                             .get_or_insert(full_cache_key, None, Durability::volatile(), vec![])
                             .expect("get_or_insert with no dependencies cannot fail")
                         {
-                            GetOrInsertResult::Inserted(_) => {
-                                return Ok(AssetLoadingState::loading(key));
+                            GetOrInsertResult::Inserted(node) => {
+                                return Ok((AssetLoadingState::loading(key), node.changed_at));
                             }
                             GetOrInsertResult::Existing(node) => {
-                                // Another thread already inserted a value - use it
+                                let changed_at = node.changed_at;
                                 match &node.data {
                                     Some(CachedEntry::AssetReady(arc)) => {
                                         match arc.clone().downcast::<K::Asset>() {
                                             Ok(value) => {
-                                                return Ok(AssetLoadingState::ready(key, value))
+                                                return Ok((
+                                                    AssetLoadingState::ready(key, value),
+                                                    changed_at,
+                                                ))
                                             }
-                                            Err(_) => return Ok(AssetLoadingState::loading(key)),
+                                            Err(_) => {
+                                                return Ok((
+                                                    AssetLoadingState::loading(key),
+                                                    changed_at,
+                                                ))
+                                            }
                                         }
                                     }
                                     Some(CachedEntry::AssetNotFound) => {
@@ -1174,7 +1192,7 @@ impl<T: Tracer> QueryRuntime<T> {
                                             description: format!("Asset not found: {:?}", key),
                                         });
                                     }
-                                    _ => return Ok(AssetLoadingState::loading(key)),
+                                    _ => return Ok((AssetLoadingState::loading(key), changed_at)),
                                 }
                             }
                         }
@@ -1182,15 +1200,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     AssetState::NotFound => {
                         emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
 
-                        // Store NotFound in whale atomically (so we don't keep re-querying)
-                        // TODO: AssetLocator API should include durability
                         let entry = CachedEntry::AssetNotFound;
                         let durability = Durability::volatile();
                         let _ = self.whale.update_with_compare(
                             full_cache_key,
                             Some(entry),
                             |old_data, _new_data| {
-                                // Changed unless already NotFound
                                 !matches!(
                                     old_data.and_then(|d| d.as_ref()),
                                     Some(CachedEntry::AssetNotFound)
@@ -1213,29 +1228,35 @@ impl<T: Tracer> QueryRuntime<T> {
         self.pending
             .insert::<K>(full_asset_key.clone(), key.clone());
 
-        // Use get_or_insert to avoid overwriting existing values
         match self
             .whale
             .get_or_insert(full_cache_key, None, Durability::volatile(), vec![])
             .expect("get_or_insert with no dependencies cannot fail")
         {
-            GetOrInsertResult::Inserted(_) => Ok(AssetLoadingState::loading(key)),
+            GetOrInsertResult::Inserted(node) => {
+                Ok((AssetLoadingState::loading(key), node.changed_at))
+            }
             GetOrInsertResult::Existing(node) => {
-                // Another thread already inserted a value - use it
+                let changed_at = node.changed_at;
                 match &node.data {
                     Some(CachedEntry::AssetReady(arc)) => {
                         match arc.clone().downcast::<K::Asset>() {
-                            Ok(value) => Ok(AssetLoadingState::ready(key, value)),
-                            Err(_) => Ok(AssetLoadingState::loading(key)),
+                            Ok(value) => Ok((AssetLoadingState::ready(key, value), changed_at)),
+                            Err(_) => Ok((AssetLoadingState::loading(key), changed_at)),
                         }
                     }
                     Some(CachedEntry::AssetNotFound) => Err(QueryError::MissingDependency {
                         description: format!("Asset not found: {:?}", key),
                     }),
-                    _ => Ok(AssetLoadingState::loading(key)),
+                    _ => Ok((AssetLoadingState::loading(key), changed_at)),
                 }
             }
         }
+    }
+
+    /// Internal: Get asset state, checking cache and locator.
+    fn get_asset_internal<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        self.get_asset_with_revision(key).map(|(state, _)| state)
     }
 }
 
@@ -1266,9 +1287,43 @@ pub struct QueryContext<'a, T: Tracer = NoopTracer> {
     parent_query_type: &'static str,
     exec_ctx: ExecutionContext,
     deps: RefCell<Vec<FullCacheKey>>,
+    /// Revision at first asset access, used for consistency checking.
+    /// Assets with changed_at > this value were modified during query execution.
+    first_access_revision: Cell<Option<RevisionCounter>>,
 }
 
 impl<'a, T: Tracer> QueryContext<'a, T> {
+    /// Ensure consistency of asset access.
+    ///
+    /// On first asset access: records max(current_global, dep_changed_at) as baseline.
+    /// On subsequent asset accesses: checks dep_changed_at <= baseline.
+    ///
+    /// IMPORTANT: current_global must be obtained BEFORE accessing the asset.
+    #[inline]
+    fn ensure_consistent(
+        &self,
+        current_global: RevisionCounter,
+        dep_changed_at: RevisionCounter,
+    ) -> Result<(), QueryError> {
+        match self.first_access_revision.get() {
+            None => {
+                // First asset access: record max(current_global, dep_changed_at)
+                // Using max ensures we don't get false positives when only one asset is accessed
+                let first = current_global.max(dep_changed_at);
+                self.first_access_revision.set(Some(first));
+                Ok(())
+            }
+            Some(first) => {
+                // Subsequent asset accesses: check consistency
+                if dep_changed_at > first {
+                    Err(QueryError::InconsistentAssetResolution)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// Query a dependency.
     ///
     /// The dependency is automatically tracked for invalidation.
@@ -1326,18 +1381,31 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
-        // Emit asset dependency registered event
+        // 1. Get current_global FIRST (before accessing the asset)
+        let current_global = self
+            .runtime
+            .whale
+            .current_revision()
+            .get(Durability::volatile());
+
+        // 2. Emit asset dependency registered event
         self.runtime.tracer.on_asset_dependency_registered(
             self.exec_ctx.span_id(),
             TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
             TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
         );
 
-        // Record dependency on this asset
+        // 3. Record dependency on this asset
         self.deps.borrow_mut().push(full_cache_key);
 
-        // Get asset from runtime
-        let result = self.runtime.get_asset_internal(key);
+        // 4. Get asset AND changed_at from the same whale access (atomic)
+        let (result, dep_changed_at) = match self.runtime.get_asset_with_revision(key) {
+            Ok((state, rev)) => (Ok(state), rev),
+            Err(e) => return Err(e),
+        };
+
+        // 5. Check consistency - detects if resolve_asset was called during query execution
+        self.ensure_consistent(current_global, dep_changed_at)?;
 
         // Emit missing dependency event on error
         if let Err(QueryError::MissingDependency { ref description }) = result {

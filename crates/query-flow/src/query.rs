@@ -90,19 +90,6 @@ pub trait Query: Clone + Send + Sync + 'static {
     /// * `Err(QueryError::Cycle)` - Dependency cycle detected
     fn query(self, db: &impl Db) -> Result<Self::Output, QueryError>;
 
-    /// Durability hint for this query.
-    ///
-    /// Higher values indicate the query's output changes less frequently.
-    /// This is used for optimization in the dependency tracking layer.
-    ///
-    /// - 0: Volatile (changes frequently)
-    /// - Higher: More stable
-    ///
-    /// Default: `0` (volatile)
-    fn durability(&self) -> u8 {
-        0
-    }
-
     /// Compare two outputs for equality (for early cutoff optimization).
     ///
     /// When a query is recomputed and the output is equal to the previous

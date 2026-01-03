@@ -398,9 +398,11 @@ impl<T: Tracer> QueryRuntime<T> {
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
 
-        // Get durability for whale registration
-        let durability =
-            Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
+        // Query durability defaults to stable - Whale will automatically reduce
+        // the effective durability to min(requested, min(dep_durabilities)).
+        // A pure query with no dependencies remains stable.
+        // A query depending on volatile assets becomes volatile.
+        let durability = Durability::stable();
 
         match result {
             Ok(output) => {
@@ -455,7 +457,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     let sentinel = FullCacheKey::query_set_sentinel::<Q>();
                     let _ = self
                         .whale
-                        .register(sentinel, None, Durability::volatile(), vec![]);
+                        .register(sentinel, None, Durability::stable(), vec![]);
                 }
 
                 // Store verifier for this query (for verify-then-decide pattern)
@@ -514,7 +516,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     let sentinel = FullCacheKey::query_set_sentinel::<Q>();
                     let _ = self
                         .whale
-                        .register(sentinel, None, Durability::volatile(), vec![]);
+                        .register(sentinel, None, Durability::stable(), vec![]);
                 }
 
                 // Store verifier for this query (for verify-then-decide pattern)
@@ -542,9 +544,11 @@ impl<T: Tracer> QueryRuntime<T> {
         );
 
         // Update whale to invalidate dependents (register with None to clear cached value)
+        // Use stable durability to increment all revision counters, ensuring queries
+        // at any durability level will see this as a change.
         let _ = self
             .whale
-            .register(full_key, None, Durability::volatile(), vec![]);
+            .register(full_key, None, Durability::stable(), vec![]);
     }
 
     /// Remove a query from the cache entirely, freeing memory.
@@ -573,7 +577,7 @@ impl<T: Tracer> QueryRuntime<T> {
             let sentinel = FullCacheKey::query_set_sentinel::<Q>();
             let _ = self
                 .whale
-                .register(sentinel, None, Durability::volatile(), vec![]);
+                .register(sentinel, None, Durability::stable(), vec![]);
         }
     }
 
@@ -898,28 +902,19 @@ impl<T: Tracer> QueryRuntime<T> {
     /// This method is idempotent - resolving with the same value (via `asset_eq`)
     /// will not trigger downstream recomputation.
     ///
-    /// Uses the asset key's default durability.
+    /// # Arguments
+    ///
+    /// * `key` - The asset key identifying this resource
+    /// * `value` - The loaded asset value
+    /// * `durability` - How frequently this asset is expected to change
     ///
     /// # Example
     ///
     /// ```ignore
     /// let content = std::fs::read_to_string(&path)?;
-    /// runtime.resolve_asset(FilePath(path), content);
+    /// runtime.resolve_asset(FilePath(path), content, DurabilityLevel::Volatile);
     /// ```
-    pub fn resolve_asset<K: AssetKey>(&self, key: K, value: K::Asset) {
-        let durability = key.durability();
-        self.resolve_asset_internal(key, value, durability);
-    }
-
-    /// Resolve an asset with a specific durability level.
-    ///
-    /// Use this to override the asset key's default durability.
-    pub fn resolve_asset_with_durability<K: AssetKey>(
-        &self,
-        key: K,
-        value: K::Asset,
-        durability: DurabilityLevel,
-    ) {
+    pub fn resolve_asset<K: AssetKey>(&self, key: K, value: K::Asset, durability: DurabilityLevel) {
         self.resolve_asset_internal(key, value, durability);
     }
 
@@ -977,7 +972,7 @@ impl<T: Tracer> QueryRuntime<T> {
             let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
             let _ = self
                 .whale
-                .register(sentinel, None, Durability::volatile(), vec![]);
+                .register(sentinel, None, Durability::stable(), vec![]);
         }
     }
 
@@ -1010,9 +1005,10 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // Atomic: clear cached value + invalidate dependents
         // Using None for data means "needs to be loaded"
+        // Use stable durability to ensure queries at any durability level see the change.
         let _ = self
             .whale
-            .register(full_cache_key, None, Durability::volatile(), vec![]);
+            .register(full_cache_key, None, Durability::stable(), vec![]);
     }
 
     /// Remove an asset from the cache entirely.
@@ -1035,7 +1031,7 @@ impl<T: Tracer> QueryRuntime<T> {
             let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
             let _ = self
                 .whale
-                .register(sentinel, None, Durability::volatile(), vec![]);
+                .register(sentinel, None, Durability::stable(), vec![]);
         }
     }
 
@@ -1115,7 +1111,10 @@ impl<T: Tracer> QueryRuntime<T> {
         if let Some(locator) = self.locators.get(TypeId::of::<K>()) {
             if let Some(state) = locator.locate_any(&key) {
                 match state {
-                    AssetState::Ready(arc) => {
+                    AssetState::Ready {
+                        value: arc,
+                        durability: durability_level,
+                    } => {
                         emit_requested(&self.tracer, &key, TracerAssetState::Ready);
 
                         let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
@@ -1128,8 +1127,9 @@ impl<T: Tracer> QueryRuntime<T> {
                         };
 
                         // Store in whale atomically with early cutoff
+                        // Use durability from LocateResult::Ready
                         let entry = CachedEntry::AssetReady(typed_value.clone());
-                        let durability = Durability::new(key.durability().as_u8() as usize)
+                        let durability = Durability::new(durability_level.as_u8() as usize)
                             .unwrap_or(Durability::volatile());
                         let new_value = typed_value.clone();
                         let result = self
@@ -1201,8 +1201,7 @@ impl<T: Tracer> QueryRuntime<T> {
                         emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
 
                         let entry = CachedEntry::AssetNotFound;
-                        let durability = Durability::new(key.durability().as_u8() as usize)
-                            .unwrap_or(Durability::volatile());
+                        let durability = Durability::volatile();
                         let _ = self.whale.update_with_compare(
                             full_cache_key,
                             Some(entry),
@@ -1741,16 +1740,16 @@ mod tests {
             assert_eq!(*result, 3);
         }
 
-        #[query(durability = 2)]
-        fn with_durability(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+        #[query]
+        fn simple_double(db: &impl Db, x: i32) -> Result<i32, QueryError> {
             let _ = db;
             Ok(x * 2)
         }
 
         #[test]
-        fn test_macro_durability() {
+        fn test_macro_simple() {
             let runtime = QueryRuntime::new();
-            let result = runtime.query(WithDurability::new(5)).unwrap();
+            let result = runtime.query(SimpleDouble::new(5)).unwrap();
             assert_eq!(*result, 10);
         }
 

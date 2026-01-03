@@ -61,23 +61,19 @@ fn double_sum(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError>
 ### Macro Options
 
 ```rust
-// Custom durability (0-3, higher = changes less frequently)
-#[query(durability = 2)]
-fn stable_query(ctx: &mut QueryContext, id: u64) -> Result<Data, QueryError> { ... }
-
 // Selective cache keys - only `id` is part of the key
 #[query(keys(id))]
-fn fetch_user(ctx: &mut QueryContext, id: u64, include_deleted: bool) -> Result<User, QueryError> {
+fn fetch_user(db: &impl Db, id: u64, include_deleted: bool) -> Result<User, QueryError> {
     // Queries with same `id` share cache, regardless of `include_deleted`
 }
 
 // Custom struct name
 #[query(name = "FetchUserById")]
-fn fetch_user(ctx: &mut QueryContext, id: u64) -> Result<User, QueryError> { ... }
+fn fetch_user(db: &impl Db, id: u64) -> Result<User, QueryError> { ... }
 
 // Custom output equality (for types without PartialEq)
 #[query(output_eq = my_custom_eq)]
-fn complex_query(ctx: &mut QueryContext) -> Result<ComplexType, QueryError> { ... }
+fn complex_query(db: &impl Db) -> Result<ComplexType, QueryError> { ... }
 ```
 
 ### Manual Query Implementation
@@ -150,16 +146,15 @@ Assets represent external resources (files, network data) that queries can depen
 ### Defining Asset Keys
 
 ```rust
-use query_flow::{asset_key, AssetKey, DurabilityLevel};
+use query_flow::{asset_key, AssetKey};
 use std::path::PathBuf;
 
 // Using the macro
 #[asset_key(asset = String)]
 pub struct ConfigFile(pub PathBuf);
 
-// With durability hint
-#[asset_key(asset = String, durability = constant)]
-pub struct BundledAsset(pub PathBuf);
+#[asset_key(asset = Vec<u8>)]
+pub struct BinaryAsset(pub PathBuf);
 
 // Manual implementation
 pub struct TextureId(pub u32);
@@ -169,10 +164,6 @@ impl AssetKey for TextureId {
 
     fn asset_eq(old: &Self::Asset, new: &Self::Asset) -> bool {
         old.bytes == new.bytes
-    }
-
-    fn durability(&self) -> DurabilityLevel {
-        DurabilityLevel::Stable
     }
 }
 ```
@@ -196,6 +187,8 @@ fn process_config(ctx: &mut QueryContext, path: PathBuf) -> Result<Config, Query
 ### Asset Loading Flow
 
 ```rust
+use query_flow::DurabilityLevel;
+
 let runtime = QueryRuntime::new();
 
 // Optional: Register a locator for immediate resolution
@@ -209,7 +202,8 @@ match runtime.query(ProcessConfig::new(path)) {
         for pending in runtime.pending_assets() {
             if let Some(path) = pending.key::<ConfigFile>() {
                 let content = std::fs::read_to_string(&path.0)?;
-                runtime.resolve_asset(path.clone(), content);
+                // Durability is specified at resolve time
+                runtime.resolve_asset(path.clone(), content, DurabilityLevel::Volatile);
             }
         }
         // Retry query
@@ -254,14 +248,20 @@ impl<T> LoadingState<T> {
 
 ## Durability Levels
 
-Durability hints help optimize invalidation propagation:
+Durability is specified when resolving assets and helps optimize invalidation propagation:
 
 | Level | Value | Description |
 |-------|-------|-------------|
-| `Volatile` | 0 | Changes frequently (default) |
-| `Session` | 1 | Stable within a session |
-| `Stable` | 2 | Changes rarely |
-| `Constant` | 3 | Never changes (bundled assets) |
+| `Volatile` | 0 | Changes frequently (user input, live feeds) |
+| `Transient` | 1 | Changes occasionally (configuration, session data) |
+| `Stable` | 2 | Changes rarely (external dependencies) |
+| `Static` | 3 | Fixed for this session (bundled assets, constants) |
+
+```rust
+// Durability is specified at resolve_asset time
+runtime.resolve_asset(ConfigFile(path), content, DurabilityLevel::Volatile);
+runtime.resolve_asset(BundledAsset(name), data, DurabilityLevel::Static);
+```
 
 ## QueryRuntime API
 
@@ -277,7 +277,7 @@ runtime.clear_cache();
 
 // Asset management
 runtime.register_asset_locator(locator);
-runtime.resolve_asset(key, value);
+runtime.resolve_asset(key, value, DurabilityLevel::Volatile);
 runtime.invalidate_asset(&key);
 runtime.remove_asset(&key);
 

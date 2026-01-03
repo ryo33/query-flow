@@ -6,6 +6,8 @@
 //! - Incremental recomputation
 //! - Early cutoff optimization
 
+#[cfg(test)]
+use query_flow::DurabilityLevel;
 use query_flow::{asset_key, query, Db, QueryError};
 
 // ============================================================================
@@ -36,11 +38,11 @@ pub enum BinOp {
 // ============================================================================
 
 /// Asset key for source file content.
-#[asset_key(asset = String, durability = stable)]
+#[asset_key(asset = String)]
 pub struct SourceFile(pub String);
 
 /// Asset key for variable bindings.
-#[asset_key(asset = i64, durability = stable)]
+#[asset_key(asset = i64)]
 pub struct Variable(pub String);
 
 // ============================================================================
@@ -230,7 +232,11 @@ mod tests {
         let tracer = EventSinkTracer::new(collector.clone());
         let runtime = QueryRuntime::with_tracer(tracer);
 
-        runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2 * 3".to_string());
+        runtime.resolve_asset(
+            SourceFile("main".to_string()),
+            "1 + 2 * 3".to_string(),
+            DurabilityLevel::Volatile,
+        );
 
         let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
@@ -301,9 +307,13 @@ mod tests {
         let tracer = EventSinkTracer::new(collector.clone());
         let runtime = QueryRuntime::with_tracer(tracer);
 
-        runtime.resolve_asset(SourceFile("main".to_string()), "x + y * 2".to_string());
-        runtime.resolve_asset(Variable("x".to_string()), 10);
-        runtime.resolve_asset(Variable("y".to_string()), 5);
+        runtime.resolve_asset(
+            SourceFile("main".to_string()),
+            "x + y * 2".to_string(),
+            DurabilityLevel::Volatile,
+        );
+        runtime.resolve_asset(Variable("x".to_string()), 10, DurabilityLevel::Volatile);
+        runtime.resolve_asset(Variable("y".to_string()), 5, DurabilityLevel::Volatile);
 
         let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
@@ -400,7 +410,11 @@ mod tests {
         let tracer = EventSinkTracer::new(collector.clone());
         let runtime = QueryRuntime::with_tracer(tracer);
 
-        runtime.resolve_asset(SourceFile("main".to_string()), "(1 + 2) * 3".to_string());
+        runtime.resolve_asset(
+            SourceFile("main".to_string()),
+            "(1 + 2) * 3".to_string(),
+            DurabilityLevel::Volatile,
+        );
 
         let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
@@ -501,7 +515,11 @@ mod tests {
         }
 
         let runtime = QueryRuntime::new();
-        runtime.resolve_asset(SourceFile("main".to_string()), "1 + 2".to_string());
+        runtime.resolve_asset(
+            SourceFile("main".to_string()),
+            "1 + 2".to_string(),
+            DurabilityLevel::Volatile,
+        );
 
         // First query - should parse
         let _ = runtime
@@ -527,6 +545,7 @@ mod tests {
         runtime.resolve_asset(
             SourceFile("main".to_string()),
             "((2 + 3) * 4 - 5) / 3".to_string(),
+            DurabilityLevel::Volatile,
         );
 
         let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
@@ -539,9 +558,21 @@ mod tests {
     fn test_multiple_files() {
         let runtime = QueryRuntime::new();
 
-        runtime.resolve_asset(SourceFile("a".to_string()), "10".to_string());
-        runtime.resolve_asset(SourceFile("b".to_string()), "20 + 5".to_string());
-        runtime.resolve_asset(SourceFile("c".to_string()), "3 * 3".to_string());
+        runtime.resolve_asset(
+            SourceFile("a".to_string()),
+            "10".to_string(),
+            DurabilityLevel::Volatile,
+        );
+        runtime.resolve_asset(
+            SourceFile("b".to_string()),
+            "20 + 5".to_string(),
+            DurabilityLevel::Volatile,
+        );
+        runtime.resolve_asset(
+            SourceFile("c".to_string()),
+            "3 * 3".to_string(),
+            DurabilityLevel::Volatile,
+        );
 
         let result_a = runtime.query(EvalFile::new("a".to_string())).unwrap();
         let result_b = runtime.query(EvalFile::new("b".to_string())).unwrap();
@@ -556,10 +587,14 @@ mod tests {
     fn test_dependency_chain() {
         let runtime = QueryRuntime::new();
 
-        runtime.resolve_asset(SourceFile("expr".to_string()), "a * b + c".to_string());
-        runtime.resolve_asset(Variable("a".to_string()), 2);
-        runtime.resolve_asset(Variable("b".to_string()), 3);
-        runtime.resolve_asset(Variable("c".to_string()), 4);
+        runtime.resolve_asset(
+            SourceFile("expr".to_string()),
+            "a * b + c".to_string(),
+            DurabilityLevel::Volatile,
+        );
+        runtime.resolve_asset(Variable("a".to_string()), 2, DurabilityLevel::Volatile);
+        runtime.resolve_asset(Variable("b".to_string()), 3, DurabilityLevel::Volatile);
+        runtime.resolve_asset(Variable("c".to_string()), 4, DurabilityLevel::Volatile);
 
         let result = runtime.query(EvalFile::new("expr".to_string())).unwrap();
 
@@ -571,7 +606,11 @@ mod tests {
     fn test_subtraction_and_division() {
         let runtime = QueryRuntime::new();
 
-        runtime.resolve_asset(SourceFile("main".to_string()), "100 - 50 / 2".to_string());
+        runtime.resolve_asset(
+            SourceFile("main".to_string()),
+            "100 - 50 / 2".to_string(),
+            DurabilityLevel::Volatile,
+        );
 
         let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 
@@ -583,8 +622,16 @@ mod tests {
     fn test_variable_only() {
         let runtime = QueryRuntime::new();
 
-        runtime.resolve_asset(SourceFile("main".to_string()), "answer".to_string());
-        runtime.resolve_asset(Variable("answer".to_string()), 42);
+        runtime.resolve_asset(
+            SourceFile("main".to_string()),
+            "answer".to_string(),
+            DurabilityLevel::Volatile,
+        );
+        runtime.resolve_asset(
+            Variable("answer".to_string()),
+            42,
+            DurabilityLevel::Volatile,
+        );
 
         let result = runtime.query(EvalFile::new("main".to_string())).unwrap();
 

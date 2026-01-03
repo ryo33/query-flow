@@ -9,7 +9,7 @@ use crate::generator::{
 use crate::recorder::{FuzzEventRecorder, FuzzRunRecord, RunMetadata, RunStats};
 use crate::validator::{ValidationFailure, ValidationResult, Validator};
 use parking_lot::Mutex;
-use query_flow::QueryError;
+use query_flow::{DurabilityLevel, QueryError};
 use query_flow_inspector::{EventSinkTracer, NullSink};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -327,8 +327,11 @@ impl FuzzRunner {
     fn resolve_all_assets(&self) {
         let asset_values = self.asset_values.lock();
         for (&node_id, data) in asset_values.iter() {
-            self.runtime
-                .resolve_asset(SyntheticAssetKey(node_id), data.clone());
+            self.runtime.resolve_asset(
+                SyntheticAssetKey(node_id),
+                data.clone(),
+                DurabilityLevel::Volatile,
+            );
         }
     }
 
@@ -407,8 +410,11 @@ impl FuzzRunner {
                 let new_data = generate_asset_data(node_id, *data_size, *version, &mut *rng);
                 asset_values.insert(node_id, new_data.clone());
 
-                self.runtime
-                    .resolve_asset(SyntheticAssetKey(node_id), new_data);
+                self.runtime.resolve_asset(
+                    SyntheticAssetKey(node_id),
+                    new_data,
+                    DurabilityLevel::Volatile,
+                );
             }
         }
 
@@ -432,8 +438,11 @@ impl FuzzRunner {
                 let new_data = generate_asset_data(node_id, *data_size, *version, &mut *rng);
                 asset_values.insert(node_id, new_data.clone());
 
-                self.runtime
-                    .resolve_asset(SyntheticAssetKey(node_id), new_data);
+                self.runtime.resolve_asset(
+                    SyntheticAssetKey(node_id),
+                    new_data,
+                    DurabilityLevel::Volatile,
+                );
             }
         }
 

@@ -604,7 +604,10 @@ where
         // - Edge updates are idempotent: re-adding to dependents list is a no-op
         // - This provides eventual consistency for graph traversal
         // - Validity checks use changedAt/verifiedAt, not edge traversal
-        if let Compute::Updated { old: (_, old_node), .. } = &final_result {
+        if let Compute::Updated {
+            old: (_, old_node), ..
+        } = &final_result
+        {
             self.cleanup_stale_edges(&qid, &old_node.dependencies, &dep_ids);
         }
         self.update_graph_edges(&qid, &dep_records);

@@ -1163,7 +1163,9 @@ impl<T: Tracer> QueryRuntime<T> {
                                 match &node.data {
                                     Some(CachedEntry::AssetReady(arc)) => {
                                         match arc.clone().downcast::<K::Asset>() {
-                                            Ok(value) => return Ok(AssetLoadingState::ready(key, value)),
+                                            Ok(value) => {
+                                                return Ok(AssetLoadingState::ready(key, value))
+                                            }
                                             Err(_) => return Ok(AssetLoadingState::loading(key)),
                                         }
                                     }

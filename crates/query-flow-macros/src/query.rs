@@ -69,10 +69,6 @@ impl FromMeta for OutputEq {
 /// Options for the `#[query]` attribute.
 #[derive(Debug, Default, FromMeta)]
 pub struct QueryAttr {
-    /// Durability level (0-255). Default: 0 (volatile).
-    #[darling(default)]
-    durability: Option<u8>,
-
     /// Output equality for early cutoff optimization.
     /// Default: uses PartialEq (`old == new`).
     /// `output_eq = path`: uses custom function for types without PartialEq.
@@ -347,15 +343,6 @@ fn generate_query_impl(
     let fn_name = &parsed.name;
     let field_names: Vec<_> = parsed.params.iter().map(|p| &p.name).collect();
 
-    // Generate optional trait methods
-    let durability_impl = attr.durability.map(|d| {
-        quote! {
-            fn durability(&self) -> u8 {
-                #d
-            }
-        }
-    });
-
     let output_eq_impl = match &attr.output_eq {
         // Default: use PartialEq
         OutputEq::None | OutputEq::PartialEq => quote! {
@@ -384,7 +371,6 @@ fn generate_query_impl(
                 #fn_name(db #(,self.#field_names )*)
             }
 
-            #durability_impl
             #output_eq_impl
         }
     })

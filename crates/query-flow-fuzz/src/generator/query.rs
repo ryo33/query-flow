@@ -130,10 +130,6 @@ impl Query for SyntheticQuery {
     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
         old == new
     }
-
-    fn durability(&self) -> u8 {
-        0
-    }
 }
 
 /// Registry of synthetic queries for lookup during execution.

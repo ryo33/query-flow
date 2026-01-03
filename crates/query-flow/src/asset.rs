@@ -12,22 +12,22 @@ use std::sync::Arc;
 
 use crate::key::Key;
 
-/// Named durability levels for assets and queries.
+/// Durability levels for dependency tracking optimization.
 ///
 /// Higher values indicate the data changes less frequently.
-/// This is used for optimization in the dependency tracking layer.
+/// Durability is specified when resolving assets, not on the type itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum DurabilityLevel {
-    /// Changes frequently (live feeds, real-time data).
+    /// Changes frequently (user input, live feeds).
     #[default]
     Volatile = 0,
-    /// Stable within a session.
-    Session = 1,
-    /// Changes rarely.
+    /// Changes occasionally (configuration, session data).
+    Transient = 1,
+    /// Changes rarely (external dependencies).
     Stable = 2,
-    /// Never changes (bundled assets, constants).
-    Constant = 3,
+    /// Fixed for this session (bundled assets, constants).
+    Static = 3,
 }
 
 impl DurabilityLevel {
@@ -43,16 +43,15 @@ impl DurabilityLevel {
 /// the type of asset they load. Assets are leaf nodes in the dependency
 /// graph - they have no dependencies but can be depended upon by queries.
 ///
+/// Durability is specified when calling `resolve_asset()`, not on the key type.
+///
 /// # Example
 ///
 /// ```ignore
-/// use query_flow::{asset_key, AssetKey, DurabilityLevel};
+/// use query_flow::{asset_key, AssetKey};
 ///
 /// #[asset_key(asset = String)]
 /// pub struct ConfigFile(pub PathBuf);
-///
-/// #[asset_key(asset = String, durability = constant)]
-/// pub struct BundledFile(pub PathBuf);
 ///
 /// // Or manually:
 /// pub struct TextureId(pub u32);
@@ -62,10 +61,6 @@ impl DurabilityLevel {
 ///
 ///     fn asset_eq(old: &Self::Asset, new: &Self::Asset) -> bool {
 ///         old.bytes == new.bytes
-///     }
-///
-///     fn durability(&self) -> DurabilityLevel {
-///         DurabilityLevel::Constant
 ///     }
 /// }
 /// ```
@@ -78,14 +73,6 @@ pub trait AssetKey: Key + 'static {
     /// When an asset is re-resolved with the same value, dependent queries
     /// can skip recomputation (early cutoff).
     fn asset_eq(old: &Self::Asset, new: &Self::Asset) -> bool;
-
-    /// Durability level for this asset type.
-    ///
-    /// Higher values indicate the asset changes less frequently.
-    /// Default: `Volatile` (changes frequently).
-    fn durability(&self) -> DurabilityLevel {
-        DurabilityLevel::Volatile
-    }
 }
 
 /// Result of locating an asset.

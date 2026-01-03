@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use query_flow::{AssetKey, Db, Query, QueryError, QueryRuntime};
+use query_flow::{AssetKey, Db, DurabilityLevel, Query, QueryError, QueryRuntime};
 
 // Simple query that doubles a value
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -256,8 +256,16 @@ fn test_list_asset_keys_basic() {
     let runtime = QueryRuntime::new();
 
     // Resolve some assets
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "{}".to_string());
-    runtime.resolve_asset(ConfigFile("db.json".to_string()), "{}".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "{}".to_string(),
+        DurabilityLevel::Volatile,
+    );
+    runtime.resolve_asset(
+        ConfigFile("db.json".to_string()),
+        "{}".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // List should see both
     let result = runtime.query(ListConfigsQuery).unwrap();
@@ -294,8 +302,16 @@ fn test_list_asset_keys_invalidation_on_remove() {
     LIST_COUNT.store(0, Ordering::SeqCst);
 
     // Resolve assets
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "{}".to_string());
-    runtime.resolve_asset(ConfigFile("db.json".to_string()), "{}".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "{}".to_string(),
+        DurabilityLevel::Volatile,
+    );
+    runtime.resolve_asset(
+        ConfigFile("db.json".to_string()),
+        "{}".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // First list
     let result = runtime.query(TrackedListConfigs).unwrap();
@@ -346,7 +362,11 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
     LIST_COUNT.store(0, Ordering::SeqCst);
 
     // Resolve asset
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "v1".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // First list
     let result = runtime.query(TrackedListConfigs2).unwrap();
@@ -354,7 +374,11 @@ fn test_list_asset_keys_no_invalidation_on_value_change() {
     assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
 
     // Update asset value (same key, different value)
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "v2".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "v2".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // List should still be cached because the SET didn't change
     let result = runtime.query(TrackedListConfigs2).unwrap();
@@ -399,7 +423,11 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
     CONTENT_COUNT.store(0, Ordering::SeqCst);
 
     // Resolve assets
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "v1".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // First query
     let result = runtime.query(AllConfigContents).unwrap();
@@ -407,7 +435,11 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
     assert_eq!(CONTENT_COUNT.load(Ordering::SeqCst), 1);
 
     // Update asset value - should invalidate because we depend on individual assets too
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "v2".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "v2".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // Should recompute because of individual asset dependency
     let result = runtime.query(AllConfigContents).unwrap();
@@ -487,7 +519,11 @@ fn test_list_asset_keys_invalidation_on_add() {
     LIST_COUNT.store(0, Ordering::SeqCst);
 
     // Resolve first asset
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "{}".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "{}".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // First list
     let result = runtime.query(TrackedListConfigs3).unwrap();
@@ -495,7 +531,11 @@ fn test_list_asset_keys_invalidation_on_add() {
     assert_eq!(LIST_COUNT.load(Ordering::SeqCst), 1);
 
     // Add another asset - should invalidate list
-    runtime.resolve_asset(ConfigFile("db.json".to_string()), "{}".to_string());
+    runtime.resolve_asset(
+        ConfigFile("db.json".to_string()),
+        "{}".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // Should recompute
     let result = runtime.query(TrackedListConfigs3).unwrap();

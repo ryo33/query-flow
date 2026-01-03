@@ -1,7 +1,7 @@
 //! Synthetic asset implementation.
 
 use super::NodeId;
-use query_flow::{AssetKey, DurabilityLevel};
+use query_flow::AssetKey;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -14,10 +14,6 @@ impl AssetKey for SyntheticAssetKey {
 
     fn asset_eq(old: &Self::Asset, new: &Self::Asset) -> bool {
         old == new
-    }
-
-    fn durability(&self) -> DurabilityLevel {
-        DurabilityLevel::Stable
     }
 }
 

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use query_flow::{asset_key, query, Db, QueryError, QueryRuntime};
+use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
 use query_flow_inspector::{
     to_kinds, AssetKey, AssetState, EventCollector, EventKind, EventSinkTracer, ExecutionResult,
     QueryKey,
@@ -34,7 +34,7 @@ fn add_then_double(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
 }
 
 // Test asset
-#[asset_key(asset = String, durability = stable)]
+#[asset_key(asset = String)]
 pub struct TestSource(pub String);
 
 #[query]
@@ -231,7 +231,11 @@ fn test_asset_events() {
     let runtime = QueryRuntime::with_tracer(tracer);
 
     // Resolve asset first (clear events after)
-    runtime.resolve_asset(TestSource("test".to_string()), "hello".to_string());
+    runtime.resolve_asset(
+        TestSource("test".to_string()),
+        "hello".to_string(),
+        DurabilityLevel::Volatile,
+    );
     collector.clear();
 
     let result = runtime
@@ -292,7 +296,11 @@ fn test_asset_resolution_events() {
     let tracer = EventSinkTracer::new(collector.clone());
     let runtime = QueryRuntime::with_tracer(tracer);
 
-    runtime.resolve_asset(TestSource("new".to_string()), "content".to_string());
+    runtime.resolve_asset(
+        TestSource("new".to_string()),
+        "content".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     assert_eq!(
         to_kinds(&collector.trace()),
@@ -311,7 +319,11 @@ fn test_asset_invalidation_events() {
     let tracer = EventSinkTracer::new(collector.clone());
     let runtime = QueryRuntime::with_tracer(tracer);
 
-    runtime.resolve_asset(TestSource("test".to_string()), "content".to_string());
+    runtime.resolve_asset(
+        TestSource("test".to_string()),
+        "content".to_string(),
+        DurabilityLevel::Volatile,
+    );
     collector.clear();
 
     runtime.invalidate_asset(&TestSource("test".to_string()));

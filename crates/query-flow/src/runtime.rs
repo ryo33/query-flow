@@ -397,9 +397,9 @@ impl<T: Tracer> QueryRuntime<T> {
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
 
-        // Get durability for whale registration
-        let durability =
-            Durability::new(query.durability() as usize).unwrap_or(Durability::volatile());
+        // Query durability defaults to volatile, matching the previous behavior
+        // where Query::durability() returned 0 by default.
+        let durability = Durability::volatile();
 
         match result {
             Ok(output) => {
@@ -897,28 +897,19 @@ impl<T: Tracer> QueryRuntime<T> {
     /// This method is idempotent - resolving with the same value (via `asset_eq`)
     /// will not trigger downstream recomputation.
     ///
-    /// Uses the asset key's default durability.
+    /// # Arguments
+    ///
+    /// * `key` - The asset key identifying this resource
+    /// * `value` - The loaded asset value
+    /// * `durability` - How frequently this asset is expected to change
     ///
     /// # Example
     ///
     /// ```ignore
     /// let content = std::fs::read_to_string(&path)?;
-    /// runtime.resolve_asset(FilePath(path), content);
+    /// runtime.resolve_asset(FilePath(path), content, DurabilityLevel::Volatile);
     /// ```
-    pub fn resolve_asset<K: AssetKey>(&self, key: K, value: K::Asset) {
-        let durability = key.durability();
-        self.resolve_asset_internal(key, value, durability);
-    }
-
-    /// Resolve an asset with a specific durability level.
-    ///
-    /// Use this to override the asset key's default durability.
-    pub fn resolve_asset_with_durability<K: AssetKey>(
-        &self,
-        key: K,
-        value: K::Asset,
-        durability: DurabilityLevel,
-    ) {
+    pub fn resolve_asset<K: AssetKey>(&self, key: K, value: K::Asset, durability: DurabilityLevel) {
         self.resolve_asset_internal(key, value, durability);
     }
 
@@ -1120,9 +1111,9 @@ impl<T: Tracer> QueryRuntime<T> {
                         };
 
                         // Store in whale atomically with early cutoff
+                        // TODO: AssetLocator API should include durability in LocateResult::Ready
                         let entry = CachedEntry::AssetReady(typed_value.clone());
-                        let durability = Durability::new(key.durability().as_u8() as usize)
-                            .unwrap_or(Durability::volatile());
+                        let durability = Durability::volatile();
                         let new_value = typed_value.clone();
                         let _ = self.whale.update_with_compare(
                             full_cache_key,
@@ -1183,9 +1174,9 @@ impl<T: Tracer> QueryRuntime<T> {
                         emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
 
                         // Store NotFound in whale atomically (so we don't keep re-querying)
+                        // TODO: AssetLocator API should include durability
                         let entry = CachedEntry::AssetNotFound;
-                        let durability = Durability::new(key.durability().as_u8() as usize)
-                            .unwrap_or(Durability::volatile());
+                        let durability = Durability::volatile();
                         let _ = self.whale.update_with_compare(
                             full_cache_key,
                             Some(entry),
@@ -1672,16 +1663,16 @@ mod tests {
             assert_eq!(*result, 3);
         }
 
-        #[query(durability = 2)]
-        fn with_durability(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+        #[query]
+        fn simple_double(db: &impl Db, x: i32) -> Result<i32, QueryError> {
             let _ = db;
             Ok(x * 2)
         }
 
         #[test]
-        fn test_macro_durability() {
+        fn test_macro_simple() {
             let runtime = QueryRuntime::new();
-            let result = runtime.query(WithDurability::new(5)).unwrap();
+            let result = runtime.query(SimpleDouble::new(5)).unwrap();
             assert_eq!(*result, 10);
         }
 

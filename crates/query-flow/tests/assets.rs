@@ -3,8 +3,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use query_flow::{
-    asset_key, query, AssetKey, AssetLocator, Db, DurabilityLevel, LocateResult, QueryError,
-    QueryRuntime,
+    asset_key, query, AssetLocator, Db, DurabilityLevel, LocateResult, QueryError, QueryRuntime,
 };
 
 // ============================================================================
@@ -14,13 +13,13 @@ use query_flow::{
 #[asset_key(asset = String)]
 pub struct ConfigFile(pub String);
 
-#[asset_key(asset = String, durability = constant)]
+#[asset_key(asset = String)]
 pub struct BundledAsset(pub String);
 
 // Use type alias for generic types with angle brackets
 type ByteVec = Vec<u8>;
 
-#[asset_key(asset = ByteVec, durability = stable)]
+#[asset_key(asset = ByteVec)]
 pub struct BinaryFile(pub String);
 
 // ============================================================================
@@ -63,14 +62,10 @@ impl AssetLocator<ConfigFile> for NotFoundLocator {
 #[test]
 fn test_asset_key_macro() {
     // Test that the macro generates correct implementations
-    let config = ConfigFile("config.json".to_string());
-    assert_eq!(config.durability(), DurabilityLevel::Volatile);
-
-    let bundled = BundledAsset("bundle.json".to_string());
-    assert_eq!(bundled.durability(), DurabilityLevel::Constant);
-
-    let binary = BinaryFile("data.bin".to_string());
-    assert_eq!(binary.durability(), DurabilityLevel::Stable);
+    let _config = ConfigFile("config.json".to_string());
+    let _bundled = BundledAsset("bundle.json".to_string());
+    let _binary = BinaryFile("data.bin".to_string());
+    // Asset keys no longer have durability - it's specified at resolve time
 }
 
 #[test]
@@ -81,6 +76,7 @@ fn test_resolve_asset_before_query() {
     runtime.resolve_asset(
         ConfigFile("app.json".to_string()),
         "config content".to_string(),
+        DurabilityLevel::Volatile,
     );
 
     // Define a query that uses the asset
@@ -121,6 +117,7 @@ fn test_pending_asset_flow() {
     runtime.resolve_asset(
         ConfigFile("app.json".to_string()),
         "resolved content".to_string(),
+        DurabilityLevel::Volatile,
     );
 
     // Now query should succeed
@@ -172,7 +169,11 @@ fn test_invalidate_asset() {
     let runtime = QueryRuntime::new();
 
     // Resolve initial value
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "initial".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "initial".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
@@ -192,7 +193,11 @@ fn test_invalidate_asset() {
     assert!(matches!(result, Err(QueryError::Suspend { .. })));
 
     // Resolve with new value
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "updated".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "updated".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // Query should return new value
     let result = runtime.query(ReadConfig::new(ConfigFile("app.json".to_string())));
@@ -235,7 +240,11 @@ fn test_asset_dependency_tracking() {
     static QUERY_CALLS: AtomicU32 = AtomicU32::new(0);
 
     let runtime = QueryRuntime::new();
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "v1".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "v1".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     #[query]
     fn process_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
@@ -257,7 +266,11 @@ fn test_asset_dependency_tracking() {
     assert_eq!(QUERY_CALLS.load(Ordering::SeqCst), 1); // Still 1
 
     // Update asset - should invalidate dependent query
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "v2".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "v2".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     // Query should recompute
     let result = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
@@ -270,7 +283,11 @@ fn test_asset_early_cutoff() {
     static DOWNSTREAM_CALLS: AtomicU32 = AtomicU32::new(0);
 
     let runtime = QueryRuntime::new();
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "same_value".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "same_value".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     #[query]
     fn process_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
@@ -286,7 +303,11 @@ fn test_asset_early_cutoff() {
     assert_eq!(DOWNSTREAM_CALLS.load(Ordering::SeqCst), 1);
 
     // Resolve with same value - should not trigger recomputation
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "same_value".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "same_value".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     let _ = runtime.query(ProcessConfig::new(ConfigFile("app.json".to_string())));
     // Early cutoff: same value means no recomputation needed
@@ -294,14 +315,14 @@ fn test_asset_early_cutoff() {
 }
 
 #[test]
-fn test_resolve_asset_with_durability() {
+fn test_resolve_asset_with_static_durability() {
     let runtime = QueryRuntime::new();
 
     // Resolve with explicit durability
-    runtime.resolve_asset_with_durability(
+    runtime.resolve_asset(
         ConfigFile("config.json".to_string()),
         "content".to_string(),
-        DurabilityLevel::Constant,
+        DurabilityLevel::Static,
     );
 
     #[query]
@@ -325,6 +346,7 @@ fn test_remove_asset() {
     runtime.resolve_asset(
         ConfigFile("app.json".to_string()),
         "pre_resolved".to_string(),
+        DurabilityLevel::Volatile,
     );
 
     #[query]
@@ -352,8 +374,13 @@ fn test_multiple_asset_types() {
     runtime.resolve_asset(
         ConfigFile("config.json".to_string()),
         "config content".to_string(),
+        DurabilityLevel::Volatile,
     );
-    runtime.resolve_asset(BinaryFile("data.bin".to_string()), vec![1, 2, 3, 4]);
+    runtime.resolve_asset(
+        BinaryFile("data.bin".to_string()),
+        vec![1, 2, 3, 4],
+        DurabilityLevel::Volatile,
+    );
 
     #[query]
     fn process_files(
@@ -404,7 +431,11 @@ fn test_no_locator_pending() {
 #[test]
 fn test_get_asset_ready() {
     let runtime = QueryRuntime::new();
-    runtime.resolve_asset(ConfigFile("app.json".to_string()), "content".to_string());
+    runtime.resolve_asset(
+        ConfigFile("app.json".to_string()),
+        "content".to_string(),
+        DurabilityLevel::Volatile,
+    );
 
     let result = runtime.get_asset(ConfigFile("app.json".to_string()));
     assert!(result.is_ok());

@@ -42,7 +42,10 @@ struct ImmediateLocator {
 
 impl AssetLocator<ConfigFile> for ImmediateLocator {
     fn locate(&self, _key: &ConfigFile) -> LocateResult<String> {
-        LocateResult::Ready(self.content.clone())
+        LocateResult::Ready {
+            value: self.content.clone(),
+            durability: DurabilityLevel::Stable,
+        }
     }
 }
 
@@ -212,7 +215,10 @@ fn test_asset_caching() {
     impl AssetLocator<ConfigFile> for CountingLocator {
         fn locate(&self, _key: &ConfigFile) -> LocateResult<String> {
             LOCATOR_CALLS.fetch_add(1, Ordering::SeqCst);
-            LocateResult::Ready("cached".to_string())
+            LocateResult::Ready {
+                value: "cached".to_string(),
+                durability: DurabilityLevel::Stable,
+            }
         }
     }
 

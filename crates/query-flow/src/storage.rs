@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use papaya::HashMap;
 
-use crate::asset::{AssetKey, AssetLocator, FullAssetKey};
+use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey};
 use crate::key::FullCacheKey;
 use crate::query::Query;
 
@@ -60,8 +60,11 @@ impl CachedEntry {
 pub(crate) enum AssetState {
     /// Asset is being loaded.
     Loading,
-    /// Asset is ready with the given value (type-erased).
-    Ready(Arc<dyn Any + Send + Sync>),
+    /// Asset is ready with the given value (type-erased) and durability.
+    Ready {
+        value: Arc<dyn Any + Send + Sync>,
+        durability: DurabilityLevel,
+    },
     /// Asset could not be found.
     NotFound,
 }
@@ -93,9 +96,10 @@ impl<K: AssetKey, L: AssetLocator<K>> AnyAssetLocator for LocatorWrapper<K, L> {
     fn locate_any(&self, key: &dyn Any) -> Option<AssetState> {
         let key = key.downcast_ref::<K>()?;
         Some(match self.locator.locate(key) {
-            crate::asset::LocateResult::Ready(value) => {
-                AssetState::Ready(Arc::new(value) as Arc<dyn Any + Send + Sync>)
-            }
+            crate::asset::LocateResult::Ready { value, durability } => AssetState::Ready {
+                value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
+                durability,
+            },
             crate::asset::LocateResult::Pending => AssetState::Loading,
             crate::asset::LocateResult::NotFound => AssetState::NotFound,
         })

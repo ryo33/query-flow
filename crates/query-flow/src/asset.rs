@@ -79,7 +79,12 @@ pub trait AssetKey: Key + 'static {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocateResult<A> {
     /// Asset is immediately available (e.g., from memory cache).
-    Ready(A),
+    Ready {
+        /// The asset value.
+        value: A,
+        /// The durability level of this asset.
+        durability: DurabilityLevel,
+    },
     /// Asset needs to be loaded asynchronously.
     /// The runtime will track this as a pending request.
     Pending,
@@ -107,7 +112,10 @@ pub enum LocateResult<A> {
 ///         // For sync IO, could read directly:
 ///         // let path = self.base_path.join(&key.0);
 ///         // match std::fs::read_to_string(&path) {
-///         //     Ok(content) => LocateResult::Ready(content),
+///         //     Ok(content) => LocateResult::Ready {
+///         //         value: content,
+///         //         durability: DurabilityLevel::Stable,
+///         //     },
 ///         //     Err(_) => LocateResult::NotFound,
 ///         // }
 ///
@@ -120,7 +128,7 @@ pub trait AssetLocator<K: AssetKey>: Send + Sync + 'static {
     /// Attempt to locate an asset for the given key.
     ///
     /// This method should be fast and non-blocking:
-    /// - Return `Ready(value)` if the asset is immediately available
+    /// - Return `Ready { value, durability }` if the asset is immediately available
     /// - Return `Pending` if the asset needs async loading
     /// - Return `NotFound` if the asset cannot be found
     ///

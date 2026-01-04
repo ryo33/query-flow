@@ -95,7 +95,7 @@ impl Query for SyntheticQuery {
         self.node_id
     }
 
-    fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
+    fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
         // Collect dependency outputs
         let mut combined_data = Vec::new();
 
@@ -121,10 +121,10 @@ impl Query for SyntheticQuery {
         // Compute deterministic output
         let output_data = compute_hash_output(&combined_data, self.output_size);
 
-        Ok(SyntheticOutput {
+        Ok(Arc::new(SyntheticOutput {
             node_id: self.node_id,
             data: output_data,
-        })
+        }))
     }
 
     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

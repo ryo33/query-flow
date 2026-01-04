@@ -714,6 +714,42 @@ fn test_cycle_locator_query_asset() {
     assert!(matches!(result, Err(QueryError::Cycle { .. })));
 }
 
+#[asset_key(asset = String)]
+struct MutualCycleA(String);
+
+#[asset_key(asset = String)]
+struct MutualCycleB(String);
+
+#[test]
+fn test_cycle_mutual_assets() {
+    // A's locator accesses B, B's locator accesses A
+    #[asset_locator]
+    fn locator_a(db: &impl Db, key: &MutualCycleA) -> Result<LocateResult<String>, QueryError> {
+        let b = db.asset(MutualCycleB(key.0.clone()))?.suspend()?;
+        Ok(LocateResult::Ready {
+            value: format!("A got B: {}", b),
+            durability: DurabilityLevel::Volatile,
+        })
+    }
+
+    #[asset_locator]
+    fn locator_b(db: &impl Db, key: &MutualCycleB) -> Result<LocateResult<String>, QueryError> {
+        let a = db.asset(MutualCycleA(key.0.clone()))?.suspend()?;
+        Ok(LocateResult::Ready {
+            value: format!("B got A: {}", a),
+            durability: DurabilityLevel::Volatile,
+        })
+    }
+
+    let runtime = QueryRuntime::new();
+    runtime.register_asset_locator(LocatorA);
+    runtime.register_asset_locator(LocatorB);
+
+    // Access A -> A's locator accesses B -> B's locator accesses A -> Cycle
+    let result = runtime.asset(MutualCycleA("test".to_string()));
+    assert!(matches!(result, Err(QueryError::Cycle { .. })));
+}
+
 // ============================================================================
 // Locator Dependency Invalidation Tests
 // ============================================================================

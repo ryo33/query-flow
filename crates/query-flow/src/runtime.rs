@@ -36,6 +36,40 @@ thread_local! {
     static QUERY_STACK: RefCell<Vec<FullCacheKey>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Check for cycles in the query stack and return error if detected.
+fn check_cycle(key: &FullCacheKey) -> Result<(), QueryError> {
+    let cycle_detected = QUERY_STACK.with(|stack| stack.borrow().iter().any(|k| k == key));
+    if cycle_detected {
+        let path = QUERY_STACK.with(|stack| {
+            let stack = stack.borrow();
+            let mut path: Vec<String> =
+                stack.iter().map(|k| k.debug_repr().to_string()).collect();
+            path.push(key.debug_repr().to_string());
+            path
+        });
+        return Err(QueryError::Cycle { path });
+    }
+    Ok(())
+}
+
+/// RAII guard for pushing/popping from query stack.
+struct StackGuard;
+
+impl StackGuard {
+    fn push(key: FullCacheKey) -> Self {
+        QUERY_STACK.with(|stack| stack.borrow_mut().push(key));
+        StackGuard
+    }
+}
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        QUERY_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
 /// Execution context passed through query execution.
 ///
 /// Contains a span ID for tracing correlation.
@@ -337,15 +371,9 @@ impl<T: Tracer> QueryRuntime<T> {
             .on_cache_check(span_id, query_key.clone(), false);
 
         // Execute the query with cycle tracking
-        QUERY_STACK.with(|stack| {
-            stack.borrow_mut().push(full_key.clone());
-        });
-
+        let _guard = StackGuard::push(full_key.clone());
         let result = self.execute_query::<Q>(&query, &full_key, exec_ctx);
-
-        QUERY_STACK.with(|stack| {
-            stack.borrow_mut().pop();
-        });
+        drop(_guard);
 
         // Emit end event
         let exec_result = match &result {
@@ -1184,9 +1212,14 @@ impl<T: Tracer> QueryRuntime<T> {
         }
 
         // Not in cache or invalid - try locator
-        if let Some(result) = self
+        check_cycle(&full_cache_key)?;
+        let _guard = StackGuard::push(full_cache_key.clone());
+
+        let locator_result = self
             .locators
-            .locate_with_runtime(TypeId::of::<K>(), self, &key)
+            .locate_with_runtime(TypeId::of::<K>(), self, &key);
+
+        if let Some(result) = locator_result
         {
             match result {
                 Ok(ErasedLocateResult::Ready {
@@ -1376,34 +1409,10 @@ impl<T: Tracer> QueryRuntime<T> {
         }
 
         // Not in cache or invalid - try locator (with context for dependency tracking)
-        // First, check for cycles using the query stack (assets share the same stack as queries)
-        let cycle_detected = QUERY_STACK.with(|stack| {
-            let stack = stack.borrow();
-            stack.iter().any(|k| k == &full_cache_key)
-        });
-
-        if cycle_detected {
-            let path = QUERY_STACK.with(|stack| {
-                let stack = stack.borrow();
-                let mut path: Vec<String> =
-                    stack.iter().map(|k| k.debug_repr().to_string()).collect();
-                path.push(full_cache_key.debug_repr().to_string());
-                path
-            });
-            return Err(QueryError::Cycle { path });
-        }
-
-        // Push asset to stack before calling locator
-        QUERY_STACK.with(|stack| {
-            stack.borrow_mut().push(full_cache_key.clone());
-        });
+        check_cycle(&full_cache_key)?;
+        let _guard = StackGuard::push(full_cache_key.clone());
 
         let locator_result = self.locators.locate_with_ctx(TypeId::of::<K>(), ctx, &key);
-
-        // Pop asset from stack after locator returns
-        QUERY_STACK.with(|stack| {
-            stack.borrow_mut().pop();
-        });
 
         if let Some(result) = locator_result {
             match result {

@@ -1,7 +1,7 @@
 use darling::FromMeta;
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Error, ItemStruct};
+use syn::{Error, Item};
 
 use crate::query::OutputEq;
 
@@ -32,11 +32,13 @@ pub struct AssetKeyAttr {
     asset_eq: OutputEq,
 }
 
-pub fn generate_asset_key(
-    attr: AssetKeyAttr,
-    input_struct: ItemStruct,
-) -> Result<TokenStream, Error> {
-    let struct_name = &input_struct.ident;
+pub fn generate_asset_key(attr: AssetKeyAttr, input: Item) -> Result<TokenStream, Error> {
+    let (name, item_tokens) = match &input {
+        Item::Struct(s) => (&s.ident, quote! { #s }),
+        Item::Enum(e) => (&e.ident, quote! { #e }),
+        _ => return Err(Error::new_spanned(input, "expected struct or enum")),
+    };
+
     let asset_ty = &attr.asset.0;
 
     // Generate asset_eq method
@@ -55,9 +57,9 @@ pub fn generate_asset_key(
 
     Ok(quote! {
         #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-        #input_struct
+        #item_tokens
 
-        impl ::query_flow::AssetKey for #struct_name {
+        impl ::query_flow::AssetKey for #name {
             type Asset = #asset_ty;
 
             #asset_eq_impl

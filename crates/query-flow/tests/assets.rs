@@ -489,3 +489,36 @@ fn test_get_asset_not_found() {
     let result = runtime.get_asset(ConfigFile("missing.json".to_string()));
     assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
 }
+
+// ============================================================================
+// Enum Asset Key Tests
+// ============================================================================
+
+#[asset_key(asset = String)]
+pub enum ResourcePath {
+    Config(String),
+    Data { name: String },
+    Static,
+}
+
+#[test]
+fn test_enum_asset_key() {
+    let runtime = QueryRuntime::new();
+
+    runtime.resolve_asset(
+        ResourcePath::Config("app.toml".to_string()),
+        "config content".to_string(),
+        DurabilityLevel::Volatile,
+    );
+
+    #[query]
+    fn read_resource(db: &impl Db, path: ResourcePath) -> Result<String, QueryError> {
+        let content = db.asset(path.clone())?.suspend()?;
+        Ok((*content).clone())
+    }
+
+    let result = runtime.query(ReadResource::new(ResourcePath::Config(
+        "app.toml".to_string(),
+    )));
+    assert_eq!(*result.unwrap(), "config content");
+}

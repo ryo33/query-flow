@@ -35,7 +35,7 @@ mod query;
 
 use darling::{ast::NestedMeta, FromMeta as _};
 use proc_macro::TokenStream;
-use syn::{parse_macro_input, ItemFn, ItemStruct};
+use syn::{parse_macro_input, Item, ItemFn};
 
 use crate::{
     asset_key::{generate_asset_key, AssetKeyAttr},
@@ -126,9 +126,9 @@ pub fn asset_key(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return TokenStream::from(e.write_errors()),
     };
 
-    let input_struct = parse_macro_input!(item as ItemStruct);
+    let input = parse_macro_input!(item as Item);
 
-    match generate_asset_key(attr, input_struct) {
+    match generate_asset_key(attr, input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

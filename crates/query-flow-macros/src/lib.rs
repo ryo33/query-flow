@@ -1,7 +1,7 @@
 //! Procedural macros for query-flow.
 //!
-//! This crate provides attribute macros for defining queries and asset keys
-//! with minimal boilerplate.
+//! This crate provides attribute macros for defining queries, asset keys,
+//! and asset locators with minimal boilerplate.
 //!
 //! # Query Example
 //!
@@ -29,8 +29,24 @@
 //! // Generates:
 //! // impl AssetKey for ConfigFile { type Asset = String; ... }
 //! ```
+//!
+//! # Asset Locator Example
+//!
+//! ```ignore
+//! use query_flow::{asset_locator, Db, LocateResult, QueryError};
+//!
+//! #[asset_locator]
+//! fn pending(_db: &impl Db, _key: &ConfigFile) -> Result<LocateResult<String>, QueryError> {
+//!     Ok(LocateResult::Pending)
+//! }
+//!
+//! // Generates:
+//! // struct Pending;
+//! // impl AssetLocator<ConfigFile> for Pending { ... }
+//! ```
 
 mod asset_key;
+mod asset_locator;
 mod query;
 
 use darling::{ast::NestedMeta, FromMeta as _};
@@ -39,6 +55,7 @@ use syn::{parse_macro_input, Item, ItemFn};
 
 use crate::{
     asset_key::{generate_asset_key, AssetKeyAttr},
+    asset_locator::generate_asset_locator,
     query::{generate_query, QueryAttr},
 };
 
@@ -129,6 +146,43 @@ pub fn asset_key(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as Item);
 
     match generate_asset_key(attr, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Define an asset locator from a function.
+///
+/// This macro generates a struct and `AssetLocator` implementation from a
+/// locator function, making it easier to define inline locators in tests.
+///
+/// The function name is converted to PascalCase for the struct name.
+/// The `db` parameter name can be anything (commonly `_db` if unused).
+/// The key type is inferred from the second parameter.
+///
+/// # Example
+///
+/// ```ignore
+/// use query_flow::{asset_locator, Db, LocateResult, QueryError};
+///
+/// // Basic locator - returns Pending
+/// #[asset_locator]
+/// fn pending(_db: &impl Db, _key: &ConfigFile) -> Result<LocateResult<String>, QueryError> {
+///     Ok(LocateResult::Pending)
+/// }
+///
+/// // Generates:
+/// // struct Pending;
+/// // impl AssetLocator<ConfigFile> for Pending { ... }
+///
+/// // Use it:
+/// runtime.register_asset_locator(Pending);
+/// ```
+#[proc_macro_attribute]
+pub fn asset_locator(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    match generate_asset_locator(input_fn) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

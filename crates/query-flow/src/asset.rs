@@ -10,6 +10,8 @@ use std::any::{Any, TypeId};
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::db::Db;
+use crate::error::QueryError;
 use crate::key::Key;
 
 /// Durability levels for dependency tracking optimization.
@@ -88,8 +90,6 @@ pub enum LocateResult<A> {
     /// Asset needs to be loaded asynchronously.
     /// The runtime will track this as a pending request.
     Pending,
-    /// Asset does not exist or cannot be located.
-    NotFound,
 }
 
 /// Trait for locating and loading assets.
@@ -100,41 +100,53 @@ pub enum LocateResult<A> {
 /// - Network locator for web/playground
 /// - Memory locator for testing
 ///
+/// # Database Access
+///
+/// The `locate` method receives a database handle, allowing locators to:
+/// - Query configuration to determine loading behavior
+/// - Access other assets as dependencies
+/// - Make dynamic decisions based on runtime state
+///
+/// Any queries or assets accessed during `locate()` are tracked as dependencies
+/// of the calling query.
+///
 /// # Example
 ///
 /// ```ignore
-/// struct FileSystemLocator {
-///     base_path: PathBuf,
-/// }
+/// struct ConfigAwareLocator;
 ///
-/// impl AssetLocator<FilePath> for FileSystemLocator {
-///     fn locate(&self, key: &FilePath) -> LocateResult<String> {
-///         // For sync IO, could read directly:
-///         // let path = self.base_path.join(&key.0);
-///         // match std::fs::read_to_string(&path) {
-///         //     Ok(content) => LocateResult::Ready {
-///         //         value: content,
-///         //         durability: DurabilityLevel::Stable,
-///         //     },
-///         //     Err(_) => LocateResult::NotFound,
-///         // }
+/// impl AssetLocator<FilePath> for ConfigAwareLocator {
+///     fn locate(&self, db: &impl Db, key: &FilePath) -> Result<LocateResult<String>, QueryError> {
+///         // Access config to check if path is allowed
+///         let config = db.query(GetConfig)?.clone();
+///         if !config.allowed_paths.contains(&key.0) {
+///             return Err(QueryError::MissingDependency {
+///                 description: format!("Path not allowed: {:?}", key.0),
+///             });
+///         }
 ///
-///         // For async IO, return Pending:
-///         LocateResult::Pending
+///         // Return pending for async loading
+///         Ok(LocateResult::Pending)
 ///     }
 /// }
 /// ```
 pub trait AssetLocator<K: AssetKey>: Send + Sync + 'static {
     /// Attempt to locate an asset for the given key.
     ///
-    /// This method should be fast and non-blocking:
-    /// - Return `Ready { value, durability }` if the asset is immediately available
-    /// - Return `Pending` if the asset needs async loading
-    /// - Return `NotFound` if the asset cannot be found
+    /// # Arguments
+    /// * `db` - Database handle for accessing queries and other assets
+    /// * `key` - The asset key to locate
     ///
-    /// For assets requiring IO, typically return `Pending` and let the user
-    /// fetch the asset externally, then call `runtime.resolve_asset()`.
-    fn locate(&self, key: &K) -> LocateResult<K::Asset>;
+    /// # Returns
+    /// * `Ok(Ready { value, durability })` - Asset is immediately available
+    /// * `Ok(Pending)` - Asset needs async loading (will be added to pending list)
+    /// * `Err(QueryError)` - Location failed (will NOT be added to pending list)
+    ///
+    /// # Dependency Tracking
+    ///
+    /// Any `db.query()` or `db.asset()` calls made during this method
+    /// become dependencies of the query that requested this asset.
+    fn locate(&self, db: &impl Db, key: &K) -> Result<LocateResult<K::Asset>, QueryError>;
 }
 
 /// A pending asset request that needs to be resolved.

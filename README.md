@@ -156,6 +156,13 @@ pub struct ConfigFile(pub PathBuf);
 #[asset_key(asset = Vec<u8>)]
 pub struct BinaryAsset(pub PathBuf);
 
+// With selective key fields (only `path` used for Hash/Eq)
+#[asset_key(asset = String, key(path))]
+pub struct CountedAsset {
+    path: String,
+    call_count: Arc<AtomicU32>,  // Not part of key
+}
+
 // Manual implementation
 pub struct TextureId(pub u32);
 
@@ -184,6 +191,43 @@ fn process_config(ctx: &mut QueryContext, path: PathBuf) -> Result<Config, Query
 }
 ```
 
+### Asset Locators (Optional)
+
+Locators are **optional**. Without a locator, assets always return `Pending` and must be resolved externally via `resolve_asset()` or `resolve_asset_error()`.
+
+Register a locator when you need:
+- **Immediate resolution**: Return `Ready` for assets available synchronously
+- **Validation/hooks**: Reject invalid keys or log access patterns
+- **Query-based DI**: Use `db.query()` to determine loading behavior dynamically
+
+```rust
+use query_flow::{asset_locator, Db, LocateResult, QueryError, DurabilityLevel};
+
+#[asset_locator]
+fn config_locator(db: &impl Db, key: &ConfigFile) -> Result<LocateResult<String>, QueryError> {
+    // Validation: reject disallowed paths
+    let config = db.query(GetConfig)?;
+    if !config.allowed_paths.contains(&key.0) {
+        return Err(anyhow::anyhow!("Path not allowed").into());
+    }
+
+    // Immediate resolution for bundled files
+    if let Some(content) = BUNDLED_FILES.get(&key.0) {
+        return Ok(LocateResult::Ready {
+            value: content.clone(),
+            durability: DurabilityLevel::Static,
+        });
+    }
+
+    // Otherwise, defer to external loading
+    Ok(LocateResult::Pending)
+}
+
+runtime.register_asset_locator(ConfigLocator);
+```
+
+The `#[asset_locator]` macro generates a struct (PascalCase of function name) implementing `AssetLocator`.
+
 ### Asset Loading Flow
 
 ```rust
@@ -191,8 +235,8 @@ use query_flow::DurabilityLevel;
 
 let runtime = QueryRuntime::new();
 
-// Optional: Register a locator for immediate resolution
-runtime.register_asset_locator(MyFileLocator::new());
+// Optional: Register a locator (see above)
+// runtime.register_asset_locator(ConfigLocator);
 
 // Execute query - may return Err(Suspend) if assets are loading
 match runtime.query(ProcessConfig::new(path)) {
@@ -201,9 +245,15 @@ match runtime.query(ProcessConfig::new(path)) {
         // Handle pending assets
         for pending in runtime.pending_assets() {
             if let Some(path) = pending.key::<ConfigFile>() {
-                let content = std::fs::read_to_string(&path.0)?;
-                // Durability is specified at resolve time
-                runtime.resolve_asset(path.clone(), content, DurabilityLevel::Volatile);
+                match std::fs::read_to_string(&path.0) {
+                    Ok(content) => {
+                        runtime.resolve_asset(path.clone(), content, DurabilityLevel::Volatile);
+                    }
+                    Err(e) => {
+                        // Cache the error - queries will receive QueryError::UserError
+                        runtime.resolve_asset_error(path.clone(), e, DurabilityLevel::Volatile);
+                    }
+                }
             }
         }
         // Retry query
@@ -278,6 +328,7 @@ runtime.clear_cache();
 // Asset management
 runtime.register_asset_locator(locator);
 runtime.resolve_asset(key, value, DurabilityLevel::Volatile);
+runtime.resolve_asset_error(key, error, DurabilityLevel::Volatile);
 runtime.invalidate_asset(&key);
 runtime.remove_asset(&key);
 

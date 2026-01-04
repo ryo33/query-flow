@@ -34,91 +34,151 @@ pub enum CachedEntry {
     UserError(Arc<anyhow::Error>),
     /// Asset is ready with value (type-erased).
     AssetReady(Arc<dyn Any + Send + Sync>),
-    /// Asset was not found.
-    AssetNotFound,
+    /// Asset error (from locator or resolve_asset_error).
+    ///
+    /// Unlike query errors which use `UserError`, asset errors are stored
+    /// separately to maintain distinct retrieval paths for queries and assets.
+    AssetError(Arc<anyhow::Error>),
 }
 
 impl CachedEntry {
     /// Convert to typed [`CachedValue`] by downcasting.
     ///
     /// This is intended for query results only. Returns `None` for asset variants
-    /// (`AssetReady`, `AssetNotFound`) because queries and assets have distinct
+    /// (`AssetReady`, `AssetError`) because queries and assets have distinct
     /// retrieval paths and type semantics:
     /// - Queries use `CachedValue<Arc<T>>` with `Ok`/`UserError` variants
-    /// - Assets use dedicated methods like `to_asset_value()` or `is_asset_not_found()`
+    /// - Assets use dedicated methods like `to_asset_value()` or `to_asset_error()`
     pub fn to_cached_value<T: Send + Sync + 'static>(&self) -> Option<CachedValue<Arc<T>>> {
         match self {
             CachedEntry::Ok(arc) => arc.clone().downcast::<T>().ok().map(CachedValue::Ok),
             CachedEntry::UserError(e) => Some(CachedValue::UserError(e.clone())),
-            CachedEntry::AssetReady(_) | CachedEntry::AssetNotFound => None,
+            CachedEntry::AssetReady(_) | CachedEntry::AssetError(_) => None,
         }
     }
 }
 
-/// Internal state of an asset in the cache.
-#[derive(Clone)]
-pub(crate) enum AssetState {
-    /// Asset is being loaded.
-    Loading,
-    /// Asset is ready with the given value (type-erased) and durability.
+/// Result of locating an asset (type-erased).
+pub(crate) enum ErasedLocateResult {
+    /// Asset is immediately available.
     Ready {
         value: Arc<dyn Any + Send + Sync>,
         durability: DurabilityLevel,
     },
-    /// Asset could not be found.
-    NotFound,
+    /// Asset needs to be loaded asynchronously.
+    Pending,
 }
 
-/// Type-erased wrapper for asset locators.
-pub(crate) trait AnyAssetLocator: Send + Sync + 'static {
-    /// Locate an asset and return the state.
-    ///
-    /// This is type-erased - the concrete type handles the conversion.
-    fn locate_any(&self, key: &dyn Any) -> Option<AssetState>;
+/// Type-erased asset locator.
+///
+/// This wraps an `AssetLocator<K>` implementation and provides type-erased
+/// access via monomorphized function pointers captured at registration time.
+///
+/// Two function pointers are stored:
+/// - `locate_with_ctx_fn`: For calls from within a query (with dependency tracking)
+/// - `locate_with_runtime_fn`: For direct calls from QueryRuntime (no tracking)
+pub(crate) struct ErasedLocator<T: crate::Tracer> {
+    /// The actual locator, type-erased.
+    inner: Box<dyn Any + Send + Sync>,
+    /// Locate function for calls with QueryContext (dependency tracking enabled).
+    locate_with_ctx_fn: DynAssetLocatorWithQueryContext<T>,
+    /// Locate function for direct QueryRuntime calls (no dependency tracking).
+    locate_with_runtime_fn: DynAssetLocatorWithRuntime<T>,
 }
 
-/// Wrapper to make AssetLocator into AnyAssetLocator.
-pub(crate) struct LocatorWrapper<K: AssetKey, L: AssetLocator<K>> {
-    locator: L,
-    _marker: std::marker::PhantomData<fn(K)>,
-}
+type DynAssetLocatorWithQueryContext<T> =
+    fn(
+        &dyn Any,
+        &crate::QueryContext<'_, T>,
+        &dyn Any,
+    ) -> Option<Result<ErasedLocateResult, crate::QueryError>>;
 
-impl<K: AssetKey, L: AssetLocator<K>> LocatorWrapper<K, L> {
-    pub fn new(locator: L) -> Self {
+type DynAssetLocatorWithRuntime<T> = fn(
+    &dyn Any,
+    &crate::QueryRuntime<T>,
+    &dyn Any,
+) -> Option<Result<ErasedLocateResult, crate::QueryError>>;
+
+impl<T: crate::Tracer> ErasedLocator<T> {
+    /// Create a new erased locator from a concrete implementation.
+    pub fn new<K: AssetKey, L: AssetLocator<K>>(locator: L) -> Self {
         Self {
-            locator,
-            _marker: std::marker::PhantomData,
+            inner: Box::new(locator),
+            locate_with_ctx_fn: erased_locate_with_ctx::<K, L, T>,
+            locate_with_runtime_fn: erased_locate_with_runtime::<K, L, T>,
         }
     }
+
+    /// Attempt to locate an asset using QueryContext (with dependency tracking).
+    ///
+    /// Returns `None` if the key type doesn't match.
+    pub fn locate_with_ctx(
+        &self,
+        ctx: &crate::QueryContext<'_, T>,
+        key: &dyn Any,
+    ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
+        (self.locate_with_ctx_fn)(&*self.inner, ctx, key)
+    }
+
+    /// Attempt to locate an asset using QueryRuntime directly (no dependency tracking).
+    ///
+    /// Returns `None` if the key type doesn't match.
+    pub fn locate_with_runtime(
+        &self,
+        runtime: &crate::QueryRuntime<T>,
+        key: &dyn Any,
+    ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
+        (self.locate_with_runtime_fn)(&*self.inner, runtime, key)
+    }
 }
 
-impl<K: AssetKey, L: AssetLocator<K>> AnyAssetLocator for LocatorWrapper<K, L> {
-    fn locate_any(&self, key: &dyn Any) -> Option<AssetState> {
-        let key = key.downcast_ref::<K>()?;
-        Some(match self.locator.locate(key) {
-            crate::asset::LocateResult::Ready { value, durability } => AssetState::Ready {
-                value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
-                durability,
-            },
-            crate::asset::LocateResult::Pending => AssetState::Loading,
-            crate::asset::LocateResult::NotFound => AssetState::NotFound,
-        })
-    }
+/// Monomorphized locate function for QueryContext calls.
+fn erased_locate_with_ctx<K: AssetKey, L: AssetLocator<K>, T: crate::Tracer>(
+    locator: &dyn Any,
+    ctx: &crate::QueryContext<'_, T>,
+    key: &dyn Any,
+) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
+    let locator = locator.downcast_ref::<L>()?;
+    let key = key.downcast_ref::<K>()?;
+    Some(locator.locate(ctx, key).map(|result| match result {
+        crate::asset::LocateResult::Ready { value, durability } => ErasedLocateResult::Ready {
+            value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
+            durability,
+        },
+        crate::asset::LocateResult::Pending => ErasedLocateResult::Pending,
+    }))
+}
+
+/// Monomorphized locate function for QueryRuntime calls.
+fn erased_locate_with_runtime<K: AssetKey, L: AssetLocator<K>, T: crate::Tracer>(
+    locator: &dyn Any,
+    runtime: &crate::QueryRuntime<T>,
+    key: &dyn Any,
+) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
+    let locator = locator.downcast_ref::<L>()?;
+    let key = key.downcast_ref::<K>()?;
+    Some(locator.locate(runtime, key).map(|result| match result {
+        crate::asset::LocateResult::Ready { value, durability } => ErasedLocateResult::Ready {
+            value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
+            durability,
+        },
+        crate::asset::LocateResult::Pending => ErasedLocateResult::Pending,
+    }))
 }
 
 /// Thread-safe storage for asset locators.
-pub(crate) struct LocatorStorage {
+pub(crate) struct LocatorStorage<T: crate::Tracer> {
     /// Map from AssetKey TypeId to type-erased locator
-    locators: HashMap<TypeId, Arc<dyn AnyAssetLocator>, ahash::RandomState>,
+    locators: HashMap<TypeId, ErasedLocator<T>, ahash::RandomState>,
 }
 
-impl Default for LocatorStorage {
+impl<T: crate::Tracer> Default for LocatorStorage<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LocatorStorage {
+impl<T: crate::Tracer> LocatorStorage<T> {
     /// Create a new empty locator storage.
     pub fn new() -> Self {
         Self {
@@ -129,16 +189,41 @@ impl LocatorStorage {
     /// Register a locator for a specific asset key type.
     pub fn insert<K: AssetKey, L: AssetLocator<K>>(&self, locator: L) {
         let pinned = self.locators.pin();
-        pinned.insert(
-            TypeId::of::<K>(),
-            Arc::new(LocatorWrapper::<K, L>::new(locator)) as Arc<dyn AnyAssetLocator>,
-        );
+        pinned.insert(TypeId::of::<K>(), ErasedLocator::new::<K, L>(locator));
     }
 
-    /// Get a locator for a specific asset key type.
-    pub fn get(&self, key_type: TypeId) -> Option<Arc<dyn AnyAssetLocator>> {
+    /// Attempt to locate an asset using the registered locator (with QueryContext).
+    ///
+    /// This variant is used when called from within a query, enabling dependency tracking.
+    /// Returns `None` if no locator is registered for the key type or if the key
+    /// type doesn't match.
+    pub fn locate_with_ctx(
+        &self,
+        key_type: TypeId,
+        ctx: &crate::QueryContext<'_, T>,
+        key: &dyn Any,
+    ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
         let pinned = self.locators.pin();
-        pinned.get(&key_type).cloned()
+        pinned
+            .get(&key_type)
+            .and_then(|locator| locator.locate_with_ctx(ctx, key))
+    }
+
+    /// Attempt to locate an asset using the registered locator (with QueryRuntime).
+    ///
+    /// This variant is used for direct QueryRuntime::asset calls without dependency tracking.
+    /// Returns `None` if no locator is registered for the key type or if the key
+    /// type doesn't match.
+    pub fn locate_with_runtime(
+        &self,
+        key_type: TypeId,
+        runtime: &crate::QueryRuntime<T>,
+        key: &dyn Any,
+    ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
+        let pinned = self.locators.pin();
+        pinned
+            .get(&key_type)
+            .and_then(|locator| locator.locate_with_runtime(runtime, key))
     }
 }
 

@@ -184,16 +184,8 @@ fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
 
 fn validate_db_param(arg: &FnArg) -> Result<(), Error> {
     match arg {
-        FnArg::Typed(pat_type) => {
-            // Check parameter name is 'db'
-            if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                if pat_ident.ident != "db" {
-                    return Err(Error::new(
-                        pat_ident.ident.span(),
-                        "first parameter must be named `db`",
-                    ));
-                }
-            }
+        FnArg::Typed(_) => {
+            // We accept any name for the db parameter (e.g., db, _db, ctx, etc.)
             // Type checking is complex, we'll trust the user
             Ok(())
         }

@@ -42,8 +42,7 @@ fn check_cycle(key: &FullCacheKey) -> Result<(), QueryError> {
     if cycle_detected {
         let path = QUERY_STACK.with(|stack| {
             let stack = stack.borrow();
-            let mut path: Vec<String> =
-                stack.iter().map(|k| k.debug_repr().to_string()).collect();
+            let mut path: Vec<String> = stack.iter().map(|k| k.debug_repr().to_string()).collect();
             path.push(key.debug_repr().to_string());
             path
         });
@@ -1219,8 +1218,7 @@ impl<T: Tracer> QueryRuntime<T> {
             .locators
             .locate_with_runtime(TypeId::of::<K>(), self, &key);
 
-        if let Some(result) = locator_result
-        {
+        if let Some(result) = locator_result {
             match result {
                 Ok(ErasedLocateResult::Ready {
                     value: arc,

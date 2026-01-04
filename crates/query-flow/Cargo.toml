@@ -20,3 +20,9 @@ serde.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+criterion.workspace = true
+indexmap.workspace = true
+
+[[bench]]
+name = "stack_cycle"
+harness = false

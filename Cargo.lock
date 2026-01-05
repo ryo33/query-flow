@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "ahash",
  "anyhow",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow-fuzz"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "ahash",
  "clap",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow-inspector"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "parking_lot",
  "query-flow",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "query-flow-macros"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "darling",
  "heck",

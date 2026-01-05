@@ -17,6 +17,7 @@ pub fn generate_asset_locator(input_fn: ItemFn) -> Result<TokenStream, Error> {
     // Generate struct name from function name (PascalCase)
     let struct_name = format_ident!("{}", parsed.name.to_string().to_upper_camel_case());
 
+    let vis = &input_fn.vis;
     let key_ty = &parsed.key_ty;
     let asset_ty = &parsed.asset_ty;
     let fn_name = &parsed.name;
@@ -24,7 +25,7 @@ pub fn generate_asset_locator(input_fn: ItemFn) -> Result<TokenStream, Error> {
     Ok(quote! {
         #input_fn
 
-        struct #struct_name;
+        #vis struct #struct_name;
 
         impl ::query_flow::AssetLocator<#key_ty> for #struct_name {
             fn locate(
@@ -175,6 +176,7 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+            .replace("> >", ">>")
     }
 
     #[test]
@@ -218,9 +220,55 @@ mod tests {
 
         let output = generate_asset_locator(input_fn).unwrap();
 
-        // Should generate struct MyLocator and impl AssetLocator<MyKey>
-        let output_str = normalize_tokens(output);
-        assert!(output_str.contains("struct MyLocator"));
-        assert!(output_str.contains("AssetLocator < MyKey >"));
+        let expected = quote! {
+            fn my_locator(db: &impl Db, key: &MyKey) -> Result<LocateResult<Vec<u8>>, QueryError> {
+                Ok(LocateResult::Pending)
+            }
+
+            struct MyLocator;
+
+            impl ::query_flow::AssetLocator<MyKey> for MyLocator {
+                fn locate(
+                    &self,
+                    db: &impl ::query_flow::Db,
+                    key: &MyKey,
+                ) -> ::std::result::Result<::query_flow::LocateResult<Vec<u8>>, ::query_flow::QueryError> {
+                    my_locator(db, key)
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_asset_locator_with_vis() {
+        let input_fn: ItemFn = syn::parse_quote! {
+            pub fn my_locator(db: &impl Db, key: &MyKey) -> Result<LocateResult<String>, QueryError> {
+                Ok(LocateResult::Pending)
+            }
+        };
+
+        let output = generate_asset_locator(input_fn).unwrap();
+
+        let expected = quote! {
+            pub fn my_locator(db: &impl Db, key: &MyKey) -> Result<LocateResult<String>, QueryError> {
+                Ok(LocateResult::Pending)
+            }
+
+            pub struct MyLocator;
+
+            impl ::query_flow::AssetLocator<MyKey> for MyLocator {
+                fn locate(
+                    &self,
+                    db: &impl ::query_flow::Db,
+                    key: &MyKey,
+                ) -> ::std::result::Result<::query_flow::LocateResult<String>, ::query_flow::QueryError> {
+                    my_locator(db, key)
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
     }
 }

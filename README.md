@@ -6,27 +6,25 @@
 [![docs.rs](https://img.shields.io/docsrs/query-flow)](https://docs.rs/query-flow)
 ![GitHub Repo stars](https://img.shields.io/github/stars/ryo33/query-flow?style=social)
 
-A high-level query framework for incremental computation in Rust.
+An ergonomic, runtime-agnostic framework for incremental computation.
 
 > [!WARNING]
-> This is WIP
+> Currently in dogfooding phase with the [Eure](https://github.com/Hihaheho/eure/tree/main/crates/eure/src/query) project's CLI, LSP, and Web Playground.
 
 ## Features
 
-- **Async-agnostic queries**: Write sync query logic, run with sync or async runtime
+- **Runtime-agnostic**: Sync query logic with suspense pattern — works with any event loop or async runtime
 - **Automatic caching**: Query results are cached and invalidated based on dependencies
-- **Suspense pattern**: Handle async loading with `LoadingState` without coloring functions
 - **Type-safe**: Per-query-type caching with compile-time guarantees
-- **Early cutoff**: Skip downstream recomputation when values don't change
-- **Lock-free**: Built on [whale](#whale), a lock-free dependency-tracking primitive
+- **Lock-free API**: Concurrent access from multiple threads via [whale](#whale)
 
 ## Quick Start
 
 ```rust
-use query_flow::{query, QueryContext, QueryError, QueryRuntime};
+use query_flow::{query, Db, QueryError, QueryRuntime};
 
 #[query]
-fn add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+fn add(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
     Ok(a + b)
 }
 
@@ -35,6 +33,12 @@ let result = runtime.query(Add::new(1, 2)).unwrap();
 assert_eq!(*result, 3);
 ```
 
+## Core Concepts
+
+- **Query**: A derived computation that is cached and automatically invalidated when its dependencies change. Queries can depend on other queries or assets.
+- **Asset**: An external input (files, network data, user input) that queries can depend on. Assets are resolved asynchronously and trigger the suspense pattern when not yet available.
+- **Runtime**: The `QueryRuntime` manages query execution, caching, dependency tracking, and asset resolution.
+
 ## Defining Queries
 
 ### Using the `#[query]` Macro
@@ -42,18 +46,18 @@ assert_eq!(*result, 3);
 The `#[query]` macro transforms a function into a query struct implementing the `Query` trait:
 
 ```rust
-use query_flow::{query, QueryContext, QueryError};
+use query_flow::{query, Db, QueryError};
 
 // Basic query - generates `Add` struct
 #[query]
-fn add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+fn add(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
     Ok(a + b)
 }
 
 // Query with dependencies
 #[query]
-fn double_sum(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
-    let sum = ctx.query(Add::new(*a, *b))?;
+fn double_sum(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+    let sum = db.query(Add::new(a, b))?;
     Ok(*sum * 2)
 }
 ```
@@ -81,8 +85,10 @@ fn complex_query(db: &impl Db) -> Result<ComplexType, QueryError> { ... }
 For full control, implement the `Query` trait directly:
 
 ```rust
-use query_flow::{Query, QueryContext, QueryError, Key};
+use std::sync::Arc;
+use query_flow::{Query, Db, QueryError, Key};
 
+#[derive(Clone)]
 struct Add { a: i32, b: i32 }
 
 impl Query for Add {
@@ -93,8 +99,8 @@ impl Query for Add {
         (self.a, self.b)
     }
 
-    fn query(&self, _ctx: &mut QueryContext) -> Result<Self::Output, QueryError> {
-        Ok(self.a + self.b)
+    fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
+        Ok(Arc::new(self.a + self.b))
     }
 
     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -105,24 +111,49 @@ impl Query for Add {
 
 ## Error Handling
 
-query-flow supports both **system errors** and **user errors** through `QueryError`:
+Queries return `Result<Arc<Output>, QueryError>`. The error variants are:
 
-- **System errors**: `Suspend`, `Cycle`, `Cancelled`, `MissingDependency`
-- **User errors**: `UserError(Arc<anyhow::Error>)` - cached like successful results
+**System errors** (not cached):
+- `Suspend` - An asset is not yet available. See [Suspense Pattern](#suspense-pattern).
+- `Cycle` - A dependency cycle was detected in the query graph.
+- `Cancelled` - Query explicitly returned cancellation (not cached, unlike `UserError`).
+- `MissingDependency` - An asset locator indicated the asset is not found or not allowed.
+- `DependenciesRemoved` - Dependencies were removed by another thread during execution.
+- `InconsistentAssetResolution` - An asset was resolved during query execution, possibly causing inconsistent state.
+
+**User errors** (cached like successful results):
+- `UserError(Arc<anyhow::Error>)` - Domain errors from your query logic, automatically converted via `?` operator.
 
 ```rust
 // User errors with ? operator - errors are automatically converted
 #[query]
-fn parse_int(ctx: &mut QueryContext, input: String) -> Result<i32, QueryError> {
+fn parse_int(db: &impl Db, input: String) -> Result<i32, QueryError> {
     let num: i32 = input.parse()?;  // ParseIntError -> QueryError::UserError
     Ok(num)
 }
 
 // System errors propagate automatically
 #[query]
-fn process(ctx: &mut QueryContext, id: u64) -> Result<Output, QueryError> {
-    let data = ctx.query(FetchData::new(id))?;  // Propagates Suspend, Cycle, UserError, etc.
+fn process(db: &impl Db, id: u64) -> Result<Output, QueryError> {
+    let data = db.query(FetchData::new(id))?;  // Propagates Suspend, Cycle, UserError, etc.
     Ok(transform(*data))
+}
+```
+
+### Handling Specific Error Types
+
+Use `downcast_err()` to handle specific user error types while propagating others:
+
+```rust
+use query_flow::QueryResultExt;
+
+let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
+match result {
+    Ok(value) => { /* success */ }
+    Err(my_err) => {
+        // my_err derefs to &MyError
+        println!("Error code: {}", my_err.code);
+    }
 }
 ```
 
@@ -179,9 +210,9 @@ impl AssetKey for TextureId {
 
 ```rust
 #[query]
-fn process_config(ctx: &mut QueryContext, path: PathBuf) -> Result<Config, QueryError> {
-    // Get asset - returns LoadingState<Arc<String>>
-    let content = ctx.asset(&ConfigFile(path.clone()))?;
+fn process_config(db: &impl Db, path: PathBuf) -> Result<Config, QueryError> {
+    // Get asset - returns AssetLoadingState<ConfigFile>
+    let content = db.asset(ConfigFile(path.clone()))?;
 
     // Suspend if not ready (propagates to caller)
     let content = content.suspend()?;
@@ -228,41 +259,6 @@ runtime.register_asset_locator(ConfigLocator);
 
 The `#[asset_locator]` macro generates a struct (PascalCase of function name) implementing `AssetLocator`.
 
-### Asset Loading Flow
-
-```rust
-use query_flow::DurabilityLevel;
-
-let runtime = QueryRuntime::new();
-
-// Optional: Register a locator (see above)
-// runtime.register_asset_locator(ConfigLocator);
-
-// Execute query - may return Err(Suspend) if assets are loading
-match runtime.query(ProcessConfig::new(path)) {
-    Ok(result) => println!("Done: {:?}", result),
-    Err(QueryError::Suspend) => {
-        // Handle pending assets
-        for pending in runtime.pending_assets() {
-            if let Some(path) = pending.key::<ConfigFile>() {
-                match std::fs::read_to_string(&path.0) {
-                    Ok(content) => {
-                        runtime.resolve_asset(path.clone(), content, DurabilityLevel::Volatile);
-                    }
-                    Err(e) => {
-                        // Cache the error - queries will receive QueryError::UserError
-                        runtime.resolve_asset_error(path.clone(), e, DurabilityLevel::Volatile);
-                    }
-                }
-            }
-        }
-        // Retry query
-        let result = runtime.query(ProcessConfig::new(path))?;
-    }
-    Err(e) => return Err(e),
-}
-```
-
 ### Asset Invalidation
 
 ```rust
@@ -276,23 +272,76 @@ runtime.remove_asset(&ConfigFile(path));
 
 ## Suspense Pattern
 
-The suspense pattern allows sync query code to handle async operations:
+The suspense pattern allows sync query code to handle async operations. `db.asset()` returns `AssetLoadingState<K>` which can be handled in two ways:
+
+### Pattern 1: Suspend until ready
+
+Use `.suspend()` to propagate loading state upward as `Err(QueryError::Suspend)`.
 
 ```rust
-/// LoadingState<T> represents async loading state
-pub enum LoadingState<T> {
-    Loading,
-    Ready(T),
+#[query]
+fn process_config(db: &impl Db, path: ConfigFile) -> Result<Config, QueryError> {
+    let content = db.asset(path)?.suspend()?;  // Returns Err(Suspend) if loading
+    Ok(parse_config(&content))
+}
+```
+
+When a query suspends, the runtime tracks which assets are pending. In your event loop, resolve assets when they become available:
+
+```rust
+// You can check what's pending:
+for pending in runtime.pending_assets_of::<ConfigFile>() {
+    start_loading(&pending.0);
 }
 
-impl<T> LoadingState<T> {
-    /// Convert to Result - Loading becomes Err(Suspend)
-    pub fn suspend(self) -> Result<T, QueryError>;
+// In your event loop, when file content is loaded:
+runtime.resolve_asset(ConfigFile(path), content, DurabilityLevel::Volatile);
 
-    pub fn is_loading(&self) -> bool;
-    pub fn is_ready(&self) -> bool;
-    pub fn get(&self) -> Option<&T>;
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> LoadingState<U>;
+// Or if loading failed:
+runtime.resolve_asset_error(ConfigFile(path), io_error, DurabilityLevel::Volatile);
+
+// Then retry the query
+let result = runtime.query(ProcessConfig::new(path))?;
+```
+
+### Pattern 2: Handle loading state inline
+
+Use `.into_inner()` or `.get()` to provide a fallback value during loading:
+
+```rust
+#[query]
+fn eval_expr(db: &impl Db, name: String) -> Result<i64, QueryError> {
+    // Return 0 while loading, use actual value when ready
+    let value = db.asset(Variable(name))?
+        .into_inner()
+        .map(|v| *v)
+        .unwrap_or(0);
+    Ok(value)
+}
+```
+
+## Subscription Pattern
+
+Use `runtime.poll()` to track query changes with revision numbers. This is useful for push-based notifications (e.g., LSP diagnostics).
+
+```rust
+struct Subscription<Q: Query> {
+    query: Q,
+    last_revision: RevisionCounter,
+}
+
+// Poll and return only when changed
+fn poll_subscription<Q: Query>(
+    db: &impl Db,
+    sub: &mut Subscription<Q>,
+) -> Result<Option<Arc<Q::Output>>, QueryError> {
+    let polled = db.poll(sub.query.clone())?;
+    if polled.revision != sub.last_revision {
+        sub.last_revision = polled.revision;
+        Ok(Some(polled.value?))
+    } else {
+        Ok(None)
+    }
 }
 ```
 
@@ -300,12 +349,12 @@ impl<T> LoadingState<T> {
 
 Durability is specified when resolving assets and helps optimize invalidation propagation:
 
-| Level | Value | Description |
-|-------|-------|-------------|
-| `Volatile` | 0 | Changes frequently (user input, live feeds) |
-| `Transient` | 1 | Changes occasionally (configuration, session data) |
-| `Stable` | 2 | Changes rarely (external dependencies) |
-| `Static` | 3 | Fixed for this session (bundled assets, constants) |
+| Level | Description |
+|-------|-------------|
+| `Volatile` | Changes frequently (user input, live feeds) |
+| `Transient` | Changes occasionally (configuration, session data) |
+| `Stable` | Changes rarely (external dependencies) |
+| `Static` | Fixed for this session (bundled assets, constants) |
 
 ```rust
 // Durability is specified at resolve_asset time

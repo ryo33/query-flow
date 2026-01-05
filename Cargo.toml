@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 # Version for query-flow* crates. whale has its own version.
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/ryo33/query-flow"
@@ -14,9 +14,9 @@ readme = "README.md"
 
 [workspace.dependencies]
 whale = { path = "crates/whale", version = "0.5.0" }
-query-flow = { path = "crates/query-flow", version = "0.12.1" }
-query-flow-macros = { path = "crates/query-flow-macros", version = "0.12.1" }
-query-flow-inspector = { path = "crates/query-flow-inspector", version = "0.12.1" }
+query-flow = { path = "crates/query-flow", version = "0.12.2" }
+query-flow-macros = { path = "crates/query-flow-macros", version = "0.12.2" }
+query-flow-inspector = { path = "crates/query-flow-inspector", version = "0.12.2" }
 ahash = "0.8"
 papaya = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }

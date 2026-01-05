@@ -64,21 +64,11 @@ fn double_sum(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
 
 ### Macro Options
 
-```rust
-// Selective cache keys - only `id` is part of the key
-#[query(keys(id))]
-fn fetch_user(db: &impl Db, id: u64, include_deleted: bool) -> Result<User, QueryError> {
-    // Queries with same `id` share cache, regardless of `include_deleted`
-}
-
-// Custom struct name
-#[query(name = "FetchUserById")]
-fn fetch_user(db: &impl Db, id: u64) -> Result<User, QueryError> { ... }
-
-// Custom output equality (for types without PartialEq)
-#[query(output_eq = my_custom_eq)]
-fn complex_query(db: &impl Db) -> Result<ComplexType, QueryError> { ... }
-```
+| Option | Example | Description |
+|--------|---------|-------------|
+| `keys(...)` | `#[query(keys(id))]` | Only specified fields used as cache key |
+| `name = "..."` | `#[query(name = "FetchUserById")]` | Custom struct name |
+| `output_eq = fn` | `#[query(output_eq = my_eq)]` | Custom equality for early cutoff |
 
 ### Manual Query Implementation
 
@@ -107,67 +97,6 @@ impl Query for Add {
         old == new
     }
 }
-```
-
-## Error Handling
-
-Queries return `Result<Arc<Output>, QueryError>`. The error variants are:
-
-**System errors** (not cached):
-- `Suspend` - An asset is not yet available. See [Suspense Pattern](#suspense-pattern).
-- `Cycle` - A dependency cycle was detected in the query graph.
-- `Cancelled` - Query explicitly returned cancellation (not cached, unlike `UserError`).
-- `MissingDependency` - An asset locator indicated the asset is not found or not allowed.
-- `DependenciesRemoved` - Dependencies were removed by another thread during execution.
-- `InconsistentAssetResolution` - An asset was resolved during query execution, possibly causing inconsistent state.
-
-**User errors** (cached like successful results):
-- `UserError(Arc<anyhow::Error>)` - Domain errors from your query logic, automatically converted via `?` operator.
-
-```rust
-// User errors with ? operator - errors are automatically converted
-#[query]
-fn parse_int(db: &impl Db, input: String) -> Result<i32, QueryError> {
-    let num: i32 = input.parse()?;  // ParseIntError -> QueryError::UserError
-    Ok(num)
-}
-
-// System errors propagate automatically
-#[query]
-fn process(db: &impl Db, id: u64) -> Result<Output, QueryError> {
-    let data = db.query(FetchData::new(id))?;  // Propagates Suspend, Cycle, UserError, etc.
-    Ok(transform(*data))
-}
-```
-
-### Handling Specific Error Types
-
-Use `downcast_err()` to handle specific user error types while propagating others:
-
-```rust
-use query_flow::QueryResultExt;
-
-let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
-match result {
-    Ok(value) => { /* success */ }
-    Err(my_err) => {
-        // my_err derefs to &MyError
-        println!("Error code: {}", my_err.code);
-    }
-}
-```
-
-### Error Comparator for Early Cutoff
-
-By default, all `UserError` values are considered different (conservative). Use `QueryRuntimeBuilder` to customize:
-
-```rust
-let runtime = QueryRuntime::builder()
-    .error_comparator(|a, b| {
-        // Treat errors as equal if they have the same message
-        a.to_string() == b.to_string()
-    })
-    .build();
 ```
 
 ## Assets: External Inputs
@@ -259,6 +188,22 @@ runtime.register_asset_locator(ConfigLocator);
 
 The `#[asset_locator]` macro generates a struct (PascalCase of function name) implementing `AssetLocator`.
 
+### Durability Levels
+
+Durability is specified when resolving assets and helps optimize invalidation propagation:
+
+| Level | Description |
+|-------|-------------|
+| `Volatile` | Changes frequently (user input, live feeds) |
+| `Transient` | Changes occasionally (configuration, session data) |
+| `Stable` | Changes rarely (external dependencies) |
+| `Static` | Fixed for this session (bundled assets, constants) |
+
+```rust
+runtime.resolve_asset(ConfigFile(path), content, DurabilityLevel::Volatile);
+runtime.resolve_asset(BundledAsset(name), data, DurabilityLevel::Static);
+```
+
 ### Asset Invalidation
 
 ```rust
@@ -270,11 +215,11 @@ runtime.invalidate_asset(&ConfigFile(path));
 runtime.remove_asset(&ConfigFile(path));
 ```
 
-## Suspense Pattern
+### Suspense Pattern
 
 The suspense pattern allows sync query code to handle async operations. `db.asset()` returns `AssetLoadingState<K>` which can be handled in two ways:
 
-### Pattern 1: Suspend until ready
+#### Pattern 1: Suspend until ready
 
 Use `.suspend()` to propagate loading state upward as `Err(QueryError::Suspend)`.
 
@@ -304,7 +249,7 @@ runtime.resolve_asset_error(ConfigFile(path), io_error, DurabilityLevel::Volatil
 let result = runtime.query(ProcessConfig::new(path))?;
 ```
 
-### Pattern 2: Handle loading state inline
+#### Pattern 2: Handle loading state inline
 
 Use `.into_inner()` or `.get()` to provide a fallback value during loading:
 
@@ -318,6 +263,67 @@ fn eval_expr(db: &impl Db, name: String) -> Result<i64, QueryError> {
         .unwrap_or(0);
     Ok(value)
 }
+```
+
+## Error Handling
+
+Queries return `Result<Arc<Output>, QueryError>`. The error variants are:
+
+**System errors** (not cached):
+- `Suspend` - An asset is not yet available. See [Suspense Pattern](#suspense-pattern).
+- `Cycle` - A dependency cycle was detected in the query graph.
+- `Cancelled` - Query explicitly returned cancellation (not cached, unlike `UserError`).
+- `MissingDependency` - An asset locator indicated the asset is not found or not allowed.
+- `DependenciesRemoved` - Dependencies were removed by another thread during execution.
+- `InconsistentAssetResolution` - An asset was resolved during query execution, possibly causing inconsistent state.
+
+**User errors** (cached like successful results):
+- `UserError(Arc<anyhow::Error>)` - Domain errors from your query logic, automatically converted via `?` operator.
+
+```rust
+// User errors with ? operator - errors are automatically converted
+#[query]
+fn parse_int(db: &impl Db, input: String) -> Result<i32, QueryError> {
+    let num: i32 = input.parse()?;  // ParseIntError -> QueryError::UserError
+    Ok(num)
+}
+
+// System errors propagate automatically
+#[query]
+fn process(db: &impl Db, id: u64) -> Result<Output, QueryError> {
+    let data = db.query(FetchData::new(id))?;  // Propagates Suspend, Cycle, UserError, etc.
+    Ok(transform(*data))
+}
+```
+
+### Handling Specific Error Types
+
+Use `downcast_err()` to handle specific user error types while propagating others:
+
+```rust
+use query_flow::QueryResultExt;
+
+let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
+match result {
+    Ok(value) => { /* success */ }
+    Err(my_err) => {
+        // my_err derefs to &MyError
+        println!("Error code: {}", my_err.code);
+    }
+}
+```
+
+### Error Comparator for Early Cutoff
+
+By default, all `UserError` values are considered different (conservative). Use `QueryRuntimeBuilder` to customize:
+
+```rust
+let runtime = QueryRuntime::builder()
+    .error_comparator(|a, b| {
+        // Treat errors as equal if they have the same message
+        a.to_string() == b.to_string()
+    })
+    .build();
 ```
 
 ## Subscription Pattern
@@ -343,23 +349,6 @@ fn poll_subscription<Q: Query>(
         Ok(None)
     }
 }
-```
-
-## Durability Levels
-
-Durability is specified when resolving assets and helps optimize invalidation propagation:
-
-| Level | Description |
-|-------|-------------|
-| `Volatile` | Changes frequently (user input, live feeds) |
-| `Transient` | Changes occasionally (configuration, session data) |
-| `Stable` | Changes rarely (external dependencies) |
-| `Static` | Fixed for this session (bundled assets, constants) |
-
-```rust
-// Durability is specified at resolve_asset time
-runtime.resolve_asset(ConfigFile(path), content, DurabilityLevel::Volatile);
-runtime.resolve_asset(BundledAsset(name), data, DurabilityLevel::Static);
 ```
 
 ## QueryRuntime API

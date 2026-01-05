@@ -1,8 +1,9 @@
 //! Query runtime and context.
 
 use std::any::{Any, TypeId};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use whale::{Durability, GetOrInsertResult, RevisionCounter, Runtime as WhaleRuntime};
@@ -34,6 +35,43 @@ const DURABILITY_LEVELS: usize = 4;
 // Thread-local query execution stack for cycle detection.
 thread_local! {
     static QUERY_STACK: RefCell<Vec<FullCacheKey>> = const { RefCell::new(Vec::new()) };
+
+    /// Current consistency tracker for leaf asset checks.
+    /// Set during query execution, used by all nested locator calls.
+    /// Uses Rc since thread-local is single-threaded.
+    static CONSISTENCY_TRACKER: RefCell<Option<Rc<ConsistencyTracker>>> = const { RefCell::new(None) };
+}
+
+/// Check a leaf asset against the current consistency tracker (if any).
+/// Returns Ok if no tracker is set or if the check passes.
+fn check_leaf_asset_consistency(dep_changed_at: RevisionCounter) -> Result<(), QueryError> {
+    CONSISTENCY_TRACKER.with(|tracker| {
+        if let Some(ref t) = *tracker.borrow() {
+            t.check_leaf_asset(dep_changed_at)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// RAII guard that sets the consistency tracker for the current thread.
+struct ConsistencyTrackerGuard {
+    previous: Option<Rc<ConsistencyTracker>>,
+}
+
+impl ConsistencyTrackerGuard {
+    fn new(tracker: Rc<ConsistencyTracker>) -> Self {
+        let previous = CONSISTENCY_TRACKER.with(|t| t.borrow_mut().replace(tracker));
+        Self { previous }
+    }
+}
+
+impl Drop for ConsistencyTrackerGuard {
+    fn drop(&mut self) {
+        CONSISTENCY_TRACKER.with(|t| {
+            *t.borrow_mut() = self.previous.take();
+        });
+    }
 }
 
 /// Check for cycles in the query stack and return error if detected.
@@ -339,12 +377,15 @@ impl<T: Tracer> QueryRuntime<T> {
                 if let Some(deps) = self.whale.get_dependency_ids(&full_key) {
                     for dep in deps {
                         if let Some(verifier) = self.verifiers.get(&dep) {
-                            // Re-query dep to verify it (triggers recursive verification)
+                            // Re-run query/asset to verify it (triggers recursive verification)
+                            // For assets, this re-accesses the asset which may re-run the locator
                             if verifier.verify(self as &dyn std::any::Any).is_err() {
                                 deps_verified = false;
                                 break;
                             }
                         }
+                        // Note: deps without verifiers are assumed valid (they're verified
+                        // by the final is_valid check if their changed_at increased)
                     }
                 }
 
@@ -409,6 +450,15 @@ impl<T: Tracer> QueryRuntime<T> {
         ),
         QueryError,
     > {
+        // Capture current global revision at query start for consistency checking
+        let start_revision = self.whale.current_revision().get(Durability::volatile());
+
+        // Create consistency tracker for this query execution
+        let tracker = Rc::new(ConsistencyTracker::new(start_revision));
+
+        // Set thread-local tracker for nested locator calls
+        let _tracker_guard = ConsistencyTrackerGuard::new(tracker);
+
         // Create context for this query execution
         let ctx = QueryContext {
             runtime: self,
@@ -416,7 +466,6 @@ impl<T: Tracer> QueryRuntime<T> {
             parent_query_type: std::any::type_name::<Q>(),
             exec_ctx,
             deps: RefCell::new(Vec::new()),
-            first_access_revision: Cell::new(None),
         };
 
         // Execute the query (clone because query() takes ownership)
@@ -1177,48 +1226,84 @@ impl<T: Tracer> QueryRuntime<T> {
         // Check whale cache first (single atomic read)
         if let Some(node) = self.whale.get(&full_cache_key) {
             let changed_at = node.changed_at;
-            // Check if valid at current revision
+            // Check if valid at current revision (shallow check)
             if self.whale.is_valid(&full_cache_key) {
-                match &node.data {
-                    Some(CachedEntry::AssetReady(arc)) => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::Ready);
-                        match arc.clone().downcast::<K::Asset>() {
-                            Ok(value) => {
-                                return Ok((AssetLoadingState::ready(key, value), changed_at))
-                            }
-                            Err(_) => {
-                                return Err(QueryError::MissingDependency {
-                                    description: format!("Asset type mismatch: {:?}", key),
-                                })
+                // Verify dependencies recursively (like query path does)
+                let mut deps_verified = true;
+                if let Some(deps) = self.whale.get_dependency_ids(&full_cache_key) {
+                    for dep in deps {
+                        if let Some(verifier) = self.verifiers.get(&dep) {
+                            // Re-run query/asset to verify it (triggers recursive verification)
+                            if verifier.verify(self as &dyn std::any::Any).is_err() {
+                                deps_verified = false;
+                                break;
                             }
                         }
                     }
-                    Some(CachedEntry::AssetError(err)) => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
-                        return Err(QueryError::UserError(err.clone()));
-                    }
-                    None => {
-                        // Loading state
-                        emit_requested(&self.tracer, &key, TracerAssetState::Loading);
-                        return Ok((AssetLoadingState::loading(key), changed_at));
-                    }
-                    _ => {
-                        // Query-related entries (Ok, UserError) shouldn't be here
-                        // Fall through to locator
+                }
+
+                // Re-check validity after deps are verified
+                if deps_verified && self.whale.is_valid(&full_cache_key) {
+                    // For cached entries, check consistency for leaf assets (no locator deps).
+                    // This detects if resolve_asset/resolve_asset_error was called during query execution.
+                    let has_locator_deps = self
+                        .whale
+                        .get_dependency_ids(&full_cache_key)
+                        .is_some_and(|deps| !deps.is_empty());
+
+                    match &node.data {
+                        Some(CachedEntry::AssetReady(arc)) => {
+                            // Check consistency for cached leaf assets
+                            if !has_locator_deps {
+                                check_leaf_asset_consistency(changed_at)?;
+                            }
+                            emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+                            match arc.clone().downcast::<K::Asset>() {
+                                Ok(value) => {
+                                    return Ok((AssetLoadingState::ready(key, value), changed_at))
+                                }
+                                Err(_) => {
+                                    return Err(QueryError::MissingDependency {
+                                        description: format!("Asset type mismatch: {:?}", key),
+                                    })
+                                }
+                            }
+                        }
+                        Some(CachedEntry::AssetError(err)) => {
+                            // Check consistency for cached leaf errors
+                            if !has_locator_deps {
+                                check_leaf_asset_consistency(changed_at)?;
+                            }
+                            emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
+                            return Err(QueryError::UserError(err.clone()));
+                        }
+                        None => {
+                            // Loading state - no value to be inconsistent with
+                            emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                            return Ok((AssetLoadingState::loading(key), changed_at));
+                        }
+                        _ => {
+                            // Query-related entries (Ok, UserError) shouldn't be here
+                            // Fall through to locator
+                        }
                     }
                 }
             }
         }
 
         // Not in cache or invalid - try locator
+        // Use LocatorContext to track deps on the asset itself
         check_cycle(&full_cache_key)?;
         let _guard = StackGuard::push(full_cache_key.clone());
 
-        let locator_result = self
-            .locators
-            .locate_with_runtime(TypeId::of::<K>(), self, &key);
+        let locator_ctx = LocatorContext::new(self, full_cache_key.clone());
+        let locator_result =
+            self.locators
+                .locate_with_locator_ctx(TypeId::of::<K>(), &locator_ctx, &key);
 
         if let Some(result) = locator_result {
+            // Get collected dependencies from the locator context
+            let locator_deps = locator_ctx.into_deps();
             match result {
                 Ok(ErasedLocateResult::Ready {
                     value: arc,
@@ -1236,6 +1321,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     };
 
                     // Store in whale atomically with early cutoff
+                    // Include locator's dependencies so the asset is invalidated when they change
                     let entry = CachedEntry::AssetReady(typed_value.clone());
                     let durability = Durability::new(durability_level.as_u8() as usize)
                         .unwrap_or(Durability::volatile());
@@ -1243,7 +1329,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     let result = self
                         .whale
                         .update_with_compare(
-                            full_cache_key,
+                            full_cache_key.clone(),
                             Some(entry),
                             |old_data, _new_data| {
                                 let Some(CachedEntry::AssetReady(old_arc)) =
@@ -1257,9 +1343,13 @@ impl<T: Tracer> QueryRuntime<T> {
                                 !K::asset_eq(&old_value, &new_value)
                             },
                             durability,
-                            vec![],
+                            locator_deps,
                         )
-                        .expect("update_with_compare with no dependencies cannot fail");
+                        .expect("update_with_compare should succeed");
+
+                    // Register verifier for this asset (for verify-then-decide pattern)
+                    self.verifiers
+                        .insert_asset::<K, T>(full_cache_key, key.clone());
 
                     return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                 }
@@ -1270,8 +1360,8 @@ impl<T: Tracer> QueryRuntime<T> {
                     self.pending.insert::<K>(full_asset_key, key.clone());
                     match self
                         .whale
-                        .get_or_insert(full_cache_key, None, Durability::volatile(), vec![])
-                        .expect("get_or_insert with no dependencies cannot fail")
+                        .get_or_insert(full_cache_key, None, Durability::volatile(), locator_deps)
+                        .expect("get_or_insert should succeed")
                     {
                         GetOrInsertResult::Inserted(node) => {
                             return Ok((AssetLoadingState::loading(key), node.changed_at));
@@ -1310,7 +1400,7 @@ impl<T: Tracer> QueryRuntime<T> {
                         full_cache_key,
                         Some(entry),
                         Durability::volatile(),
-                        vec![],
+                        locator_deps,
                     );
                     return Err(QueryError::UserError(err));
                 }
@@ -1322,6 +1412,7 @@ impl<T: Tracer> QueryRuntime<T> {
         }
 
         // No locator registered or locator returned None - mark as pending
+        // (no locator was called, so no deps to track)
         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
         self.pending
             .insert::<K>(full_asset_key.clone(), key.clone());
@@ -1352,12 +1443,12 @@ impl<T: Tracer> QueryRuntime<T> {
 
     /// Internal: Get asset state and its changed_at revision atomically (with QueryContext).
     ///
-    /// This version is called from QueryContext::asset and enables dependency tracking
-    /// within the locator's db.query() and db.asset() calls.
+    /// This version is called from QueryContext::asset. Consistency checking for
+    /// cached leaf assets is done inside this function before returning.
     fn get_asset_with_revision_ctx<K: AssetKey>(
         &self,
         key: K,
-        ctx: &QueryContext<'_, T>,
+        _ctx: &QueryContext<'_, T>,
     ) -> Result<(AssetLoadingState<K>, RevisionCounter), QueryError> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
@@ -1373,46 +1464,85 @@ impl<T: Tracer> QueryRuntime<T> {
         // Check whale cache first (single atomic read)
         if let Some(node) = self.whale.get(&full_cache_key) {
             let changed_at = node.changed_at;
-            // Check if valid at current revision
+            // Check if valid at current revision (shallow check)
             if self.whale.is_valid(&full_cache_key) {
-                match &node.data {
-                    Some(CachedEntry::AssetReady(arc)) => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::Ready);
-                        match arc.clone().downcast::<K::Asset>() {
-                            Ok(value) => {
-                                return Ok((AssetLoadingState::ready(key, value), changed_at))
-                            }
-                            Err(_) => {
-                                return Err(QueryError::MissingDependency {
-                                    description: format!("Asset type mismatch: {:?}", key),
-                                })
+                // Verify dependencies recursively (like query path does)
+                let mut deps_verified = true;
+                if let Some(deps) = self.whale.get_dependency_ids(&full_cache_key) {
+                    for dep in deps {
+                        if let Some(verifier) = self.verifiers.get(&dep) {
+                            // Re-run query/asset to verify it (triggers recursive verification)
+                            if verifier.verify(self as &dyn std::any::Any).is_err() {
+                                deps_verified = false;
+                                break;
                             }
                         }
                     }
-                    Some(CachedEntry::AssetError(err)) => {
-                        emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
-                        return Err(QueryError::UserError(err.clone()));
-                    }
-                    None => {
-                        // Loading state
-                        emit_requested(&self.tracer, &key, TracerAssetState::Loading);
-                        return Ok((AssetLoadingState::loading(key), changed_at));
-                    }
-                    _ => {
-                        // Query-related entries (Ok, UserError) shouldn't be here
-                        // Fall through to locator
+                }
+
+                // Re-check validity after deps are verified
+                if deps_verified && self.whale.is_valid(&full_cache_key) {
+                    // For cached entries, check consistency for leaf assets (no locator deps).
+                    // This detects if resolve_asset/resolve_asset_error was called during query execution.
+                    let has_locator_deps = self
+                        .whale
+                        .get_dependency_ids(&full_cache_key)
+                        .is_some_and(|deps| !deps.is_empty());
+
+                    match &node.data {
+                        Some(CachedEntry::AssetReady(arc)) => {
+                            // Check consistency for cached leaf assets
+                            if !has_locator_deps {
+                                check_leaf_asset_consistency(changed_at)?;
+                            }
+                            emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+                            match arc.clone().downcast::<K::Asset>() {
+                                Ok(value) => {
+                                    return Ok((AssetLoadingState::ready(key, value), changed_at))
+                                }
+                                Err(_) => {
+                                    return Err(QueryError::MissingDependency {
+                                        description: format!("Asset type mismatch: {:?}", key),
+                                    })
+                                }
+                            }
+                        }
+                        Some(CachedEntry::AssetError(err)) => {
+                            // Check consistency for cached leaf errors
+                            if !has_locator_deps {
+                                check_leaf_asset_consistency(changed_at)?;
+                            }
+                            emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
+                            return Err(QueryError::UserError(err.clone()));
+                        }
+                        None => {
+                            // Loading state - no value to be inconsistent with
+                            emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                            return Ok((AssetLoadingState::loading(key), changed_at));
+                        }
+                        _ => {
+                            // Query-related entries (Ok, UserError) shouldn't be here
+                            // Fall through to locator
+                        }
                     }
                 }
             }
         }
 
-        // Not in cache or invalid - try locator (with context for dependency tracking)
+        // Not in cache or invalid - try locator
+        // Use LocatorContext to track deps on the asset itself (not the calling query)
+        // Consistency tracking is handled via thread-local storage
         check_cycle(&full_cache_key)?;
         let _guard = StackGuard::push(full_cache_key.clone());
 
-        let locator_result = self.locators.locate_with_ctx(TypeId::of::<K>(), ctx, &key);
+        let locator_ctx = LocatorContext::new(self, full_cache_key.clone());
+        let locator_result =
+            self.locators
+                .locate_with_locator_ctx(TypeId::of::<K>(), &locator_ctx, &key);
 
         if let Some(result) = locator_result {
+            // Get collected dependencies from the locator context
+            let locator_deps = locator_ctx.into_deps();
             match result {
                 Ok(ErasedLocateResult::Ready {
                     value: arc,
@@ -1430,6 +1560,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     };
 
                     // Store in whale atomically with early cutoff
+                    // Include locator's dependencies so the asset is invalidated when they change
                     let entry = CachedEntry::AssetReady(typed_value.clone());
                     let durability = Durability::new(durability_level.as_u8() as usize)
                         .unwrap_or(Durability::volatile());
@@ -1437,7 +1568,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     let result = self
                         .whale
                         .update_with_compare(
-                            full_cache_key,
+                            full_cache_key.clone(),
                             Some(entry),
                             |old_data, _new_data| {
                                 let Some(CachedEntry::AssetReady(old_arc)) =
@@ -1451,9 +1582,13 @@ impl<T: Tracer> QueryRuntime<T> {
                                 !K::asset_eq(&old_value, &new_value)
                             },
                             durability,
-                            vec![],
+                            locator_deps,
                         )
-                        .expect("update_with_compare with no dependencies cannot fail");
+                        .expect("update_with_compare should succeed");
+
+                    // Register verifier for this asset (for verify-then-decide pattern)
+                    self.verifiers
+                        .insert_asset::<K, T>(full_cache_key, key.clone());
 
                     return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                 }
@@ -1464,8 +1599,8 @@ impl<T: Tracer> QueryRuntime<T> {
                     self.pending.insert::<K>(full_asset_key, key.clone());
                     match self
                         .whale
-                        .get_or_insert(full_cache_key, None, Durability::volatile(), vec![])
-                        .expect("get_or_insert with no dependencies cannot fail")
+                        .get_or_insert(full_cache_key, None, Durability::volatile(), locator_deps)
+                        .expect("get_or_insert should succeed")
                     {
                         GetOrInsertResult::Inserted(node) => {
                             return Ok((AssetLoadingState::loading(key), node.changed_at));
@@ -1479,7 +1614,7 @@ impl<T: Tracer> QueryRuntime<T> {
                                             return Ok((
                                                 AssetLoadingState::ready(key, value),
                                                 changed_at,
-                                            ))
+                                            ));
                                         }
                                         Err(_) => {
                                             return Ok((
@@ -1504,7 +1639,7 @@ impl<T: Tracer> QueryRuntime<T> {
                         full_cache_key,
                         Some(entry),
                         Durability::volatile(),
-                        vec![],
+                        locator_deps,
                     );
                     return Err(QueryError::UserError(err));
                 }
@@ -1568,6 +1703,42 @@ impl<T: Tracer> Db for QueryRuntime<T> {
     }
 }
 
+/// Tracks consistency of leaf asset accesses during query execution.
+///
+/// A "leaf" asset is one without dependencies (externally resolved via `resolve_asset`).
+/// This tracker ensures that all leaf assets accessed during a query execution
+/// (including those accessed by locators) are consistent - i.e., none were modified
+/// via `resolve_asset` mid-execution.
+///
+/// The tracker is shared across `QueryContext` and `LocatorContext` to propagate
+/// consistency checking through the entire execution tree.
+#[derive(Debug)]
+pub(crate) struct ConsistencyTracker {
+    /// Global revision at query start. All leaf assets must have changed_at <= this.
+    start_revision: RevisionCounter,
+}
+
+impl ConsistencyTracker {
+    /// Create a new tracker with the given start revision.
+    pub fn new(start_revision: RevisionCounter) -> Self {
+        Self { start_revision }
+    }
+
+    /// Check consistency for a leaf asset access.
+    ///
+    /// A leaf asset is consistent if its changed_at <= start_revision.
+    /// This detects if resolve_asset was called during query execution.
+    ///
+    /// Returns Ok(()) if consistent, Err if inconsistent.
+    pub fn check_leaf_asset(&self, dep_changed_at: RevisionCounter) -> Result<(), QueryError> {
+        if dep_changed_at > self.start_revision {
+            Err(QueryError::InconsistentAssetResolution)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Context provided to queries during execution.
 ///
 /// Use this to access dependencies via `query()`.
@@ -1577,43 +1748,9 @@ pub struct QueryContext<'a, T: Tracer = NoopTracer> {
     parent_query_type: &'static str,
     exec_ctx: ExecutionContext,
     deps: RefCell<Vec<FullCacheKey>>,
-    /// Revision at first asset access, used for consistency checking.
-    /// Assets with changed_at > this value were modified during query execution.
-    first_access_revision: Cell<Option<RevisionCounter>>,
 }
 
 impl<'a, T: Tracer> QueryContext<'a, T> {
-    /// Ensure consistency of asset access.
-    ///
-    /// On first asset access: records max(current_global, dep_changed_at) as baseline.
-    /// On subsequent asset accesses: checks dep_changed_at <= baseline.
-    ///
-    /// IMPORTANT: current_global must be obtained BEFORE accessing the asset.
-    #[inline]
-    fn ensure_consistent(
-        &self,
-        current_global: RevisionCounter,
-        dep_changed_at: RevisionCounter,
-    ) -> Result<(), QueryError> {
-        match self.first_access_revision.get() {
-            None => {
-                // First asset access: record max(current_global, dep_changed_at)
-                // Using max ensures we don't get false positives when only one asset is accessed
-                let first = current_global.max(dep_changed_at);
-                self.first_access_revision.set(Some(first));
-                Ok(())
-            }
-            Some(first) => {
-                // Subsequent asset accesses: check consistency
-                if dep_changed_at > first {
-                    Err(QueryError::InconsistentAssetResolution)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
     /// Query a dependency.
     ///
     /// The dependency is automatically tracked for invalidation.
@@ -1671,42 +1808,21 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
-        // 1. Get current_global FIRST (before accessing the asset)
-        let current_global = self
-            .runtime
-            .whale
-            .current_revision()
-            .get(Durability::volatile());
-
-        // 2. Emit asset dependency registered event
+        // 1. Emit asset dependency registered event
         self.runtime.tracer.on_asset_dependency_registered(
             self.exec_ctx.span_id(),
             TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
             TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
         );
 
-        // 3. Record dependency on this asset
+        // 2. Record dependency on this asset
         self.deps.borrow_mut().push(full_cache_key);
 
-        // 4. Get asset AND changed_at from the same whale access (atomic)
-        // Use the context-aware version to enable dependency tracking in locators
-        let (result, dep_changed_at) = match self.runtime.get_asset_with_revision_ctx(key, self) {
-            Ok((state, rev)) => (Ok(state), rev),
-            Err(e) => return Err(e),
-        };
+        // 3. Get asset from cache/locator
+        // Consistency checking for cached leaf assets is done inside get_asset_with_revision_ctx
+        let (state, _changed_at) = self.runtime.get_asset_with_revision_ctx(key, self)?;
 
-        // 5. Check consistency - detects if resolve_asset was called during query execution
-        self.ensure_consistent(current_global, dep_changed_at)?;
-
-        // Emit missing dependency event on error
-        if let Err(QueryError::MissingDependency { ref description }) = result {
-            self.runtime.tracer.on_missing_dependency(
-                TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
-                description.clone(),
-            );
-        }
-
-        result
+        Ok(state)
     }
 
     /// List all query instances of type Q that have been registered.
@@ -1819,6 +1935,68 @@ impl<'a, T: Tracer> Db for QueryContext<'a, T> {
 
     fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
         QueryContext::list_asset_keys(self)
+    }
+}
+
+/// Context for collecting dependencies during asset locator execution.
+///
+/// Unlike `QueryContext`, this is specifically for locators and does not
+/// register dependencies on any parent query. Dependencies collected here
+/// are stored with the asset itself.
+pub(crate) struct LocatorContext<'a, T: Tracer> {
+    runtime: &'a QueryRuntime<T>,
+    deps: RefCell<Vec<FullCacheKey>>,
+}
+
+impl<'a, T: Tracer> LocatorContext<'a, T> {
+    /// Create a new locator context for the given asset key.
+    ///
+    /// Consistency tracking is handled via thread-local storage, so leaf asset
+    /// accesses will be checked against any active tracker from a parent query.
+    pub(crate) fn new(runtime: &'a QueryRuntime<T>, _asset_key: FullCacheKey) -> Self {
+        Self {
+            runtime,
+            deps: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Consume this context and return the collected dependencies.
+    pub(crate) fn into_deps(self) -> Vec<FullCacheKey> {
+        self.deps.into_inner()
+    }
+}
+
+impl<T: Tracer> Db for LocatorContext<'_, T> {
+    fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+        let key = query.cache_key();
+        let full_key = FullCacheKey::new::<Q, _>(&key);
+
+        // Record this as a dependency of the asset being located
+        self.deps.borrow_mut().push(full_key);
+
+        // Execute the query via the runtime
+        self.runtime.query(query)
+    }
+
+    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        let full_asset_key = FullAssetKey::new(&key);
+        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+
+        // Record this as a dependency of the asset being located
+        self.deps.borrow_mut().push(full_cache_key);
+
+        // Access the asset - consistency checking is done inside get_asset_with_revision
+        let (state, _changed_at) = self.runtime.get_asset_with_revision(key)?;
+
+        Ok(state)
+    }
+
+    fn list_queries<Q: Query>(&self) -> Vec<Q> {
+        self.runtime.list_queries()
+    }
+
+    fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
+        self.runtime.list_asset_keys()
     }
 }
 

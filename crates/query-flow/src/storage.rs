@@ -74,90 +74,55 @@ pub(crate) enum ErasedLocateResult {
 /// This wraps an `AssetLocator<K>` implementation and provides type-erased
 /// access via monomorphized function pointers captured at registration time.
 ///
-/// Two function pointers are stored:
-/// - `locate_with_ctx_fn`: For calls from within a query (with dependency tracking)
+/// Three function pointers are stored:
+/// - `locate_with_ctx_fn`: For calls from within a query (with dependency tracking on query)
 /// - `locate_with_runtime_fn`: For direct calls from QueryRuntime (no tracking)
+/// - `locate_with_locator_ctx_fn`: For locator-specific dependency tracking (deps on asset)
 pub(crate) struct ErasedLocator<T: crate::Tracer> {
     /// The actual locator, type-erased.
     inner: Box<dyn Any + Send + Sync>,
-    /// Locate function for calls with QueryContext (dependency tracking enabled).
-    locate_with_ctx_fn: DynAssetLocatorWithQueryContext<T>,
-    /// Locate function for direct QueryRuntime calls (no dependency tracking).
-    locate_with_runtime_fn: DynAssetLocatorWithRuntime<T>,
+    /// Locate function for LocatorContext calls (deps tracked on asset, not query).
+    locate_with_locator_ctx_fn: DynAssetLocatorWithLocatorContext<T>,
 }
 
-type DynAssetLocatorWithQueryContext<T> =
+type DynAssetLocatorWithLocatorContext<T> =
     fn(
         &dyn Any,
-        &crate::QueryContext<'_, T>,
+        &crate::runtime::LocatorContext<'_, T>,
         &dyn Any,
     ) -> Option<Result<ErasedLocateResult, crate::QueryError>>;
-
-type DynAssetLocatorWithRuntime<T> = fn(
-    &dyn Any,
-    &crate::QueryRuntime<T>,
-    &dyn Any,
-) -> Option<Result<ErasedLocateResult, crate::QueryError>>;
 
 impl<T: crate::Tracer> ErasedLocator<T> {
     /// Create a new erased locator from a concrete implementation.
     pub fn new<K: AssetKey, L: AssetLocator<K>>(locator: L) -> Self {
         Self {
             inner: Box::new(locator),
-            locate_with_ctx_fn: erased_locate_with_ctx::<K, L, T>,
-            locate_with_runtime_fn: erased_locate_with_runtime::<K, L, T>,
+            locate_with_locator_ctx_fn: erased_locate_with_locator_ctx::<K, L, T>,
         }
     }
 
-    /// Attempt to locate an asset using QueryContext (with dependency tracking).
+    /// Attempt to locate an asset using LocatorContext (deps tracked on asset, not query).
     ///
     /// Returns `None` if the key type doesn't match.
-    pub fn locate_with_ctx(
+    pub fn locate_with_locator_ctx(
         &self,
-        ctx: &crate::QueryContext<'_, T>,
+        locator_ctx: &crate::runtime::LocatorContext<'_, T>,
         key: &dyn Any,
     ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
-        (self.locate_with_ctx_fn)(&*self.inner, ctx, key)
-    }
-
-    /// Attempt to locate an asset using QueryRuntime directly (no dependency tracking).
-    ///
-    /// Returns `None` if the key type doesn't match.
-    pub fn locate_with_runtime(
-        &self,
-        runtime: &crate::QueryRuntime<T>,
-        key: &dyn Any,
-    ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
-        (self.locate_with_runtime_fn)(&*self.inner, runtime, key)
+        (self.locate_with_locator_ctx_fn)(&*self.inner, locator_ctx, key)
     }
 }
 
-/// Monomorphized locate function for QueryContext calls.
-fn erased_locate_with_ctx<K: AssetKey, L: AssetLocator<K>, T: crate::Tracer>(
+/// Monomorphized locate function for LocatorContext calls.
+/// Dependencies are tracked on the asset itself, not the calling query.
+fn erased_locate_with_locator_ctx<K: AssetKey, L: AssetLocator<K>, T: crate::Tracer>(
     locator: &dyn Any,
-    ctx: &crate::QueryContext<'_, T>,
+    locator_ctx: &crate::runtime::LocatorContext<'_, T>,
     key: &dyn Any,
 ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
     let locator = locator.downcast_ref::<L>()?;
     let key = key.downcast_ref::<K>()?;
-    Some(locator.locate(ctx, key).map(|result| match result {
-        crate::asset::LocateResult::Ready { value, durability } => ErasedLocateResult::Ready {
-            value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
-            durability,
-        },
-        crate::asset::LocateResult::Pending => ErasedLocateResult::Pending,
-    }))
-}
-
-/// Monomorphized locate function for QueryRuntime calls.
-fn erased_locate_with_runtime<K: AssetKey, L: AssetLocator<K>, T: crate::Tracer>(
-    locator: &dyn Any,
-    runtime: &crate::QueryRuntime<T>,
-    key: &dyn Any,
-) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
-    let locator = locator.downcast_ref::<L>()?;
-    let key = key.downcast_ref::<K>()?;
-    Some(locator.locate(runtime, key).map(|result| match result {
+    Some(locator.locate(locator_ctx, key).map(|result| match result {
         crate::asset::LocateResult::Ready { value, durability } => ErasedLocateResult::Ready {
             value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
             durability,
@@ -192,38 +157,21 @@ impl<T: crate::Tracer> LocatorStorage<T> {
         pinned.insert(TypeId::of::<K>(), ErasedLocator::new::<K, L>(locator));
     }
 
-    /// Attempt to locate an asset using the registered locator (with QueryContext).
+    /// Attempt to locate an asset using the registered locator (with LocatorContext).
     ///
-    /// This variant is used when called from within a query, enabling dependency tracking.
+    /// This variant tracks dependencies on the asset itself, not the calling query.
     /// Returns `None` if no locator is registered for the key type or if the key
     /// type doesn't match.
-    pub fn locate_with_ctx(
+    pub fn locate_with_locator_ctx(
         &self,
         key_type: TypeId,
-        ctx: &crate::QueryContext<'_, T>,
+        locator_ctx: &crate::runtime::LocatorContext<'_, T>,
         key: &dyn Any,
     ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
         let pinned = self.locators.pin();
         pinned
             .get(&key_type)
-            .and_then(|locator| locator.locate_with_ctx(ctx, key))
-    }
-
-    /// Attempt to locate an asset using the registered locator (with QueryRuntime).
-    ///
-    /// This variant is used for direct QueryRuntime::asset calls without dependency tracking.
-    /// Returns `None` if no locator is registered for the key type or if the key
-    /// type doesn't match.
-    pub fn locate_with_runtime(
-        &self,
-        key_type: TypeId,
-        runtime: &crate::QueryRuntime<T>,
-        key: &dyn Any,
-    ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
-        let pinned = self.locators.pin();
-        pinned
-            .get(&key_type)
-            .and_then(|locator| locator.locate_with_runtime(runtime, key))
+            .and_then(|locator| locator.locate_with_locator_ctx(locator_ctx, key))
     }
 }
 
@@ -521,6 +469,44 @@ impl<Q: Query, T: crate::Tracer + 'static> AnyVerifier for QueryVerifier<Q, T> {
     }
 }
 
+/// Concrete verifier for a specific asset type.
+///
+/// Re-accesses the asset to trigger locator re-execution if the asset's
+/// dependencies have changed. Uses early cutoff: if the asset value is
+/// unchanged, changed_at stays the same and dependent queries won't re-run.
+pub(crate) struct AssetVerifier<K: AssetKey, T: crate::Tracer> {
+    key: K,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<K: AssetKey, T: crate::Tracer> AssetVerifier<K, T> {
+    pub fn new(key: K) -> Self {
+        Self {
+            key,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<K: AssetKey, T: crate::Tracer + 'static> AnyVerifier for AssetVerifier<K, T> {
+    fn verify(&self, runtime: &dyn std::any::Any) -> Result<(), crate::QueryError> {
+        // Downcast to the correct runtime type
+        if let Some(runtime) = runtime.downcast_ref::<crate::QueryRuntime<T>>() {
+            // Re-access the asset, which triggers locator if asset's deps are invalid
+            match runtime.get_asset(self.key.clone()) {
+                Ok(_) => Ok(()),
+                // UserError is a valid cached result, verification succeeded
+                Err(crate::QueryError::UserError(_)) => Ok(()),
+                // System errors mean verification failed
+                Err(e) => Err(e),
+            }
+        } else {
+            // This should never happen if used correctly
+            Ok(())
+        }
+    }
+}
+
 /// Thread-safe storage for query verifiers.
 ///
 /// Verifiers can re-execute queries to verify they haven't changed.
@@ -549,6 +535,16 @@ impl VerifierStorage {
     pub fn insert<Q: Query, T: crate::Tracer + 'static>(&self, key: FullCacheKey, query: Q) {
         let pinned = self.verifiers.pin();
         pinned.insert(key, Arc::new(QueryVerifier::<Q, T>::new(query)));
+    }
+
+    /// Register a verifier for an asset.
+    pub fn insert_asset<K: AssetKey, T: crate::Tracer + 'static>(
+        &self,
+        key: FullCacheKey,
+        asset_key: K,
+    ) {
+        let pinned = self.verifiers.pin();
+        pinned.insert(key, Arc::new(AssetVerifier::<K, T>::new(asset_key)));
     }
 
     /// Get a verifier for a query key.

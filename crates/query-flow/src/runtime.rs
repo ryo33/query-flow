@@ -209,6 +209,12 @@ pub struct QueryRuntime<T: Tracer = NoopTracer> {
     tracer: Arc<T>,
 }
 
+#[test]
+fn test_runtime_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<QueryRuntime<NoopTracer>>();
+}
+
 impl Default for QueryRuntime<NoopTracer> {
     fn default() -> Self {
         Self::new()

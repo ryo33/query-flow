@@ -25,6 +25,12 @@ pub struct Runtime<K, T, const N: usize> {
     revision: Arc<AtomicRevision<N>>,
 }
 
+#[test]
+fn test_runtime_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Runtime<&str, (), 3>>();
+}
+
 impl<K, T, const N: usize> Default for Runtime<K, T, N> {
     fn default() -> Self {
         Self::new()

@@ -7,18 +7,28 @@ use crate::QueryError;
 
 /// Loading state with asset key information for error reporting.
 ///
-/// This is returned by `ctx.asset()` and provides information about
-/// whether an asset is loading or ready, along with the key for
-/// error reporting on suspend.
+/// This is returned by [`Db::asset_state()`](crate::Db::asset_state) and provides
+/// information about whether an asset is loading or ready.
+///
+/// For most use cases, prefer [`Db::asset()`](crate::Db::asset) which automatically
+/// suspends on loading. Use `asset_state()` when you need to explicitly check
+/// the loading state without triggering suspension.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[query]
-/// fn process_file(ctx: &mut QueryContext, path: FilePath) -> Result<Output, QueryError> {
-///     let content = ctx.asset(path)?.suspend()?;
-///     // Process content...
-///     Ok(output)
+/// fn process_file(db: &impl Db, path: FilePath) -> Result<Output, QueryError> {
+///     // Most common: just use db.asset() which suspends automatically
+///     let content = db.asset(path)?;
+///     Ok(process(&content))
+/// }
+///
+/// #[query]
+/// fn check_loading(db: &impl Db, path: FilePath) -> Result<bool, QueryError> {
+///     // Use asset_state() when you need to check loading status explicitly
+///     let state = db.asset_state(path)?;
+///     Ok(state.is_loading())
 /// }
 /// ```
 pub struct AssetLoadingState<K: AssetKey> {
@@ -62,16 +72,21 @@ impl<K: AssetKey> AssetLoadingState<K> {
 
     /// Convert to Result - Loading becomes Err(QueryError::Suspend).
     ///
-    /// Use this with the `?` operator to propagate loading state upward.
-    /// The returned error includes the asset key for debugging.
+    /// This method is used internally by [`Db::asset()`](crate::Db::asset).
+    /// You can also use it when working with [`Db::asset_state()`](crate::Db::asset_state).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// fn query(&self, ctx: &mut QueryContext) -> Result<MyOutput, QueryError> {
-    ///     let data = ctx.asset(key)?.suspend()?;
-    ///     // `data` is guaranteed to be ready here
-    ///     Ok(process(data))
+    /// fn query(&self, db: &impl Db) -> Result<MyOutput, QueryError> {
+    ///     // Preferred: use db.asset() directly
+    ///     let data = db.asset(key)?;
+    ///
+    ///     // Alternative: use asset_state() + suspend()
+    ///     let state = db.asset_state(key)?;
+    ///     let data = state.suspend()?;
+    ///
+    ///     Ok(process(&data))
     /// }
     /// ```
     pub fn suspend(self) -> Result<Arc<K::Asset>, QueryError> {

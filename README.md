@@ -140,11 +140,8 @@ impl AssetKey for TextureId {
 ```rust
 #[query]
 fn process_config(db: &impl Db, path: PathBuf) -> Result<Config, QueryError> {
-    // Get asset - returns AssetLoadingState<ConfigFile>
+    // Get asset - suspends automatically if not ready
     let content = db.asset(ConfigFile(path.clone()))?;
-
-    // Suspend if not ready (propagates to caller)
-    let content = content.suspend()?;
 
     // Parse and return
     Ok(parse_config(&content))
@@ -217,16 +214,16 @@ runtime.remove_asset(&ConfigFile(path));
 
 ### Suspense Pattern
 
-The suspense pattern allows sync query code to handle async operations. `db.asset()` returns `AssetLoadingState<K>` which can be handled in two ways:
+The suspense pattern allows sync query code to handle async operations. `db.asset()` returns the asset value directly, suspending automatically if not ready.
 
-#### Pattern 1: Suspend until ready
+#### Pattern 1: Suspend until ready (default)
 
-Use `.suspend()` to propagate loading state upward as `Err(QueryError::Suspend)`.
+Use `db.asset()` to get an asset. It automatically returns `Err(QueryError::Suspend)` if loading.
 
 ```rust
 #[query]
 fn process_config(db: &impl Db, path: ConfigFile) -> Result<Config, QueryError> {
-    let content = db.asset(path)?.suspend()?;  // Returns Err(Suspend) if loading
+    let content = db.asset(path)?;  // Returns Err(Suspend) if loading
     Ok(parse_config(&content))
 }
 ```
@@ -249,15 +246,15 @@ runtime.resolve_asset_error(ConfigFile(path), io_error, DurabilityLevel::Volatil
 let result = runtime.query(ProcessConfig::new(path))?;
 ```
 
-#### Pattern 2: Handle loading state inline
+#### Pattern 2: Handle loading state explicitly
 
-Use `.into_inner()` or `.get()` to provide a fallback value during loading:
+Use `db.asset_state()` to get an `AssetLoadingState` for explicit loading state handling:
 
 ```rust
 #[query]
 fn eval_expr(db: &impl Db, name: String) -> Result<i64, QueryError> {
     // Return 0 while loading, use actual value when ready
-    let value = db.asset(Variable(name))?
+    let value = db.asset_state(Variable(name))?
         .into_inner()
         .map(|v| *v)
         .unwrap_or(0);

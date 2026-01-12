@@ -39,7 +39,7 @@ pub struct TestSource(pub String);
 
 #[query]
 fn process_source(db: &impl Db, name: String) -> Result<String, QueryError> {
-    let source = db.asset(TestSource(name.clone()))?.suspend()?;
+    let source = db.asset(TestSource(name.clone()))?;
     Ok(format!("processed: {}", source))
 }
 

@@ -47,7 +47,7 @@ fn test_resolve_asset_before_query() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -68,7 +68,7 @@ fn test_pending_asset_flow() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -113,7 +113,7 @@ fn test_immediate_locator() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -136,7 +136,7 @@ fn test_not_found_asset() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -156,7 +156,7 @@ fn test_invalidate_asset() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -242,7 +242,7 @@ fn test_asset_dependency_tracking() {
     #[query]
     fn process_config(db: &impl Db, key: CountedAsset) -> Result<String, QueryError> {
         key.increment();
-        let content = db.asset(key)?.suspend()?;
+        let content = db.asset(key)?;
         Ok(format!("processed: {}", content))
     }
 
@@ -279,7 +279,7 @@ fn test_asset_early_cutoff() {
     #[query]
     fn process_config(db: &impl Db, key: CountedAsset) -> Result<String, QueryError> {
         key.increment();
-        let content = db.asset(key)?.suspend()?;
+        let content = db.asset(key)?;
         Ok(format!("processed: {}", content))
     }
 
@@ -311,7 +311,7 @@ fn test_resolve_asset_with_static_durability() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -341,7 +341,7 @@ fn test_remove_asset() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -378,8 +378,8 @@ fn test_multiple_asset_types() {
         config_path: ConfigFile,
         binary_path: BinaryFile,
     ) -> Result<(String, usize), QueryError> {
-        let config = db.asset(config_path)?.suspend()?;
-        let binary = db.asset(binary_path)?.suspend()?;
+        let config = db.asset(config_path)?;
+        let binary = db.asset(binary_path)?;
         Ok(((*config).clone(), binary.len()))
     }
 
@@ -400,7 +400,7 @@ fn test_no_locator_pending() {
 
     #[query]
     fn read_config(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -510,7 +510,7 @@ fn test_enum_asset_key() {
 
     #[query]
     fn read_resource(db: &impl Db, path: ResourcePath) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -562,7 +562,7 @@ fn test_locator_calls_query_allowed() {
 
     #[query]
     fn read_controlled(db: &impl Db, path: ControlledFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -600,7 +600,7 @@ fn test_locator_calls_query_denied() {
 
     #[query]
     fn read_controlled(db: &impl Db, path: ControlledFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -678,7 +678,7 @@ fn test_cycle_locator_to_same_asset() {
 
     #[query]
     fn read_cyclic(db: &impl Db, key: CyclicAsset) -> Result<String, QueryError> {
-        let content = db.asset(key)?.suspend()?;
+        let content = db.asset(key)?;
         Ok((*content).clone())
     }
 
@@ -691,7 +691,7 @@ struct CyclicAsset2(String);
 
 #[query]
 fn query_with_cyclic_asset(db: &impl Db, key: CyclicAsset2) -> Result<String, QueryError> {
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -725,7 +725,7 @@ fn test_cycle_mutual_assets() {
     // A's locator accesses B, B's locator accesses A
     #[asset_locator]
     fn locator_a(db: &impl Db, key: &MutualCycleA) -> Result<LocateResult<String>, QueryError> {
-        let b = db.asset(MutualCycleB(key.0.clone()))?.suspend()?;
+        let b = db.asset(MutualCycleB(key.0.clone()))?;
         Ok(LocateResult::Ready {
             value: format!("A got B: {}", b),
             durability: DurabilityLevel::Volatile,
@@ -734,7 +734,7 @@ fn test_cycle_mutual_assets() {
 
     #[asset_locator]
     fn locator_b(db: &impl Db, key: &MutualCycleB) -> Result<LocateResult<String>, QueryError> {
-        let a = db.asset(MutualCycleA(key.0.clone()))?.suspend()?;
+        let a = db.asset(MutualCycleA(key.0.clone()))?;
         Ok(LocateResult::Ready {
             value: format!("B got A: {}", a),
             durability: DurabilityLevel::Volatile,
@@ -799,7 +799,7 @@ fn test_locator_query_dependency_invalidation() {
         db: &impl Db,
         key: ConfigDependentAsset,
     ) -> Result<String, QueryError> {
-        let content = db.asset(key)?.suspend()?;
+        let content = db.asset(key)?;
         Ok((*content).clone())
     }
 
@@ -961,7 +961,7 @@ fn test_query_receives_cached_asset_error() {
 
     #[query]
     fn read_asset(db: &impl Db, path: ConfigFile) -> Result<String, QueryError> {
-        let content = db.asset(path)?.suspend()?;
+        let content = db.asset(path)?;
         Ok((*content).clone())
     }
 
@@ -1056,7 +1056,7 @@ static QUERY_1_COUNT: AtomicU32 = AtomicU32::new(0);
 #[query]
 fn read_asset_1(db: &impl Db, key: LocatorDepAsset1) -> Result<String, QueryError> {
     QUERY_1_COUNT.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -1187,7 +1187,7 @@ static QUERY_3_COUNT: AtomicU32 = AtomicU32::new(0);
 #[query]
 fn read_asset_3(db: &impl Db, key: LocatorDepAsset3) -> Result<String, QueryError> {
     QUERY_3_COUNT.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -1257,7 +1257,7 @@ static QUERY_4_COUNT: AtomicU32 = AtomicU32::new(0);
 #[query]
 fn read_asset_4(db: &impl Db, key: LocatorDepAsset4) -> Result<String, QueryError> {
     QUERY_4_COUNT.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -1368,7 +1368,7 @@ fn read_multi_dep_asset(
     key: MultiDepAssetKey,
 ) -> Result<String, QueryError> {
     key.query_count.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -1469,7 +1469,7 @@ fn read_dup_dep_asset(
     key: DupDepAssetKey,
 ) -> Result<String, QueryError> {
     key.query_count.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -1540,7 +1540,7 @@ fn dep_asset_locator_a(
     key: &DepAssetAKey,
 ) -> Result<LocateResult<String>, QueryError> {
     key.locator_count.fetch_add(1, Ordering::SeqCst);
-    let b = db.asset(DepAssetBKey(key.path.clone()))?.suspend()?;
+    let b = db.asset(DepAssetBKey(key.path.clone()))?;
     Ok(LocateResult::Ready {
         value: format!("A:{}:{}", key.path, b),
         durability: DurabilityLevel::Volatile,
@@ -1550,7 +1550,7 @@ fn dep_asset_locator_a(
 #[query(keys(_path))]
 fn read_dep_asset_a(db: &impl Db, _path: String, key: DepAssetAKey) -> Result<String, QueryError> {
     key.query_count.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 
@@ -1706,7 +1706,7 @@ fn nested_outer_locator(
     key: &NestedOuterKey,
 ) -> Result<LocateResult<String>, QueryError> {
     key.locator_count.fetch_add(1, Ordering::SeqCst);
-    let inner = db.asset(key.inner.clone())?.suspend()?;
+    let inner = db.asset(key.inner.clone())?;
     Ok(LocateResult::Ready {
         value: format!("outer:{}:{}", key.path, inner),
         durability: DurabilityLevel::Volatile,
@@ -1720,7 +1720,7 @@ fn read_nested_outer(
     key: NestedOuterKey,
 ) -> Result<String, QueryError> {
     key.query_count.fetch_add(1, Ordering::SeqCst);
-    let content = db.asset(key)?.suspend()?;
+    let content = db.asset(key)?;
     Ok((*content).clone())
 }
 

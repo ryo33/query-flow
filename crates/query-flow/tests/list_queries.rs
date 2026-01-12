@@ -407,7 +407,7 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
             let mut results = Vec::new();
             for key in keys {
                 let key_name = key.0.clone();
-                if let Some(content) = db.asset(key)?.get() {
+                if let Some(content) = db.asset_state(key)?.get() {
                     results.push((key_name, (**content).clone()));
                 }
             }

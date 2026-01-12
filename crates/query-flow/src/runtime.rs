@@ -1696,7 +1696,11 @@ impl<T: Tracer> Db for QueryRuntime<T> {
         QueryRuntime::query(self, query)
     }
 
-    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+    fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError> {
+        self.get_asset_internal(key)?.suspend()
+    }
+
+    fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         self.get_asset_internal(key)
     }
 
@@ -1789,19 +1793,15 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
 
     /// Access an asset, tracking it as a dependency.
     ///
-    /// Returns `AssetLoadingState<K>`:
-    /// - `is_loading()` if the asset is still being loaded
-    /// - `is_ready()` if the asset is available
-    ///
-    /// Use `.suspend()?` to convert to `Result<Arc<K::Asset>, QueryError>`,
-    /// which returns `Err(QueryError::Suspend { asset })` if still loading.
+    /// Returns the asset value if ready, or `Err(QueryError::Suspend)` if still loading.
+    /// Use this with the `?` operator for automatic suspension on loading.
     ///
     /// # Example
     ///
     /// ```ignore
     /// #[query]
     /// fn process_file(db: &impl Db, path: FilePath) -> Result<Output, QueryError> {
-    ///     let content = db.asset(path)?.suspend()?;
+    ///     let content = db.asset(path)?;
     ///     // Process content...
     ///     Ok(output)
     /// }
@@ -1809,8 +1809,32 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Errors
     ///
+    /// - Returns `Err(QueryError::Suspend)` if the asset is still loading.
+    /// - Returns `Err(QueryError::MissingDependency)` if the asset was not found.
+    pub fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError> {
+        self.asset_state(key)?.suspend()
+    }
+
+    /// Access an asset's loading state, tracking it as a dependency.
+    ///
+    /// Unlike [`asset()`](Self::asset), this method returns the full loading state,
+    /// allowing you to check if an asset is loading without triggering suspension.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let state = db.asset_state(key)?;
+    /// if state.is_loading() {
+    ///     // Handle loading case explicitly
+    /// } else {
+    ///     let value = state.get().unwrap();
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
-    pub fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+    pub fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 
@@ -1895,7 +1919,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///     let keys = db.list_asset_keys::<ConfigFile>();
     ///     let mut contents = Vec::new();
     ///     for key in keys {
-    ///         let content = db.asset(&key)?.suspend()?;
+    ///         let content = db.asset(key)?;
     ///         contents.push((*content).clone());
     ///     }
     ///     Ok(contents)
@@ -1931,8 +1955,12 @@ impl<'a, T: Tracer> Db for QueryContext<'a, T> {
         QueryContext::query(self, query)
     }
 
-    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+    fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError> {
         QueryContext::asset(self, key)
+    }
+
+    fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        QueryContext::asset_state(self, key)
     }
 
     fn list_queries<Q: Query>(&self) -> Vec<Q> {
@@ -1984,7 +2012,11 @@ impl<T: Tracer> Db for LocatorContext<'_, T> {
         self.runtime.query(query)
     }
 
-    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+    fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError> {
+        self.asset_state(key)?.suspend()
+    }
+
+    fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
 

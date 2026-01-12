@@ -52,7 +52,7 @@ pub struct Variable(pub String);
 pub fn parse_expr(db: &impl Db, file_name: String) -> Result<Expr, QueryError> {
     // Get source from asset, default to empty string if not found
     let source = db
-        .asset(SourceFile(file_name.clone()))?
+        .asset_state(SourceFile(file_name.clone()))?
         .into_inner()
         .map(|s| (*s).clone())
         .unwrap_or_default();
@@ -177,7 +177,7 @@ fn eval_expr(db: &impl Db, expr: &Expr) -> Result<i64, QueryError> {
         Expr::Variable(name) => {
             // Get variable from asset, default to 0 if not found
             let value = db
-                .asset(Variable(name.clone()))?
+                .asset_state(Variable(name.clone()))?
                 .into_inner()
                 .map(|v| *v)
                 .unwrap_or(0);
@@ -501,7 +501,7 @@ mod tests {
             fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
                 let source = db
-                    .asset(SourceFile(self.file_name.clone()))?
+                    .asset_state(SourceFile(self.file_name.clone()))?
                     .into_inner()
                     .map(|s| (*s).clone())
                     .unwrap_or_default();

@@ -112,7 +112,7 @@ impl Query for SyntheticQuery {
                 }
                 Dependency::Asset(asset_id) => {
                     let asset_key = SyntheticAssetKey(*asset_id);
-                    let data = db.asset(asset_key)?.suspend()?;
+                    let data = db.asset(asset_key)?;
                     combined_data.extend_from_slice(&data);
                 }
             }

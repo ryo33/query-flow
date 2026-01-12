@@ -19,7 +19,36 @@ pub trait Db {
     fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError>;
 
     /// Access an asset by key.
-    fn asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError>;
+    ///
+    /// Returns the asset value if ready, or `Err(QueryError::Suspend)` if still loading.
+    /// Use this with the `?` operator for automatic suspension on loading.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn query(&self, db: &impl Db) -> Result<MyOutput, QueryError> {
+    ///     let data = db.asset(key)?;  // Suspends if loading
+    ///     Ok(process(&data))
+    /// }
+    /// ```
+    fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError>;
+
+    /// Access an asset's loading state by key.
+    ///
+    /// Unlike [`asset()`](Self::asset), this method returns the full loading state,
+    /// allowing you to check if an asset is loading without triggering suspension.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let state = db.asset_state(key)?;
+    /// if state.is_loading() {
+    ///     // Handle loading case explicitly
+    /// } else {
+    ///     let value = state.get().unwrap();
+    /// }
+    /// ```
+    fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError>;
 
     /// List all executed queries of a specific type.
     fn list_queries<Q: Query>(&self) -> Vec<Q>;

@@ -126,9 +126,7 @@ fn test_immediate_locator() {
 fn test_not_found_asset() {
     #[asset_locator]
     fn not_found(_db: &impl Db, key: &ConfigFile) -> Result<LocateResult<String>, QueryError> {
-        Err(QueryError::MissingDependency {
-            description: format!("Asset not found: {:?}", key),
-        })
+        Err(anyhow::anyhow!("Asset not found: {:?}", key).into())
     }
 
     let runtime = QueryRuntime::new();
@@ -141,7 +139,7 @@ fn test_not_found_asset() {
     }
 
     let result = runtime.query(ReadConfig::new(ConfigFile("missing.json".to_string())));
-    assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
+    assert!(matches!(result, Err(QueryError::UserError(_))));
 }
 
 #[test]
@@ -475,16 +473,14 @@ fn test_get_asset_immediate_locator() {
 fn test_get_asset_not_found() {
     #[asset_locator]
     fn not_found(_db: &impl Db, key: &ConfigFile) -> Result<LocateResult<String>, QueryError> {
-        Err(QueryError::MissingDependency {
-            description: format!("Asset not found: {:?}", key),
-        })
+        Err(anyhow::anyhow!("Asset not found: {:?}", key).into())
     }
 
     let runtime = QueryRuntime::new();
     runtime.register_asset_locator(NotFound);
 
     let result = runtime.get_asset(ConfigFile("missing.json".to_string()));
-    assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
+    assert!(matches!(result, Err(QueryError::UserError(_))));
 }
 
 // ============================================================================
@@ -551,9 +547,7 @@ fn test_locator_calls_query_allowed() {
         if config.allowed_paths.contains(&key.0) {
             Ok(LocateResult::Pending)
         } else {
-            Err(QueryError::MissingDependency {
-                description: format!("Path '{}' is not in allow list", key.0),
-            })
+            Err(anyhow::anyhow!("Path '{}' is not in allow list", key.0).into())
         }
     }
 
@@ -589,9 +583,7 @@ fn test_locator_calls_query_denied() {
         if config.allowed_paths.contains(&key.0) {
             Ok(LocateResult::Pending)
         } else {
-            Err(QueryError::MissingDependency {
-                description: format!("Path '{}' is not in allow list", key.0),
-            })
+            Err(anyhow::anyhow!("Path '{}' is not in allow list", key.0).into())
         }
     }
 
@@ -608,7 +600,7 @@ fn test_locator_calls_query_denied() {
     let result = runtime.query(ReadControlled::new(ControlledFile(
         "denied.json".to_string(),
     )));
-    assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
+    assert!(matches!(result, Err(QueryError::UserError(_))));
 
     // Should NOT be in pending list
     let pending = runtime.pending_assets_of::<ControlledFile>();
@@ -619,16 +611,14 @@ fn test_locator_calls_query_denied() {
 fn test_locator_error_not_added_to_pending() {
     #[asset_locator]
     fn not_found(_db: &impl Db, key: &ConfigFile) -> Result<LocateResult<String>, QueryError> {
-        Err(QueryError::MissingDependency {
-            description: format!("Asset not found: {:?}", key),
-        })
+        Err(anyhow::anyhow!("Asset not found: {:?}", key).into())
     }
 
     let runtime = QueryRuntime::new();
     runtime.register_asset_locator(NotFound);
 
     let result = runtime.get_asset(ConfigFile("missing.json".to_string()));
-    assert!(matches!(result, Err(QueryError::MissingDependency { .. })));
+    assert!(matches!(result, Err(QueryError::UserError(_))));
 
     // Verify NOT added to pending
     assert!(!runtime.has_pending_assets());
@@ -764,9 +754,9 @@ static MUTABLE_CONFIG: std::sync::Mutex<Option<MutableConfig>> = std::sync::Mute
 #[query]
 fn get_mutable_config(_db: &impl Db) -> Result<MutableConfig, QueryError> {
     let config = MUTABLE_CONFIG.lock().unwrap();
-    config.clone().ok_or_else(|| QueryError::MissingDependency {
-        description: "Config not set".to_string(),
-    })
+    config
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Config not set").into())
 }
 
 #[asset_key(asset = String)]

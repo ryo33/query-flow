@@ -174,14 +174,6 @@ impl Tracer for EventSinkTracer {
             path: path.into_iter().map(|k| k.into()).collect(),
         });
     }
-
-    #[inline]
-    fn on_missing_dependency(&self, query: TracerQueryKey, dependency_description: String) {
-        self.sink.emit(FlowEvent::MissingDependency {
-            query: query.into(),
-            dependency_description,
-        });
-    }
 }
 
 #[cfg(test)]

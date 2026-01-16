@@ -40,7 +40,7 @@
 //! - **Dependency Tracking**: `DependencyRegistered`, `AssetDependencyRegistered`
 //! - **Early Cutoff**: `EarlyCutoffCheck`
 //! - **Asset Events**: `AssetRequested`, `AssetResolved`, `AssetInvalidated`
-//! - **Error Events**: `CycleDetected`, `MissingDependency`
+//! - **Error Events**: `CycleDetected`
 //!
 //! See [`FlowEvent`] for the complete list.
 //!

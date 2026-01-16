@@ -270,7 +270,6 @@ Queries return `Result<Arc<Output>, QueryError>`. The error variants are:
 - `Suspend` - An asset is not yet available. See [Suspense Pattern](#suspense-pattern).
 - `Cycle` - A dependency cycle was detected in the query graph.
 - `Cancelled` - Query explicitly returned cancellation (not cached, unlike `UserError`).
-- `MissingDependency` - An asset locator indicated the asset is not found or not allowed.
 - `DependenciesRemoved` - Dependencies were removed by another thread during execution.
 - `InconsistentAssetResolution` - An asset was resolved during query execution, possibly causing inconsistent state.
 

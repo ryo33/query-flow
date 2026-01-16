@@ -120,9 +120,7 @@ pub enum LocateResult<A> {
 ///         // Access config to check if path is allowed
 ///         let config = db.query(GetConfig)?.clone();
 ///         if !config.allowed_paths.contains(&key.0) {
-///             return Err(QueryError::MissingDependency {
-///                 description: format!("Path not allowed: {:?}", key.0),
-///             });
+///             return Err(anyhow::anyhow!("Path not allowed: {:?}", key.0).into());
 ///         }
 ///
 ///         // Return pending for async loading

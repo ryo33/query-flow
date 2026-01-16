@@ -222,12 +222,6 @@ pub enum FlowEvent {
     // === Error Events ===
     /// Dependency cycle was detected.
     CycleDetected { path: Vec<QueryKey> },
-
-    /// Missing dependency error occurred.
-    MissingDependency {
-        query: QueryKey,
-        dependency_description: String,
-    },
 }
 
 /// A complete trace of events for a query execution tree.
@@ -279,10 +273,6 @@ pub enum EventKind {
     },
     CycleDetected {
         path: Vec<QueryKey>,
-    },
-    MissingDependency {
-        query: QueryKey,
-        dependency_description: String,
     },
 }
 
@@ -336,13 +326,6 @@ impl From<&FlowEvent> for EventKind {
                 reason: reason.clone(),
             },
             FlowEvent::CycleDetected { path } => EventKind::CycleDetected { path: path.clone() },
-            FlowEvent::MissingDependency {
-                query,
-                dependency_description,
-            } => EventKind::MissingDependency {
-                query: query.clone(),
-                dependency_description: dependency_description.clone(),
-            },
         }
     }
 }
@@ -408,8 +391,7 @@ fn matches_query(event: &FlowEvent, query: &QueryKey) -> bool {
         | FlowEvent::CacheCheck { query: q, .. }
         | FlowEvent::QueryEnd { query: q, .. }
         | FlowEvent::EarlyCutoffCheck { query: q, .. }
-        | FlowEvent::QueryInvalidated { query: q, .. }
-        | FlowEvent::MissingDependency { query: q, .. } => q == query,
+        | FlowEvent::QueryInvalidated { query: q, .. } => q == query,
         FlowEvent::DependencyRegistered {
             parent, dependency, ..
         } => parent == query || dependency == query,

@@ -196,10 +196,6 @@ pub trait Tracer: Send + Sync + 'static {
     #[inline]
     fn on_cycle_detected(&self, _path: Vec<TracerQueryKey>) {}
 
-    /// Called when a missing dependency error occurs.
-    #[inline]
-    fn on_missing_dependency(&self, _query: TracerQueryKey, _dependency_description: String) {}
-
     /// Called when a query is accessed, providing the [`FullCacheKey`] for GC tracking.
     ///
     /// This is called at the start of each query execution, before `on_query_start`.

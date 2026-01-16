@@ -606,7 +606,7 @@ impl<T: Tracer> QueryRuntime<T> {
                 Ok((Err(err), output_changed, revision))
             }
             Err(e) => {
-                // System errors (Suspend, Cycle, Cancelled, MissingDependency) are not cached
+                // System errors (Suspend, Cycle, Cancelled) are not cached
                 Err(e)
             }
         }
@@ -1202,7 +1202,7 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// - `Ok(AssetLoadingState::ready(...))` - Asset is loaded and ready
     /// - `Ok(AssetLoadingState::loading(...))` - Asset is still loading (added to pending)
-    /// - `Err(QueryError::MissingDependency)` - Asset was not found
+    /// - `Err(QueryError::UserError)` - Asset was not found or locator returned an error
     pub fn get_asset<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         self.get_asset_internal(key)
     }
@@ -1269,9 +1269,7 @@ impl<T: Tracer> QueryRuntime<T> {
                                     return Ok((AssetLoadingState::ready(key, value), changed_at))
                                 }
                                 Err(_) => {
-                                    return Err(QueryError::MissingDependency {
-                                        description: format!("Asset type mismatch: {:?}", key),
-                                    })
+                                    unreachable!("Asset type mismatch: {:?}", key)
                                 }
                             }
                         }
@@ -1320,9 +1318,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                         Ok(v) => v,
                         Err(_) => {
-                            return Err(QueryError::MissingDependency {
-                                description: format!("Asset type mismatch: {:?}", key),
-                            });
+                            unreachable!("Asset type mismatch: {:?}", key);
                         }
                     };
 
@@ -1507,9 +1503,7 @@ impl<T: Tracer> QueryRuntime<T> {
                                     return Ok((AssetLoadingState::ready(key, value), changed_at))
                                 }
                                 Err(_) => {
-                                    return Err(QueryError::MissingDependency {
-                                        description: format!("Asset type mismatch: {:?}", key),
-                                    })
+                                    unreachable!("Asset type mismatch: {:?}", key)
                                 }
                             }
                         }
@@ -1559,9 +1553,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                         Ok(v) => v,
                         Err(_) => {
-                            return Err(QueryError::MissingDependency {
-                                description: format!("Asset type mismatch: {:?}", key),
-                            });
+                            unreachable!("Asset type mismatch: {:?}", key);
                         }
                     };
 
@@ -1810,7 +1802,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     /// # Errors
     ///
     /// - Returns `Err(QueryError::Suspend)` if the asset is still loading.
-    /// - Returns `Err(QueryError::MissingDependency)` if the asset was not found.
+    /// - Returns `Err(QueryError::UserError)` if the asset was not found.
     pub fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError> {
         self.asset_state(key)?.suspend()
     }
@@ -1833,7 +1825,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Errors
     ///
-    /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
+    /// Returns `Err(QueryError::UserError)` if the asset was not found.
     pub fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
         let full_asset_key = FullAssetKey::new(&key);
         let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);

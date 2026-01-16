@@ -39,12 +39,6 @@ pub enum QueryError {
     /// Query execution was cancelled.
     Cancelled,
 
-    /// A required dependency is missing.
-    MissingDependency {
-        /// Description of the missing dependency.
-        description: String,
-    },
-
     /// Dependencies were removed during query execution.
     ///
     /// This can happen if another thread removes queries or assets
@@ -83,9 +77,6 @@ impl fmt::Display for QueryError {
                 write!(f, "dependency cycle detected: {}", path.join(" -> "))
             }
             QueryError::Cancelled => write!(f, "query cancelled"),
-            QueryError::MissingDependency { description } => {
-                write!(f, "missing dependency: {}", description)
-            }
             QueryError::DependenciesRemoved { missing_keys } => {
                 write!(
                     f,

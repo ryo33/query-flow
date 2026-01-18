@@ -78,7 +78,7 @@ impl EventSink for EventCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{ExecutionResult, QueryKey, SpanId};
+    use crate::events::{ExecutionResult, QueryKey, SpanId, TraceId};
     use std::time::Duration;
 
     #[test]
@@ -88,6 +88,8 @@ mod tests {
 
         collector.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
 
@@ -101,10 +103,14 @@ mod tests {
 
         collector.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
         collector.emit(FlowEvent::QueryEnd {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
             result: ExecutionResult::Changed,
             duration: Duration::from_millis(10),
@@ -120,6 +126,8 @@ mod tests {
 
         collector.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
 
@@ -134,6 +142,8 @@ mod tests {
 
         collector.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
 

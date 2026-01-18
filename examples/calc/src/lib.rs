@@ -48,7 +48,8 @@ pub struct Variable(pub String);
 // ============================================================================
 
 /// Parse source text into an expression.
-#[query]
+/// Uses custom debug format for cleaner trace output.
+#[query(debug = "Parse({file_name:?})")]
 pub fn parse_expr(db: &impl Db, file_name: String) -> Result<Expr, QueryError> {
     // Get source from asset, default to empty string if not found
     let source = db
@@ -60,7 +61,8 @@ pub fn parse_expr(db: &impl Db, file_name: String) -> Result<Expr, QueryError> {
 }
 
 /// Evaluate an expression from a file.
-#[query]
+/// Uses custom debug format for cleaner trace output.
+#[query(debug = "Eval({file_name:?})")]
 pub fn eval_file(db: &impl Db, file_name: String) -> Result<i64, QueryError> {
     let expr = db.query(ParseExpr::new(file_name.clone()))?;
     eval_expr(db, &expr)
@@ -254,45 +256,48 @@ mod tests {
                         changed: true
                     },
                     QueryStart {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")")
+                        query: q("calc::EvalFile", "Eval(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         valid: false
                     },
                     DependencyRegistered {
-                        parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
-                        dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
+                        dependency: q("calc::ParseExpr", "Parse(\"main\")"),
                     },
                     QueryStart {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")")
+                        query: q("calc::ParseExpr", "Parse(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         valid: false
                     },
                     AssetDependencyRegistered {
-                        parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        parent: q("calc::ParseExpr", "Parse(\"main\")"),
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                    },
+                    AssetLocated {
+                        asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         result: Changed
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         result: Changed
                     },
                 ]
@@ -339,63 +344,72 @@ mod tests {
                         changed: true
                     },
                     QueryStart {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")")
+                        query: q("calc::EvalFile", "Eval(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         valid: false
                     },
                     DependencyRegistered {
-                        parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
-                        dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
+                        dependency: q("calc::ParseExpr", "Parse(\"main\")"),
                     },
                     QueryStart {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")")
+                        query: q("calc::ParseExpr", "Parse(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         valid: false
                     },
                     AssetDependencyRegistered {
-                        parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        parent: q("calc::ParseExpr", "Parse(\"main\")"),
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
+                        asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                    },
+                    AssetLocated {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         result: Changed
                     },
                     // x variable lookup
                     AssetDependencyRegistered {
-                        parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
                         asset: a("calc::Variable", "Variable(\"x\")"),
                     },
                     AssetRequested {
+                        asset: a("calc::Variable", "Variable(\"x\")"),
+                    },
+                    AssetLocated {
                         asset: a("calc::Variable", "Variable(\"x\")"),
                         state: AssetState::Ready
                     },
                     // y variable lookup
                     AssetDependencyRegistered {
-                        parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
                         asset: a("calc::Variable", "Variable(\"y\")"),
                     },
                     AssetRequested {
                         asset: a("calc::Variable", "Variable(\"y\")"),
+                    },
+                    AssetLocated {
+                        asset: a("calc::Variable", "Variable(\"y\")"),
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         result: Changed
                     },
                 ]
@@ -432,45 +446,48 @@ mod tests {
                         changed: true
                     },
                     QueryStart {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")")
+                        query: q("calc::EvalFile", "Eval(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         valid: false
                     },
                     DependencyRegistered {
-                        parent: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
-                        dependency: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
+                        dependency: q("calc::ParseExpr", "Parse(\"main\")"),
                     },
                     QueryStart {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")")
+                        query: q("calc::ParseExpr", "Parse(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         valid: false
                     },
                     AssetDependencyRegistered {
-                        parent: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        parent: q("calc::ParseExpr", "Parse(\"main\")"),
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                    },
+                    AssetLocated {
+                        asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::ParseExpr", "calc::ParseExpr(\"main\")"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         result: Changed
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::EvalFile", "calc::EvalFile(\"main\")"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         result: Changed
                     },
                 ]
@@ -485,18 +502,13 @@ mod tests {
         static PARSE_COUNT: AtomicU32 = AtomicU32::new(0);
 
         // Custom parse query that tracks call count
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct TrackedParse {
             file_name: String,
         }
 
         impl Query for TrackedParse {
-            type CacheKey = String;
             type Output = Expr;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.file_name.clone()
-            }
 
             fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 PARSE_COUNT.fetch_add(1, Ordering::SeqCst);

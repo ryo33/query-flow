@@ -17,6 +17,7 @@ papaya.workspace = true
 anyhow.workspace = true
 query-flow-macros.workspace = true
 serde.workspace = true
+dyn-hash.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

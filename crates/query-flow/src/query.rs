@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use crate::db::Db;
-use crate::key::Key;
+use crate::key::CacheKey;
 use crate::QueryError;
 
 /// A query that can be executed and cached.
 ///
 /// Queries are the fundamental unit of computation in query-flow. Each query:
-/// - Has a cache key that uniquely identifies the computation
+/// - Is itself the cache key (implements `Hash + Eq`)
 /// - Produces an output value
 /// - Can depend on other queries via `db.query()`
 ///
@@ -30,54 +30,45 @@ use crate::QueryError;
 /// # Example
 ///
 /// ```ignore
-/// use query_flow::{Query, Db, QueryError, Key};
+/// use query_flow::{Query, Db, QueryError};
 ///
 /// // Simple infallible query
+/// #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 /// struct Add { a: i32, b: i32 }
 ///
 /// impl Query for Add {
-///     type CacheKey = (i32, i32);
 ///     type Output = i32;
-///
-///     fn cache_key(&self) -> Self::CacheKey {
-///         (self.a, self.b)
-///     }
 ///
 ///     fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
 ///         Ok(Arc::new(self.a + self.b))
 ///     }
+///
+///     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+///         old == new
+///     }
 /// }
 ///
 /// // Fallible query with user errors
+/// #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 /// struct ParseInt { input: String }
 ///
 /// impl Query for ParseInt {
-///     type CacheKey = String;
 ///     type Output = Result<i32, std::num::ParseIntError>;
-///
-///     fn cache_key(&self) -> Self::CacheKey {
-///         self.input.clone()
-///     }
 ///
 ///     fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
 ///         Ok(Arc::new(self.input.parse()))  // Ok(Arc(Ok(n))) or Ok(Arc(Err(parse_error)))
 ///     }
+///
+///     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+///         old == new
+///     }
 /// }
 /// ```
-pub trait Query: Clone + Send + Sync + 'static {
-    /// The cache key type for this query.
-    ///
-    /// Two queries with the same cache key are considered equivalent and
-    /// will share cached results.
-    type CacheKey: Key;
-
+pub trait Query: CacheKey + Clone + Send + Sync + 'static {
     /// The output type of this query.
     ///
     /// For fallible queries, use `Result<T, E>` here.
     type Output: Send + Sync + 'static;
-
-    /// Get the cache key for this query instance.
-    fn cache_key(&self) -> Self::CacheKey;
 
     /// Execute the query, returning the output wrapped in Arc or a system error.
     ///

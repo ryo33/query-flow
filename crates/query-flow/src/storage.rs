@@ -1,13 +1,13 @@
 //! Type-erased cache storage for query results and assets.
 
 use std::any::{Any, TypeId};
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use papaya::HashMap;
 
-use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey};
-use crate::key::FullCacheKey;
+use crate::asset::{AssetKey, AssetLocator, DurabilityLevel};
+use crate::key::{AssetCacheKey, FullCacheKey};
 use crate::query::Query;
 
 /// Cached query result (success or user error).
@@ -177,8 +177,8 @@ impl<T: crate::Tracer> LocatorStorage<T> {
 
 /// Thread-safe storage for pending asset requests.
 pub(crate) struct PendingStorage {
-    /// Map from FullAssetKey to type-erased key
-    pending: HashMap<FullAssetKey, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+    /// Map from AssetCacheKey to type-erased key
+    pending: HashMap<AssetCacheKey, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
 }
 
 impl Default for PendingStorage {
@@ -196,13 +196,13 @@ impl PendingStorage {
     }
 
     /// Add a pending asset request.
-    pub fn insert<K: AssetKey>(&self, full_key: FullAssetKey, key: K) {
+    pub fn insert<K: AssetKey>(&self, asset_key: AssetCacheKey, key: K) {
         let pinned = self.pending.pin();
-        pinned.insert(full_key, Arc::new(key) as Arc<dyn Any + Send + Sync>);
+        pinned.insert(asset_key, Arc::new(key) as Arc<dyn Any + Send + Sync>);
     }
 
     /// Remove a pending asset request.
-    pub fn remove(&self, key: &FullAssetKey) -> bool {
+    pub fn remove(&self, key: &AssetCacheKey) -> bool {
         let pinned = self.pending.pin();
         pinned.remove(key).is_some()
     }
@@ -219,7 +219,7 @@ impl PendingStorage {
         let key_type = TypeId::of::<K>();
         pinned
             .iter()
-            .filter(|(k, _)| k.key_type() == key_type)
+            .filter(|(k, _)| k.asset_key_type() == key_type)
             .filter_map(|(_, v)| v.downcast_ref::<K>().cloned())
             .collect()
     }
@@ -230,7 +230,11 @@ impl PendingStorage {
         pinned
             .iter()
             .map(|(k, v)| {
-                crate::asset::PendingAsset::new_from_parts(k.key_type(), k.debug_repr(), v.clone())
+                crate::asset::PendingAsset::new_from_parts(
+                    k.asset_key_type(),
+                    &k.debug_repr(),
+                    v.clone(),
+                )
             })
             .collect()
     }
@@ -267,9 +271,9 @@ impl QueryRegistry {
     /// Register a query instance. Returns `true` if this was a new entry.
     pub fn register<Q: Query>(&self, query: &Q) -> bool {
         let type_id = TypeId::of::<Q>();
-        let key = query.cache_key();
+        // Hash the query itself since it's now the cache key
         let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
+        query.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
         let entries_pinned = self.entries.pin();
@@ -316,10 +320,10 @@ impl QueryRegistry {
     }
 
     /// Remove a query from the registry. Returns `true` if it was present.
-    pub fn remove<Q: Query>(&self, key: &Q::CacheKey) -> bool {
+    pub fn remove<Q: Query>(&self, query: &Q) -> bool {
         let type_id = TypeId::of::<Q>();
         let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
+        query.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
         let entries_pinned = self.entries.pin();
@@ -365,7 +369,7 @@ impl AssetKeyRegistry {
     pub fn register<K: AssetKey>(&self, key: &K) -> bool {
         let type_id = TypeId::of::<K>();
         let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
+        key.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
         let entries_pinned = self.entries.pin();
@@ -413,7 +417,7 @@ impl AssetKeyRegistry {
     pub fn remove<K: AssetKey>(&self, key: &K) -> bool {
         let type_id = TypeId::of::<K>();
         let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
+        key.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
         let entries_pinned = self.entries.pin();

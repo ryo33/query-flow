@@ -55,14 +55,17 @@ pub mod tracer;
 pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAsset};
 pub use db::Db;
 pub use error::{QueryError, QueryResultExt, TypedErr};
-pub use key::{FullCacheKey, Key};
+pub use key::{
+    AssetCacheKey, AssetKeySetSentinelKey, CacheKey, FullCacheKey, QueryCacheKey,
+    QuerySetSentinelKey,
+};
 pub use loading::AssetLoadingState;
 pub use query::Query;
 pub use query_flow_macros::{asset_key, asset_locator, query};
 pub use runtime::{ErrorComparator, Polled, QueryContext, QueryRuntime, QueryRuntimeBuilder};
 pub use tracer::{
-    ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetKey,
-    TracerAssetState, TracerQueryKey,
+    ExecutionResult, InvalidationReason, NoopTracer, SpanContext, SpanId, TraceId, Tracer,
+    TracerAssetState,
 };
 
 // Re-export RevisionCounter from whale for use with poll() and changed_at()

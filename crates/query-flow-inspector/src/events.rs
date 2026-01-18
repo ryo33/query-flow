@@ -6,13 +6,15 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-// Re-export SpanId from query-flow
-pub use query_flow::SpanId;
+// Re-export span types from query-flow
+// SpanContext is re-exported for downstream users even though it's not used directly here
+#[allow(unused_imports)]
+pub use query_flow::{SpanContext, SpanId, TraceId};
 
 // Import tracer types for From impls
 use query_flow::{
-    ExecutionResult as TracerExecutionResult, InvalidationReason as TracerInvalidationReason,
-    TracerAssetKey, TracerAssetState, TracerQueryKey,
+    AssetCacheKey, ExecutionResult as TracerExecutionResult, FullCacheKey,
+    InvalidationReason as TracerInvalidationReason, QueryCacheKey, TracerAssetState,
 };
 
 /// Represents a query key in a type-erased manner.
@@ -33,11 +35,20 @@ impl QueryKey {
     }
 }
 
-impl From<TracerQueryKey> for QueryKey {
-    fn from(key: TracerQueryKey) -> Self {
+impl From<&FullCacheKey> for QueryKey {
+    fn from(key: &FullCacheKey) -> Self {
         Self {
-            query_type: key.query_type.to_string(),
-            cache_key_debug: key.cache_key_debug,
+            query_type: key.type_name().to_string(),
+            cache_key_debug: key.debug_repr(),
+        }
+    }
+}
+
+impl From<&QueryCacheKey> for QueryKey {
+    fn from(key: &QueryCacheKey) -> Self {
+        Self {
+            query_type: key.type_name().to_string(),
+            cache_key_debug: key.debug_repr(),
         }
     }
 }
@@ -60,11 +71,47 @@ impl AssetKey {
     }
 }
 
-impl From<TracerAssetKey> for AssetKey {
-    fn from(key: TracerAssetKey) -> Self {
+impl From<&FullCacheKey> for AssetKey {
+    fn from(key: &FullCacheKey) -> Self {
         Self {
-            asset_type: key.asset_type.to_string(),
-            key_debug: key.key_debug,
+            asset_type: key.type_name().to_string(),
+            key_debug: key.debug_repr(),
+        }
+    }
+}
+
+impl From<&AssetCacheKey> for AssetKey {
+    fn from(key: &AssetCacheKey) -> Self {
+        Self {
+            asset_type: key.type_name().to_string(),
+            key_debug: key.debug_repr(),
+        }
+    }
+}
+
+/// Represents a key in a cycle path, which can be either a query or an asset.
+///
+/// Cycles can involve both queries and assets when asset locators call queries
+/// or other assets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CycleKey {
+    /// A query in the cycle path.
+    Query(QueryKey),
+    /// An asset in the cycle path.
+    Asset(AssetKey),
+}
+
+impl From<&FullCacheKey> for CycleKey {
+    fn from(key: &FullCacheKey) -> Self {
+        match key {
+            FullCacheKey::Query(q) => CycleKey::Query(q.into()),
+            FullCacheKey::Asset(a) => CycleKey::Asset(a.into()),
+            FullCacheKey::QuerySetSentinel(s) => {
+                CycleKey::Query(QueryKey::new(s.type_name(), "sentinel"))
+            }
+            FullCacheKey::AssetKeySetSentinel(s) => {
+                CycleKey::Asset(AssetKey::new(s.type_name(), "sentinel"))
+            }
         }
     }
 }
@@ -86,14 +133,14 @@ impl From<TracerInvalidationReason> for InvalidationReason {
     fn from(reason: TracerInvalidationReason) -> Self {
         match reason {
             TracerInvalidationReason::DependencyChanged { dep } => {
-                InvalidationReason::DependencyChanged { dep: dep.into() }
+                InvalidationReason::DependencyChanged { dep: (&dep).into() }
             }
             TracerInvalidationReason::AssetChanged { asset } => InvalidationReason::AssetChanged {
-                asset: asset.into(),
+                asset: (&asset).into(),
             },
             TracerInvalidationReason::ManualInvalidation => InvalidationReason::ManualInvalidation,
             TracerInvalidationReason::AssetRemoved { asset } => InvalidationReason::AssetRemoved {
-                asset: asset.into(),
+                asset: (&asset).into(),
             },
         }
     }
@@ -155,11 +202,18 @@ impl From<TracerAssetState> for AssetState {
 pub enum FlowEvent {
     // === Query Lifecycle ===
     /// Query execution started.
-    QueryStart { span_id: SpanId, query: QueryKey },
+    QueryStart {
+        span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        query: QueryKey,
+    },
 
     /// Cache validity check completed.
     CacheCheck {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         query: QueryKey,
         /// Whether the cached value was valid.
         valid: bool,
@@ -168,6 +222,8 @@ pub enum FlowEvent {
     /// Query execution completed.
     QueryEnd {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         query: QueryKey,
         result: ExecutionResult,
         /// Duration of the query execution.
@@ -178,6 +234,8 @@ pub enum FlowEvent {
     /// A query dependency was registered during execution.
     DependencyRegistered {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         parent: QueryKey,
         dependency: QueryKey,
     },
@@ -185,6 +243,8 @@ pub enum FlowEvent {
     /// An asset dependency was registered during execution.
     AssetDependencyRegistered {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         parent: QueryKey,
         asset: AssetKey,
     },
@@ -193,14 +253,30 @@ pub enum FlowEvent {
     /// Output comparison for early cutoff was performed.
     EarlyCutoffCheck {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         query: QueryKey,
         /// Whether the output changed compared to the cached value.
         output_changed: bool,
     },
 
     // === Asset Events ===
-    /// Asset was requested.
-    AssetRequested { asset: AssetKey, state: AssetState },
+    /// Asset was requested (START event, before locator runs).
+    AssetRequested {
+        span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        asset: AssetKey,
+    },
+
+    /// Asset locator finished execution (END event).
+    AssetLocated {
+        span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        asset: AssetKey,
+        state: AssetState,
+    },
 
     /// Asset was resolved with a value.
     AssetResolved {
@@ -219,9 +295,10 @@ pub enum FlowEvent {
         reason: InvalidationReason,
     },
 
-    // === Error Events ===
     /// Dependency cycle was detected.
-    CycleDetected { path: Vec<QueryKey> },
+    ///
+    /// The path can contain both queries and assets since cycles may involve asset locators.
+    CycleDetected { path: Vec<CycleKey> },
 }
 
 /// A complete trace of events for a query execution tree.
@@ -258,6 +335,9 @@ pub enum EventKind {
     },
     AssetRequested {
         asset: AssetKey,
+    },
+    AssetLocated {
+        asset: AssetKey,
         state: AssetState,
     },
     AssetResolved {
@@ -272,7 +352,7 @@ pub enum EventKind {
         reason: InvalidationReason,
     },
     CycleDetected {
-        path: Vec<QueryKey>,
+        path: Vec<CycleKey>,
     },
 }
 
@@ -310,7 +390,10 @@ impl From<&FlowEvent> for EventKind {
                 query: query.clone(),
                 output_changed: *output_changed,
             },
-            FlowEvent::AssetRequested { asset, state } => EventKind::AssetRequested {
+            FlowEvent::AssetRequested { asset, .. } => EventKind::AssetRequested {
+                asset: asset.clone(),
+            },
+            FlowEvent::AssetLocated { asset, state, .. } => EventKind::AssetLocated {
                 asset: asset.clone(),
                 state: state.clone(),
             },
@@ -355,7 +438,7 @@ impl ExecutionTrace {
     /// Get all query start events.
     pub fn query_starts(&self) -> impl Iterator<Item = (&SpanId, &QueryKey)> {
         self.events.iter().filter_map(|e| match e {
-            FlowEvent::QueryStart { span_id, query } => Some((span_id, query)),
+            FlowEvent::QueryStart { span_id, query, .. } => Some((span_id, query)),
             _ => None,
         })
     }
@@ -370,6 +453,7 @@ impl ExecutionTrace {
                 query,
                 result,
                 duration,
+                ..
             } => Some((span_id, query, result, duration)),
             _ => None,
         })
@@ -396,7 +480,10 @@ fn matches_query(event: &FlowEvent, query: &QueryKey) -> bool {
             parent, dependency, ..
         } => parent == query || dependency == query,
         FlowEvent::AssetDependencyRegistered { parent, .. } => parent == query,
-        FlowEvent::CycleDetected { path } => path.contains(query),
+        FlowEvent::CycleDetected { path } => path.iter().any(|k| match k {
+            CycleKey::Query(q) => q == query,
+            CycleKey::Asset(_) => false,
+        }),
         _ => false,
     }
 }
@@ -416,14 +503,19 @@ mod tests {
     fn test_execution_trace() {
         let mut trace = ExecutionTrace::new();
         let span_id = SpanId(1);
+        let trace_id = TraceId(1);
         let query = QueryKey::new("TestQuery", "(1)");
 
         trace.push(FlowEvent::QueryStart {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
         });
         trace.push(FlowEvent::QueryEnd {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
             result: ExecutionResult::Changed,
             duration: Duration::from_millis(10),
@@ -437,6 +529,8 @@ mod tests {
     fn test_serde_roundtrip() {
         let event = FlowEvent::QueryStart {
             span_id: SpanId(42),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("TestQuery", "(1)"),
         };
 

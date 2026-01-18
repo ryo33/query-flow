@@ -7,8 +7,9 @@ use syn::{
 };
 
 /// Wrapper for parsing a list of identifiers: `keys(a, b, c)`
+/// None = not specified (use default), Some(vec) = explicitly specified
 #[derive(Debug, Default)]
-struct Keys(Vec<Ident>);
+struct Keys(Option<Vec<Ident>>);
 
 impl FromMeta for Keys {
     fn from_list(items: &[NestedMeta]) -> darling::Result<Self> {
@@ -27,7 +28,7 @@ impl FromMeta for Keys {
                 }
             }
         }
-        Ok(Keys(idents))
+        Ok(Keys(Some(idents)))
     }
 }
 
@@ -66,6 +67,20 @@ impl FromMeta for OutputEq {
     }
 }
 
+/// Debug format option: `debug = "format string"`
+#[derive(Debug, Default)]
+pub enum DebugFormat {
+    #[default]
+    Derive,
+    Custom(String),
+}
+
+impl FromMeta for DebugFormat {
+    fn from_string(value: &str) -> darling::Result<Self> {
+        Ok(DebugFormat::Custom(value.to_string()))
+    }
+}
+
 /// Options for the `#[query]` attribute.
 #[derive(Debug, Default, FromMeta)]
 pub struct QueryAttr {
@@ -75,13 +90,23 @@ pub struct QueryAttr {
     #[darling(default)]
     output_eq: OutputEq,
 
-    /// Params that form the cache key. Default: all params except ctx.
+    /// Params that form the cache key. Default: all params.
     #[darling(default)]
     keys: Keys,
 
     /// Override the generated struct name. Default: PascalCase of function name.
     #[darling(default)]
     name: Option<String>,
+
+    /// Singleton query: no cache key, all instances share one cache entry.
+    /// Mutually exclusive with `keys`.
+    #[darling(default)]
+    singleton: bool,
+
+    /// Custom debug format string: `debug = "Fetch({id})"`.
+    /// Uses std::fmt syntax: `{field}` for Display, `{field:?}` for Debug.
+    #[darling(default)]
+    debug: DebugFormat,
 }
 
 /// A parsed function parameter.
@@ -98,6 +123,183 @@ struct ParsedFn {
     output_ty: Type,
 }
 
+/// A segment of a parsed debug format string.
+#[derive(Debug, PartialEq)]
+enum FormatSegment {
+    /// Literal text (e.g., "Fetch(" or ")")
+    Literal(String),
+    /// Field reference with optional format specifier
+    /// `{field}` -> Display, `{field:?}` -> Debug, `{field:#?}` -> Pretty Debug
+    Field { name: String, specifier: String },
+    /// Type name placeholder `{Self}` -> struct name
+    TypeName,
+}
+
+/// Parse a format string into segments.
+/// Handles `{field}`, `{field:?}`, `{field:#?}`, `{Self}`, `{{`, and `}}`.
+fn parse_format_string(format: &str) -> Result<Vec<FormatSegment>, String> {
+    let mut segments = Vec::new();
+    let mut chars = format.chars().peekable();
+    let mut current_literal = String::new();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                // Check for escaped brace
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    current_literal.push('{');
+                } else {
+                    // Flush current literal
+                    if !current_literal.is_empty() {
+                        segments.push(FormatSegment::Literal(current_literal.clone()));
+                        current_literal.clear();
+                    }
+                    // Parse field reference
+                    let mut field_content = String::new();
+                    let mut found_close = false;
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            found_close = true;
+                            break;
+                        }
+                        field_content.push(ch);
+                    }
+                    if !found_close {
+                        return Err("unclosed `{` in format string".to_string());
+                    }
+
+                    // Parse field name and specifier
+                    let (name, specifier) = if let Some(colon_pos) = field_content.find(':') {
+                        (
+                            field_content[..colon_pos].to_string(),
+                            field_content[colon_pos + 1..].to_string(),
+                        )
+                    } else {
+                        (field_content, String::new())
+                    };
+
+                    if name.is_empty() {
+                        return Err("empty field name in format string".to_string());
+                    }
+
+                    // Check for special {Self} placeholder
+                    if name == "Self" {
+                        if !specifier.is_empty() {
+                            return Err("{Self} does not support format specifiers".to_string());
+                        }
+                        segments.push(FormatSegment::TypeName);
+                    } else {
+                        segments.push(FormatSegment::Field { name, specifier });
+                    }
+                }
+            }
+            '}' => {
+                // Check for escaped brace
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    current_literal.push('}');
+                } else {
+                    return Err("unmatched `}` in format string".to_string());
+                }
+            }
+            _ => {
+                current_literal.push(c);
+            }
+        }
+    }
+
+    // Flush remaining literal
+    if !current_literal.is_empty() {
+        segments.push(FormatSegment::Literal(current_literal));
+    }
+
+    Ok(segments)
+}
+
+/// Validate that all field references in segments exist in params.
+fn validate_format_fields(segments: &[FormatSegment], params: &[Param]) -> Result<(), Error> {
+    for segment in segments {
+        if let FormatSegment::Field { name, .. } = segment {
+            if !params.iter().any(|p| p.name == name.as_str()) {
+                return Err(Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("unknown field `{}` in debug format string", name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Generate a custom Debug impl from the format string.
+fn generate_custom_debug(
+    struct_name: &Ident,
+    format: &str,
+    params: &[Param],
+) -> Result<TokenStream, Error> {
+    let segments =
+        parse_format_string(format).map_err(|e| Error::new(proc_macro2::Span::call_site(), e))?;
+
+    validate_format_fields(&segments, params)?;
+
+    // Build the write! format string and arguments
+    let mut fmt_string = String::new();
+    let mut fmt_args: Vec<TokenStream> = Vec::new();
+
+    for segment in &segments {
+        match segment {
+            FormatSegment::Literal(text) => {
+                // Escape any braces for the write! macro
+                for c in text.chars() {
+                    if c == '{' {
+                        fmt_string.push_str("{{");
+                    } else if c == '}' {
+                        fmt_string.push_str("}}");
+                    } else {
+                        fmt_string.push(c);
+                    }
+                }
+            }
+            FormatSegment::Field { name, specifier } => {
+                let field_ident = format_ident!("{}", name);
+                if specifier.is_empty() {
+                    // Display formatting
+                    fmt_string.push_str("{}");
+                    fmt_args.push(quote! { &self.#field_ident });
+                } else if specifier == "?" {
+                    // Debug formatting
+                    fmt_string.push_str("{:?}");
+                    fmt_args.push(quote! { &self.#field_ident });
+                } else if specifier == "#?" {
+                    // Pretty Debug formatting
+                    fmt_string.push_str("{:#?}");
+                    fmt_args.push(quote! { &self.#field_ident });
+                } else {
+                    // Pass through other specifiers
+                    fmt_string.push('{');
+                    fmt_string.push(':');
+                    fmt_string.push_str(specifier);
+                    fmt_string.push('}');
+                    fmt_args.push(quote! { &self.#field_ident });
+                }
+            }
+            FormatSegment::TypeName => {
+                // Embed struct name directly as literal
+                fmt_string.push_str(&struct_name.to_string());
+            }
+        }
+    }
+
+    Ok(quote! {
+        impl ::std::fmt::Debug for #struct_name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, #fmt_string #(, #fmt_args)*)
+            }
+        }
+    })
+}
+
 pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, Error> {
     // Parse the function
     let parsed = parse_function(&input_fn)?;
@@ -108,32 +310,55 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
         None => format_ident!("{}", parsed.name.to_string().to_upper_camel_case()),
     };
 
+    // Validate singleton and keys are mutually exclusive
+    if attr.singleton && attr.keys.0.is_some() {
+        return Err(Error::new(
+            input_fn.sig.span(),
+            "`singleton` and `keys` are mutually exclusive",
+        ));
+    }
+
     // Determine which params are keys
-    let key_params: Vec<&Param> = if attr.keys.0.is_empty() {
-        // Default: all params are keys
-        parsed.params.iter().collect()
+    let key_params: Vec<&Param> = if attr.singleton {
+        // Singleton: no keys, all instances share one cache entry
+        vec![]
     } else {
-        // Validate that specified keys exist
-        for key in &attr.keys.0 {
-            if !parsed.params.iter().any(|p| p.name == *key) {
+        match &attr.keys.0 {
+            None => {
+                // Default: all params are keys
+                parsed.params.iter().collect()
+            }
+            Some(keys) if keys.is_empty() => {
+                // Empty keys() is an error - use singleton instead
                 return Err(Error::new(
-                    key.span(),
-                    format!("unknown parameter `{}` in keys", key),
+                    input_fn.sig.span(),
+                    "empty `keys()` is not allowed; use `singleton` for queries with no cache key",
                 ));
             }
+            Some(keys) => {
+                // Validate that specified keys exist
+                for key in keys {
+                    if !parsed.params.iter().any(|p| p.name == *key) {
+                        return Err(Error::new(
+                            key.span(),
+                            format!("unknown parameter `{}` in keys", key),
+                        ));
+                    }
+                }
+                parsed
+                    .params
+                    .iter()
+                    .filter(|p| keys.contains(&p.name))
+                    .collect()
+            }
         }
-        parsed
-            .params
-            .iter()
-            .filter(|p| attr.keys.0.contains(&p.name))
-            .collect()
     };
 
-    // Generate struct definition
-    let struct_def = generate_struct(&parsed, &struct_name);
+    // Generate struct definition (with Hash/Eq based on key_params)
+    let struct_def = generate_struct(&parsed, &struct_name, &key_params, &attr.debug)?;
 
     // Generate Query impl
-    let query_impl = generate_query_impl(&parsed, &struct_name, &key_params, &attr)?;
+    let query_impl = generate_query_impl(&parsed, &struct_name, &attr)?;
 
     Ok(quote! {
         #input_fn
@@ -260,7 +485,12 @@ fn extract_arc_inner(ty: &Type) -> Option<Type> {
     None
 }
 
-fn generate_struct(parsed: &ParsedFn, struct_name: &Ident) -> TokenStream {
+fn generate_struct(
+    parsed: &ParsedFn,
+    struct_name: &Ident,
+    key_params: &[&Param],
+    debug: &DebugFormat,
+) -> Result<TokenStream, Error> {
     let vis = &parsed.vis;
     let fields: Vec<_> = parsed
         .params
@@ -301,20 +531,88 @@ fn generate_struct(parsed: &ParsedFn, struct_name: &Ident) -> TokenStream {
         }
     };
 
-    quote! {
-        #[derive(Clone, Debug)]
+    // Check if we need custom Hash/Eq implementations (when keys() specifies a subset of fields)
+    let all_fields_are_keys = key_params.len() == parsed.params.len()
+        && key_params
+            .iter()
+            .all(|kp| parsed.params.iter().any(|p| p.name == kp.name));
+
+    let hash_eq_impl = if all_fields_are_keys {
+        // All fields are keys, use derive
+        quote! {}
+    } else {
+        // Custom keys specified, generate custom Hash/Eq
+        let key_names: Vec<_> = key_params.iter().map(|p| &p.name).collect();
+
+        let hash_body = if key_params.is_empty() {
+            // No key fields means all instances are equal
+            quote! {}
+        } else {
+            quote! {
+                #( self.#key_names.hash(state); )*
+            }
+        };
+
+        let eq_body = if key_params.is_empty() {
+            quote! { true }
+        } else {
+            let comparisons: Vec<_> = key_params
+                .iter()
+                .map(|p| {
+                    let name = &p.name;
+                    quote! { self.#name == other.#name }
+                })
+                .collect();
+            quote! { #( #comparisons )&&* }
+        };
+
+        quote! {
+            impl ::std::hash::Hash for #struct_name {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    #hash_body
+                }
+            }
+
+            impl ::std::cmp::PartialEq for #struct_name {
+                fn eq(&self, other: &Self) -> bool {
+                    #eq_body
+                }
+            }
+
+            impl ::std::cmp::Eq for #struct_name {}
+        }
+    };
+
+    // Determine if we use derive(Debug) or custom Debug impl
+    let use_derive_debug = matches!(debug, DebugFormat::Derive);
+
+    let derives = match (all_fields_are_keys, use_derive_debug) {
+        (true, true) => quote! { #[derive(Clone, Debug, Hash, PartialEq, Eq)] },
+        (true, false) => quote! { #[derive(Clone, Hash, PartialEq, Eq)] },
+        (false, true) => quote! { #[derive(Clone, Debug)] },
+        (false, false) => quote! { #[derive(Clone)] },
+    };
+
+    let custom_debug_impl = match debug {
+        DebugFormat::Derive => quote! {},
+        DebugFormat::Custom(format) => generate_custom_debug(struct_name, format, &parsed.params)?,
+    };
+
+    Ok(quote! {
+        #derives
         #vis struct #struct_name {
             #( #fields ),*
         }
 
         #new_impl
-    }
+        #hash_eq_impl
+        #custom_debug_impl
+    })
 }
 
 fn generate_query_impl(
     parsed: &ParsedFn,
     struct_name: &Ident,
-    key_params: &[&Param],
     attr: &QueryAttr,
 ) -> Result<TokenStream, Error> {
     let output_ty = &parsed.output_ty;
@@ -339,34 +637,6 @@ fn generate_query_impl(
         )
     };
 
-    // Generate CacheKey type
-    let cache_key_ty = match key_params.len() {
-        0 => quote! { () },
-        1 => {
-            let ty = &key_params[0].ty;
-            quote! { #ty }
-        }
-        _ => {
-            let types: Vec<_> = key_params.iter().map(|p| &p.ty).collect();
-            quote! { ( #( #types ),* ) }
-        }
-    };
-
-    // Generate cache_key() body
-    // Note: For 0 params, we use an empty block which evaluates to ()
-    // to avoid clippy::unused_unit warning
-    let cache_key_body = match key_params.len() {
-        0 => quote! {},
-        1 => {
-            let name = &key_params[0].name;
-            quote! { self.#name.clone() }
-        }
-        _ => {
-            let names: Vec<_> = key_params.iter().map(|p| &p.name).collect();
-            quote! { ( #( self.#names.clone() ),* ) }
-        }
-    };
-
     let output_eq_impl = match &attr.output_eq {
         // Default: use PartialEq
         OutputEq::None | OutputEq::PartialEq => quote! {
@@ -384,12 +654,7 @@ fn generate_query_impl(
 
     Ok(quote! {
         impl ::query_flow::Query for #struct_name {
-            type CacheKey = #cache_key_ty;
             type Output = #actual_output_ty;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                #cache_key_body
-            }
 
             fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                 #query_body
@@ -436,7 +701,7 @@ mod tests {
                 Ok(x * 2)
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct MyQuery {
                 pub x: i32
             }
@@ -449,12 +714,7 @@ mod tests {
             }
 
             impl ::query_flow::Query for MyQuery {
-                type CacheKey = i32;
                 type Output = i32;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    self.x.clone()
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     my_query(db, self.x).map(::std::sync::Arc::new)
@@ -485,7 +745,7 @@ mod tests {
                 Ok(a + b)
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct Simple {
                 pub a: i32,
                 pub b: i32
@@ -499,12 +759,7 @@ mod tests {
             }
 
             impl ::query_flow::Query for Simple {
-                type CacheKey = (i32, i32);
                 type Output = i32;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    (self.a.clone(), self.b.clone())
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     simple(db, self.a, self.b).map(::std::sync::Arc::new)
@@ -535,7 +790,7 @@ mod tests {
                 Ok(42)
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct NoParams {
             }
 
@@ -553,12 +808,7 @@ mod tests {
             }
 
             impl ::query_flow::Query for NoParams {
-                type CacheKey = ();
                 type Output = i32;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    // Empty body - evaluates to () without explicit unit expression
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     no_params(db).map(::std::sync::Arc::new)
@@ -589,7 +839,7 @@ mod tests {
                 Ok(Arc::new(x.to_string()))
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct ReturnsArc {
                 pub x: i32
             }
@@ -602,15 +852,618 @@ mod tests {
             }
 
             impl ::query_flow::Query for ReturnsArc {
-                type CacheKey = i32;
                 type Output = String;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    self.x.clone()
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     returns_arc(db, self.x)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_subset() {
+        // Test keys(a) with multiple params - only 'a' should be used for Hash/Eq
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn with_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("a")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Derive,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq that only uses 'a'
+        let expected = quote! {
+            fn with_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug)]
+            struct WithKeys {
+                pub a: i32,
+                pub b: String,
+                pub c: bool
+            }
+
+            impl WithKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String, c: bool) -> Self {
+                    Self { a, b, c }
+                }
+            }
+
+            impl ::std::hash::Hash for WithKeys {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.a.hash(state);
+                }
+            }
+
+            impl ::std::cmp::PartialEq for WithKeys {
+                fn eq(&self, other: &Self) -> bool {
+                    self.a == other.a
+                }
+            }
+
+            impl ::std::cmp::Eq for WithKeys {}
+
+            impl ::query_flow::Query for WithKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    with_keys(db, self.a, self.b, self.c).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_multiple() {
+        // Test keys(a, c) with three params - only 'a' and 'c' should be used for Hash/Eq
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn multi_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("a"), format_ident!("c")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Derive,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq that uses both 'a' and 'c'
+        let expected = quote! {
+            fn multi_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug)]
+            struct MultiKeys {
+                pub a: i32,
+                pub b: String,
+                pub c: bool
+            }
+
+            impl MultiKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String, c: bool) -> Self {
+                    Self { a, b, c }
+                }
+            }
+
+            impl ::std::hash::Hash for MultiKeys {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.a.hash(state);
+                    self.c.hash(state);
+                }
+            }
+
+            impl ::std::cmp::PartialEq for MultiKeys {
+                fn eq(&self, other: &Self) -> bool {
+                    self.a == other.a && self.c == other.c
+                }
+            }
+
+            impl ::std::cmp::Eq for MultiKeys {}
+
+            impl ::query_flow::Query for MultiKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    multi_keys(db, self.a, self.b, self.c).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_all_explicit() {
+        // Test keys(a, b) when all params are specified - should use derive, not custom impl
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn all_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("a"), format_ident!("b")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Derive,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // When all params are keys, should use derive instead of custom impl
+        let expected = quote! {
+            fn all_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+            struct AllKeys {
+                pub a: i32,
+                pub b: String
+            }
+
+            impl AllKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String) -> Self {
+                    Self { a, b }
+                }
+            }
+
+            impl ::query_flow::Query for AllKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    all_keys(db, self.a, self.b).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_unknown_error() {
+        // Test that specifying an unknown key produces an error
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn bad_keys(db: &impl Db, a: i32) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("unknown")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Derive,
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown parameter `unknown` in keys"));
+    }
+
+    #[test]
+    fn test_query_macro_keys_empty_error() {
+        // Test empty keys() produces an error
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn empty_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Derive,
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty `keys()` is not allowed"));
+    }
+
+    #[test]
+    fn test_query_macro_singleton() {
+        // Test singleton attribute - no cache key, all instances share one entry
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn singleton_query(db: &impl Db, format: String) -> Result<String, QueryError> {
+                Ok(format!("result: {}", format))
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: true,
+            debug: DebugFormat::Derive,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq with no keys (all instances equal)
+        let expected = quote! {
+            fn singleton_query(db: &impl Db, format: String) -> Result<String, QueryError> {
+                Ok(format!("result: {}", format))
+            }
+
+            #[derive(Clone, Debug)]
+            struct SingletonQuery {
+                pub format: String
+            }
+
+            impl SingletonQuery {
+                #[doc = r" Create a new query instance."]
+                fn new(format: String) -> Self {
+                    Self { format }
+                }
+            }
+
+            impl ::std::hash::Hash for SingletonQuery {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                }
+            }
+
+            impl ::std::cmp::PartialEq for SingletonQuery {
+                fn eq(&self, other: &Self) -> bool {
+                    true
+                }
+            }
+
+            impl ::std::cmp::Eq for SingletonQuery {}
+
+            impl ::query_flow::Query for SingletonQuery {
+                type Output = String;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    singleton_query(db, self.format).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_singleton_keys_mutually_exclusive() {
+        // Test that singleton and keys cannot be used together
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn bad_query(db: &impl Db, a: i32) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("a")])),
+            name: None,
+            singleton: true,
+            debug: DebugFormat::Derive,
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("`singleton` and `keys` are mutually exclusive"));
+    }
+
+    #[test]
+    fn test_query_macro_custom_debug() {
+        // Test custom debug format string
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn fetch_user(db: &impl Db, id: u64, include_deleted: bool) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("Fetch({id})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Debug impl instead of derive
+        let expected = quote! {
+            fn fetch_user(db: &impl Db, id: u64, include_deleted: bool) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            struct FetchUser {
+                pub id: u64,
+                pub include_deleted: bool
+            }
+
+            impl FetchUser {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64, include_deleted: bool) -> Self {
+                    Self { id, include_deleted }
+                }
+            }
+
+            impl ::std::fmt::Debug for FetchUser {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "Fetch({})", &self.id)
+                }
+            }
+
+            impl ::query_flow::Query for FetchUser {
+                type Output = String;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    fetch_user(db, self.id, self.include_deleted).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_debug_unknown_field_error() {
+        // Test that referencing an unknown field in debug format produces an error
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn bad_debug(db: &impl Db, id: u64) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("Query({unknown_field})".to_string()),
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown field `unknown_field` in debug format string"));
+    }
+
+    #[test]
+    fn test_query_macro_debug_with_keys() {
+        // Test debug format combined with keys() subset
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn query_with_both(db: &impl Db, id: u64, opts: String) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("id")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("Query({id:?})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq (for keys) AND custom Debug (for debug format)
+        let expected = quote! {
+            fn query_with_both(db: &impl Db, id: u64, opts: String) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+
+            #[derive(Clone)]
+            struct QueryWithBoth {
+                pub id: u64,
+                pub opts: String
+            }
+
+            impl QueryWithBoth {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64, opts: String) -> Self {
+                    Self { id, opts }
+                }
+            }
+
+            impl ::std::hash::Hash for QueryWithBoth {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.id.hash(state);
+                }
+            }
+
+            impl ::std::cmp::PartialEq for QueryWithBoth {
+                fn eq(&self, other: &Self) -> bool {
+                    self.id == other.id
+                }
+            }
+
+            impl ::std::cmp::Eq for QueryWithBoth {}
+
+            impl ::std::fmt::Debug for QueryWithBoth {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "Query({:?})", &self.id)
+                }
+            }
+
+            impl ::query_flow::Query for QueryWithBoth {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    query_with_both(db, self.id, self.opts).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_parse_format_string() {
+        // Test the format string parser directly
+        let result = parse_format_string("Fetch({id})").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::Literal("Fetch(".to_string()),
+                FormatSegment::Field {
+                    name: "id".to_string(),
+                    specifier: String::new()
+                },
+                FormatSegment::Literal(")".to_string()),
+            ]
+        );
+
+        // Test with Debug specifier
+        let result = parse_format_string("Query({name:?})").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::Literal("Query(".to_string()),
+                FormatSegment::Field {
+                    name: "name".to_string(),
+                    specifier: "?".to_string()
+                },
+                FormatSegment::Literal(")".to_string()),
+            ]
+        );
+
+        // Test with escaped braces
+        let result = parse_format_string("{{literal}} {field}").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::Literal("{literal} ".to_string()),
+                FormatSegment::Field {
+                    name: "field".to_string(),
+                    specifier: String::new()
+                },
+            ]
+        );
+
+        // Test with {Self} type name placeholder
+        let result = parse_format_string("{Self}({id})").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::TypeName,
+                FormatSegment::Literal("(".to_string()),
+                FormatSegment::Field {
+                    name: "id".to_string(),
+                    specifier: String::new()
+                },
+                FormatSegment::Literal(")".to_string()),
+            ]
+        );
+
+        // Test error cases
+        assert!(parse_format_string("unclosed {brace").is_err());
+        assert!(parse_format_string("unmatched }").is_err());
+        assert!(parse_format_string("empty {}").is_err());
+        assert!(parse_format_string("{Self:?}").is_err()); // Self doesn't support specifiers
+    }
+
+    #[test]
+    fn test_query_macro_debug_with_self() {
+        // Test debug format with {Self} placeholder
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn fetch_user(db: &impl Db, id: u64) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("{Self}({id})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate Debug impl with struct name embedded
+        let expected = quote! {
+            fn fetch_user(db: &impl Db, id: u64) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            struct FetchUser {
+                pub id: u64
+            }
+
+            impl FetchUser {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64) -> Self {
+                    Self { id }
+                }
+            }
+
+            impl ::std::fmt::Debug for FetchUser {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "FetchUser({})", &self.id)
+                }
+            }
+
+            impl ::query_flow::Query for FetchUser {
+                type Output = String;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    fetch_user(db, self.id).map(::std::sync::Arc::new)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

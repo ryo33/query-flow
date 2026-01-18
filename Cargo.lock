@@ -360,6 +360,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dyn-hash"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15401da73a9ed8c80e3b2d4dc05fe10e7b72d7243b9f614e516a44fa99986e88"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -668,6 +674,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "criterion 0.8.1",
+ "dyn-hash",
  "indexmap",
  "papaya",
  "query-flow-macros",

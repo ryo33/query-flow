@@ -480,7 +480,7 @@ impl FuzzRunner {
         let queries = self.select_queries(count);
 
         for query in &queries {
-            self.runtime.remove_query::<SyntheticQuery>(&query.node_id);
+            self.runtime.remove_query(query);
         }
 
         queries.len()
@@ -491,7 +491,7 @@ impl FuzzRunner {
         let queries = self.select_queries(count);
 
         for query in &queries {
-            self.runtime.invalidate::<SyntheticQuery>(&query.node_id);
+            self.runtime.invalidate(query);
         }
 
         queries.len()

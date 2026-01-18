@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use whale::{Durability, GetOrInsertResult, RevisionCounter, Runtime as WhaleRuntime};
 
-use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, FullAssetKey, PendingAsset};
+use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, PendingAsset};
 use crate::db::Db;
 use crate::key::FullCacheKey;
 use crate::loading::AssetLoadingState;
@@ -317,8 +317,7 @@ impl<T: Tracer> QueryRuntime<T> {
         &self,
         query: Q,
     ) -> Result<(Result<Arc<Q::Output>, Arc<anyhow::Error>>, RevisionCounter), QueryError> {
-        let key = query.cache_key();
-        let full_key = FullCacheKey::new::<Q, _>(&key);
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
 
         // Emit query key event for GC tracking (before other events)
         self.tracer.on_query_key(&full_key);
@@ -615,8 +614,8 @@ impl<T: Tracer> QueryRuntime<T> {
     /// Invalidate a query, forcing recomputation on next access.
     ///
     /// This also invalidates any queries that depend on this one.
-    pub fn invalidate<Q: Query>(&self, key: &Q::CacheKey) {
-        let full_key = FullCacheKey::new::<Q, _>(key);
+    pub fn invalidate<Q: Query>(&self, query: &Q) {
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
 
         self.tracer.on_query_invalidated(
             TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
@@ -638,8 +637,8 @@ impl<T: Tracer> QueryRuntime<T> {
     /// The query will be recomputed from scratch on next access.
     ///
     /// This also invalidates any queries that depend on this one.
-    pub fn remove_query<Q: Query>(&self, key: &Q::CacheKey) {
-        let full_key = FullCacheKey::new::<Q, _>(key);
+    pub fn remove_query<Q: Query>(&self, query: &Q) {
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
 
         self.tracer.on_query_invalidated(
             TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
@@ -653,7 +652,7 @@ impl<T: Tracer> QueryRuntime<T> {
         self.whale.remove(&full_key);
 
         // Remove from registry and update sentinel for list_queries
-        if self.query_registry.remove::<Q>(key) {
+        if self.query_registry.remove::<Q>(query) {
             let sentinel = FullCacheKey::query_set_sentinel::<Q>();
             let _ = self
                 .whale
@@ -724,15 +723,15 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// ```ignore
     /// // Check if query has changed before deciding to poll
-    /// if let Some(rev) = runtime.changed_at::<MyQuery>(&key) {
+    /// if let Some(rev) = runtime.changed_at(&MyQuery::new(key)) {
     ///     if rev > last_known_revision {
     ///         let result = runtime.query(MyQuery::new(key))?;
     ///         // Process result...
     ///     }
     /// }
     /// ```
-    pub fn changed_at<Q: Query>(&self, key: &Q::CacheKey) -> Option<RevisionCounter> {
-        let full_key = FullCacheKey::new::<Q, _>(key);
+    pub fn changed_at<Q: Query>(&self, query: &Q) -> Option<RevisionCounter> {
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
         self.whale.get(&full_key).map(|node| node.changed_at)
     }
 }
@@ -774,15 +773,15 @@ impl<T: Tracer> QueryRuntime<T> {
     /// # Example
     ///
     /// ```ignore
-    /// let key = FullCacheKey::new::<MyQuery, _>(&cache_key);
-    /// if runtime.remove_query_if_unused::<MyQuery>(&cache_key) {
+    /// let query = MyQuery::new(cache_key);
+    /// if runtime.remove_query_if_unused(&query) {
     ///     println!("Query removed");
     /// } else {
     ///     println!("Query has dependents, not removed");
     /// }
     /// ```
-    pub fn remove_query_if_unused<Q: Query>(&self, key: &Q::CacheKey) -> bool {
-        let full_key = FullCacheKey::new::<Q, _>(key);
+    pub fn remove_query_if_unused<Q: Query>(&self, query: &Q) -> bool {
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
         self.remove_if_unused(&full_key)
     }
 
@@ -1026,11 +1025,10 @@ impl<T: Tracer> QueryRuntime<T> {
         error: impl Into<anyhow::Error>,
         durability: DurabilityLevel,
     ) {
-        let full_asset_key = FullAssetKey::new(&key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Remove from pending BEFORE registering the error
-        self.pending.remove(&full_asset_key);
+        self.pending.remove(&full_cache_key);
 
         // Prepare the error entry
         let error_arc = Arc::new(error.into());
@@ -1081,11 +1079,10 @@ impl<T: Tracer> QueryRuntime<T> {
         value: K::Asset,
         durability_level: DurabilityLevel,
     ) {
-        let full_asset_key = FullAssetKey::new(&key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Remove from pending BEFORE registering the value
-        self.pending.remove(&full_asset_key);
+        self.pending.remove(&full_cache_key);
 
         // Prepare the new entry
         let value_arc: Arc<K::Asset> = Arc::new(value);
@@ -1147,8 +1144,7 @@ impl<T: Tracer> QueryRuntime<T> {
     /// // User should fetch the new value and call resolve_asset
     /// ```
     pub fn invalidate_asset<K: AssetKey>(&self, key: &K) {
-        let full_asset_key = FullAssetKey::new(key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Emit asset invalidated event
         self.tracer.on_asset_invalidated(TracerAssetKey::new(
@@ -1158,7 +1154,8 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // Add to pending FIRST (before clearing whale state)
         // This ensures: readers see either old value, or Loading+pending
-        self.pending.insert::<K>(full_asset_key, key.clone());
+        self.pending
+            .insert::<K>(full_cache_key.clone(), key.clone());
 
         // Atomic: clear cached value + invalidate dependents
         // Using None for data means "needs to be loaded"
@@ -1173,11 +1170,10 @@ impl<T: Tracer> QueryRuntime<T> {
     /// Unlike `invalidate_asset`, this removes all traces of the asset.
     /// Dependent queries will go through the locator again on next access.
     pub fn remove_asset<K: AssetKey>(&self, key: &K) {
-        let full_asset_key = FullAssetKey::new(key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Remove from pending first
-        self.pending.remove(&full_asset_key);
+        self.pending.remove(&full_cache_key);
 
         // Remove from whale (this also cleans up dependency edges)
         // whale.remove() invalidates dependents before removing
@@ -1218,8 +1214,7 @@ impl<T: Tracer> QueryRuntime<T> {
         &self,
         key: K,
     ) -> Result<(AssetLoadingState<K>, RevisionCounter), QueryError> {
-        let full_asset_key = FullAssetKey::new(&key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Helper to emit AssetRequested event
         let emit_requested = |tracer: &T, key: &K, state: TracerAssetState| {
@@ -1363,7 +1358,8 @@ impl<T: Tracer> QueryRuntime<T> {
                     emit_requested(&self.tracer, &key, TracerAssetState::Loading);
 
                     // Add to pending list for Pending result
-                    self.pending.insert::<K>(full_asset_key, key.clone());
+                    self.pending
+                        .insert::<K>(full_cache_key.clone(), key.clone());
                     match self
                         .whale
                         .get_or_insert(full_cache_key, None, Durability::volatile(), locator_deps)
@@ -1421,7 +1417,7 @@ impl<T: Tracer> QueryRuntime<T> {
         // (no locator was called, so no deps to track)
         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
         self.pending
-            .insert::<K>(full_asset_key.clone(), key.clone());
+            .insert::<K>(full_cache_key.clone(), key.clone());
 
         match self
             .whale
@@ -1456,8 +1452,7 @@ impl<T: Tracer> QueryRuntime<T> {
         key: K,
         _ctx: &QueryContext<'_, T>,
     ) -> Result<(AssetLoadingState<K>, RevisionCounter), QueryError> {
-        let full_asset_key = FullAssetKey::new(&key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Helper to emit AssetRequested event
         let emit_requested = |tracer: &T, key: &K, state: TracerAssetState| {
@@ -1602,7 +1597,8 @@ impl<T: Tracer> QueryRuntime<T> {
                     emit_requested(&self.tracer, &key, TracerAssetState::Loading);
 
                     // Add to pending list for Pending result
-                    self.pending.insert::<K>(full_asset_key, key.clone());
+                    self.pending
+                        .insert::<K>(full_cache_key.clone(), key.clone());
                     match self
                         .whale
                         .get_or_insert(full_cache_key, None, Durability::volatile(), locator_deps)
@@ -1659,7 +1655,7 @@ impl<T: Tracer> QueryRuntime<T> {
         // No locator registered or locator returned None - mark as pending
         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
         self.pending
-            .insert::<K>(full_asset_key.clone(), key.clone());
+            .insert::<K>(full_cache_key.clone(), key.clone());
 
         match self
             .whale
@@ -1774,8 +1770,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     /// }
     /// ```
     pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
-        let key = query.cache_key();
-        let full_key = FullCacheKey::new::<Q, _>(&key);
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
 
         // Emit dependency registered event
         self.runtime.tracer.on_dependency_registered(
@@ -1785,7 +1780,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
         );
 
         // Record this as a dependency
-        self.deps.borrow_mut().push(full_key.clone());
+        self.deps.borrow_mut().push(full_key);
 
         // Execute the query
         self.runtime.query(query)
@@ -1835,8 +1830,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
     pub fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
-        let full_asset_key = FullAssetKey::new(&key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // 1. Emit asset dependency registered event
         self.runtime.tracer.on_asset_dependency_registered(
@@ -2002,8 +1996,7 @@ impl<'a, T: Tracer> LocatorContext<'a, T> {
 
 impl<T: Tracer> Db for LocatorContext<'_, T> {
     fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
-        let key = query.cache_key();
-        let full_key = FullCacheKey::new::<Q, _>(&key);
+        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
 
         // Record this as a dependency of the asset being located
         self.deps.borrow_mut().push(full_key);
@@ -2017,8 +2010,7 @@ impl<T: Tracer> Db for LocatorContext<'_, T> {
     }
 
     fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
-        let full_asset_key = FullAssetKey::new(&key);
-        let full_cache_key = FullCacheKey::from_asset_key(&full_asset_key);
+        let full_cache_key = FullCacheKey::for_asset(key.clone());
 
         // Record this as a dependency of the asset being located
         self.deps.borrow_mut().push(full_cache_key);
@@ -2044,19 +2036,14 @@ mod tests {
 
     #[test]
     fn test_simple_query() {
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct Add {
             a: i32,
             b: i32,
         }
 
         impl Query for Add {
-            type CacheKey = (i32, i32);
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                (self.a, self.b)
-            }
 
             fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 Ok(Arc::new(self.a + self.b))
@@ -2079,18 +2066,13 @@ mod tests {
 
     #[test]
     fn test_dependent_queries() {
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct Base {
             value: i32,
         }
 
         impl Query for Base {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.value
-            }
 
             fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 Ok(Arc::new(self.value * 2))
@@ -2101,18 +2083,13 @@ mod tests {
             }
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct Derived {
             base_value: i32,
         }
 
         impl Query for Derived {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.base_value
-            }
 
             fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let base = db.query(Base {
@@ -2134,23 +2111,18 @@ mod tests {
 
     #[test]
     fn test_cycle_detection() {
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct CycleA {
             id: i32,
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct CycleB {
             id: i32,
         }
 
         impl Query for CycleA {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.id
-            }
 
             fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let b = db.query(CycleB { id: self.id })?;
@@ -2163,12 +2135,7 @@ mod tests {
         }
 
         impl Query for CycleB {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.id
-            }
 
             fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let a = db.query(CycleA { id: self.id })?;
@@ -2188,18 +2155,13 @@ mod tests {
 
     #[test]
     fn test_fallible_query() {
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct ParseInt {
             input: String,
         }
 
         impl Query for ParseInt {
-            type CacheKey = String;
             type Output = Result<i32, std::num::ParseIntError>;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.input.clone()
-            }
 
             fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 Ok(Arc::new(self.input.parse()))
@@ -2347,18 +2309,13 @@ mod tests {
     mod poll_tests {
         use super::*;
 
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct Counter {
             id: i32,
         }
 
         impl Query for Counter {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.id
-            }
 
             fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 Ok(Arc::new(self.id * 10))
@@ -2407,7 +2364,7 @@ mod tests {
             let rev1 = result1.revision;
 
             // Invalidate and poll again
-            runtime.invalidate::<Counter>(&1);
+            runtime.invalidate(&Counter { id: 1 });
             let result2 = runtime.poll(Counter { id: 1 }).unwrap();
             let rev2 = result2.revision;
 
@@ -2426,7 +2383,7 @@ mod tests {
             let runtime = QueryRuntime::new();
 
             // Query has never been executed
-            let rev = runtime.changed_at::<Counter>(&1);
+            let rev = runtime.changed_at(&Counter { id: 1 });
             assert!(rev.is_none());
         }
 
@@ -2438,7 +2395,7 @@ mod tests {
             let _ = runtime.query(Counter { id: 1 }).unwrap();
 
             // Now changed_at should return Some
-            let rev = runtime.changed_at::<Counter>(&1);
+            let rev = runtime.changed_at(&Counter { id: 1 });
             assert!(rev.is_some());
             assert!(rev.unwrap() > 0);
         }
@@ -2451,7 +2408,7 @@ mod tests {
             let result = runtime.poll(Counter { id: 1 }).unwrap();
 
             // changed_at should match the revision from poll
-            let rev = runtime.changed_at::<Counter>(&1);
+            let rev = runtime.changed_at(&Counter { id: 1 });
             assert_eq!(rev, Some(result.revision));
         }
 
@@ -2514,18 +2471,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct Leaf {
             id: i32,
         }
 
         impl Query for Leaf {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.id
-            }
 
             fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 Ok(Arc::new(self.id * 10))
@@ -2536,18 +2488,13 @@ mod tests {
             }
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         struct Parent {
             child_id: i32,
         }
 
         impl Query for Parent {
-            type CacheKey = i32;
             type Output = i32;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                self.child_id
-            }
 
             fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
                 let child = db.query(Leaf { id: self.child_id })?;
@@ -2583,16 +2530,16 @@ mod tests {
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
 
             // Get the key
-            let full_key = FullCacheKey::new::<Leaf, _>(&1);
+            let full_key = FullCacheKey::new::<Leaf, Leaf>(Leaf { id: 1 });
 
             // Query should exist
-            assert!(runtime.changed_at::<Leaf>(&1).is_some());
+            assert!(runtime.changed_at(&Leaf { id: 1 }).is_some());
 
             // Remove it
             assert!(runtime.remove(&full_key));
 
             // Query should no longer exist
-            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+            assert!(runtime.changed_at(&Leaf { id: 1 }).is_none());
         }
 
         #[test]
@@ -2603,10 +2550,10 @@ mod tests {
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
 
             // Should be removable since no other query depends on it
-            assert!(runtime.remove_query_if_unused::<Leaf>(&1));
+            assert!(runtime.remove_query_if_unused(&Leaf { id: 1 }));
 
             // Query should no longer exist
-            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+            assert!(runtime.changed_at(&Leaf { id: 1 }).is_none());
         }
 
         #[test]
@@ -2617,13 +2564,13 @@ mod tests {
             let _ = runtime.query(Parent { child_id: 1 }).unwrap();
 
             // Leaf query should not be removable since Parent depends on it
-            assert!(!runtime.remove_query_if_unused::<Leaf>(&1));
+            assert!(!runtime.remove_query_if_unused(&Leaf { id: 1 }));
 
             // Leaf query should still exist
-            assert!(runtime.changed_at::<Leaf>(&1).is_some());
+            assert!(runtime.changed_at(&Leaf { id: 1 }).is_some());
 
             // But Parent should be removable (no dependents)
-            assert!(runtime.remove_query_if_unused::<Parent>(&1));
+            assert!(runtime.remove_query_if_unused(&Parent { child_id: 1 }));
         }
 
         #[test]
@@ -2633,13 +2580,13 @@ mod tests {
             // Execute a leaf query
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
 
-            let full_key = FullCacheKey::new::<Leaf, _>(&1);
+            let full_key = FullCacheKey::new::<Leaf, Leaf>(Leaf { id: 1 });
 
             // Should be removable via FullCacheKey
             assert!(runtime.remove_if_unused(&full_key));
 
             // Query should no longer exist
-            assert!(runtime.changed_at::<Leaf>(&1).is_none());
+            assert!(runtime.changed_at(&Leaf { id: 1 }).is_none());
         }
 
         // Test tracer receives on_query_key calls
@@ -2725,9 +2672,9 @@ mod tests {
             assert!(removed >= 3);
 
             // Queries should no longer exist
-            assert!(runtime.changed_at::<Leaf>(&1).is_none());
-            assert!(runtime.changed_at::<Leaf>(&2).is_none());
-            assert!(runtime.changed_at::<Leaf>(&3).is_none());
+            assert!(runtime.changed_at(&Leaf { id: 1 }).is_none());
+            assert!(runtime.changed_at(&Leaf { id: 2 }).is_none());
+            assert!(runtime.changed_at(&Leaf { id: 3 }).is_none());
         }
     }
 }

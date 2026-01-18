@@ -37,7 +37,7 @@ fn get_query(node_id: &NodeId) -> Option<SyntheticQuery> {
 }
 
 /// Dependency type for synthetic queries.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dependency {
     /// Dependency on another synthetic query.
     Query(NodeId),
@@ -58,7 +58,7 @@ pub struct SyntheticOutput {
 /// - Calls all its dependencies (other queries or assets)
 /// - Combines their outputs into a deterministic hash-based output
 /// - Records simulated execution time in events (but doesn't actually sleep)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct SyntheticQuery {
     /// Node ID in the tree.
     pub node_id: NodeId,
@@ -88,12 +88,7 @@ impl SyntheticQuery {
 }
 
 impl Query for SyntheticQuery {
-    type CacheKey = NodeId;
     type Output = SyntheticOutput;
-
-    fn cache_key(&self) -> Self::CacheKey {
-        self.node_id
-    }
 
     fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
         // Collect dependency outputs

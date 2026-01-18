@@ -12,12 +12,7 @@ struct DoubleQuery {
 }
 
 impl Query for DoubleQuery {
-    type CacheKey = i32;
     type Output = i32;
-
-    fn cache_key(&self) -> Self::CacheKey {
-        self.value
-    }
 
     fn query(self, _db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
         Ok(Arc::new(self.value * 2))
@@ -41,14 +36,11 @@ impl AssetKey for ConfigFile {
 }
 
 // Query that lists all config files
-#[derive(Clone)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ListConfigsQuery;
 
 impl Query for ListConfigsQuery {
-    type CacheKey = ();
     type Output = Vec<String>;
-
-    fn cache_key(&self) -> Self::CacheKey {}
 
     fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
         let keys = db.list_asset_keys::<ConfigFile>();
@@ -65,14 +57,11 @@ impl Query for ListConfigsQuery {
 #[test]
 fn test_list_queries_basic() {
     // Query that aggregates all DoubleQuery results using list_queries
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct AggregateQuery;
 
     impl Query for AggregateQuery {
-        type CacheKey = ();
         type Output = Vec<i32>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let queries = db.list_queries::<DoubleQuery>();
@@ -106,14 +95,11 @@ fn test_list_queries_invalidation_on_add() {
     static AGGREGATE_COUNT: AtomicU32 = AtomicU32::new(0);
 
     // Query that aggregates all DoubleQuery results using list_queries
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct TrackedAggregateQuery;
 
     impl Query for TrackedAggregateQuery {
-        type CacheKey = ();
         type Output = Vec<i32>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -162,14 +148,11 @@ fn test_list_queries_no_invalidation_on_value_change() {
     static AGGREGATE_COUNT: AtomicU32 = AtomicU32::new(0);
 
     // Query that only uses list_queries, not individual queries
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct ListOnlyQuery;
 
     impl Query for ListOnlyQuery {
-        type CacheKey = ();
         type Output = usize;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             AGGREGATE_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -195,7 +178,7 @@ fn test_list_queries_no_invalidation_on_value_change() {
     assert_eq!(AGGREGATE_COUNT.load(Ordering::SeqCst), 1);
 
     // Invalidate the individual query (not the set)
-    runtime.invalidate::<DoubleQuery>(&1);
+    runtime.invalidate(&DoubleQuery { value: 1 });
 
     // The list-only query should still be cached because:
     // 1. It doesn't depend on individual query values
@@ -207,14 +190,11 @@ fn test_list_queries_no_invalidation_on_value_change() {
 
 #[test]
 fn test_list_queries_individual_dependency() {
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct AggregateQuery2;
 
     impl Query for AggregateQuery2 {
-        type CacheKey = ();
         type Output = Vec<i32>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let queries = db.list_queries::<DoubleQuery>();
@@ -242,7 +222,7 @@ fn test_list_queries_individual_dependency() {
     assert_eq!(*result, vec![2, 4]);
 
     // Invalidate an individual query
-    runtime.invalidate::<DoubleQuery>(&1);
+    runtime.invalidate(&DoubleQuery { value: 1 });
 
     // Re-execute individual query with same key
     runtime.query(DoubleQuery { value: 1 }).unwrap();
@@ -277,14 +257,11 @@ fn test_list_asset_keys_basic() {
 fn test_list_asset_keys_invalidation_on_remove() {
     static LIST_COUNT: AtomicU32 = AtomicU32::new(0);
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct TrackedListConfigs;
 
     impl Query for TrackedListConfigs {
-        type CacheKey = ();
         type Output = Vec<String>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -337,14 +314,11 @@ fn test_list_asset_keys_invalidation_on_remove() {
 fn test_list_asset_keys_no_invalidation_on_value_change() {
     static LIST_COUNT: AtomicU32 = AtomicU32::new(0);
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct TrackedListConfigs2;
 
     impl Query for TrackedListConfigs2 {
-        type CacheKey = ();
         type Output = Vec<String>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -392,14 +366,11 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
     static CONTENT_COUNT: AtomicU32 = AtomicU32::new(0);
 
     // Query that lists all config files and reads their contents
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct AllConfigContents;
 
     impl Query for AllConfigContents {
-        type CacheKey = ();
         type Output = Vec<(String, String)>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             CONTENT_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -450,14 +421,11 @@ fn test_list_asset_keys_with_individual_asset_dependency() {
 
 #[test]
 fn test_list_queries_empty() {
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct AggregateQuery3;
 
     impl Query for AggregateQuery3 {
-        type CacheKey = ();
         type Output = Vec<i32>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let queries = db.list_queries::<DoubleQuery>();
@@ -494,14 +462,11 @@ fn test_list_asset_keys_empty() {
 fn test_list_asset_keys_invalidation_on_add() {
     static LIST_COUNT: AtomicU32 = AtomicU32::new(0);
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct TrackedListConfigs3;
 
     impl Query for TrackedListConfigs3 {
-        type CacheKey = ();
         type Output = Vec<String>;
-
-        fn cache_key(&self) -> Self::CacheKey {}
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             LIST_COUNT.fetch_add(1, Ordering::SeqCst);

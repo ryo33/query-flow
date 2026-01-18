@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::db::Db;
 use crate::error::QueryError;
-use crate::key::Key;
+use crate::key::CacheKey;
 
 /// Durability levels for dependency tracking optimization.
 ///
@@ -56,6 +56,7 @@ impl DurabilityLevel {
 /// pub struct ConfigFile(pub PathBuf);
 ///
 /// // Or manually:
+/// #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 /// pub struct TextureId(pub u32);
 ///
 /// impl AssetKey for TextureId {
@@ -66,7 +67,7 @@ impl DurabilityLevel {
 ///     }
 /// }
 /// ```
-pub trait AssetKey: Key + 'static {
+pub trait AssetKey: CacheKey + Clone + 'static {
     /// The asset type this key loads.
     type Asset: Send + Sync + 'static;
 
@@ -213,69 +214,3 @@ impl Debug for PendingAsset {
         write!(f, "PendingAsset({})", self.debug_repr)
     }
 }
-
-/// Full cache key for assets (includes AssetKey type information).
-///
-/// This is similar to `FullCacheKey` for queries but marks the entry
-/// as an asset in the dependency graph.
-#[derive(Clone)]
-pub(crate) struct FullAssetKey {
-    /// Type ID of the AssetKey type
-    key_type: TypeId,
-    /// Hash of the key value
-    key_hash: u64,
-    /// Debug representation
-    debug_repr: Arc<str>,
-}
-
-impl FullAssetKey {
-    /// Create a new full asset key.
-    pub fn new<K: AssetKey>(key: &K) -> Self {
-        use std::hash::Hasher;
-        let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
-        let key_hash = hasher.finish();
-
-        Self {
-            key_type: TypeId::of::<K>(),
-            key_hash,
-            debug_repr: Arc::from(format!("Asset:{}({:?})", std::any::type_name::<K>(), key)),
-        }
-    }
-
-    /// Get debug representation for error messages.
-    pub fn debug_repr(&self) -> &str {
-        &self.debug_repr
-    }
-
-    /// Get the key type.
-    pub fn key_type(&self) -> TypeId {
-        self.key_type
-    }
-
-    /// Get the key hash.
-    pub fn key_hash(&self) -> u64 {
-        self.key_hash
-    }
-}
-
-impl Debug for FullAssetKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.debug_repr)
-    }
-}
-
-impl std::hash::Hash for FullAssetKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key_type.hash(state);
-        self.key_hash.hash(state);
-    }
-}
-
-impl PartialEq for FullAssetKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.key_type == other.key_type && self.key_hash == other.key_hash
-    }
-}
-
-impl Eq for FullAssetKey {}

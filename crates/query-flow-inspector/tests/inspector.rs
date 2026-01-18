@@ -75,18 +75,18 @@ fn test_simple_query_events() {
         to_kinds(&collector.trace()),
         vec![
             QueryStart {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))")
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }")
             },
             CacheCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }"),
                 valid: false
             },
             EarlyCutoffCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }"),
                 output_changed: true
             },
             QueryEnd {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }"),
                 result: Changed
             },
         ]
@@ -114,14 +114,14 @@ fn test_cached_query_events() {
         to_kinds(&collector.trace()),
         vec![
             QueryStart {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))")
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }")
             },
             CacheCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }"),
                 valid: true
             },
             QueryEnd {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }"),
                 result: CacheHit
             },
         ]
@@ -144,77 +144,59 @@ fn test_dependent_query_events() {
         to_kinds(&collector.trace()),
         vec![
             QueryStart {
-                query: q(
-                    "inspector::AddThenDouble",
-                    "inspector::AddThenDouble((2, 3))"
-                )
+                query: q("inspector::AddThenDouble", "AddThenDouble { a: 2, b: 3 }")
             },
             CacheCheck {
-                query: q(
-                    "inspector::AddThenDouble",
-                    "inspector::AddThenDouble((2, 3))"
-                ),
+                query: q("inspector::AddThenDouble", "AddThenDouble { a: 2, b: 3 }"),
                 valid: false
             },
             // SimpleAdd(2, 3) = 5
             DependencyRegistered {
-                parent: q(
-                    "inspector::AddThenDouble",
-                    "inspector::AddThenDouble((2, 3))"
-                ),
-                dependency: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"),
+                parent: q("inspector::AddThenDouble", "AddThenDouble { a: 2, b: 3 }"),
+                dependency: q("inspector::SimpleAdd", "SimpleAdd { a: 2, b: 3 }"),
             },
             QueryStart {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))")
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 2, b: 3 }")
             },
             CacheCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 2, b: 3 }"),
                 valid: false
             },
             EarlyCutoffCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 2, b: 3 }"),
                 output_changed: true
             },
             QueryEnd {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((2, 3))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 2, b: 3 }"),
                 result: Changed
             },
             // Double(5) = 10
             DependencyRegistered {
-                parent: q(
-                    "inspector::AddThenDouble",
-                    "inspector::AddThenDouble((2, 3))"
-                ),
-                dependency: q("inspector::Double", "inspector::Double(5)"),
+                parent: q("inspector::AddThenDouble", "AddThenDouble { a: 2, b: 3 }"),
+                dependency: q("inspector::Double", "Double { x: 5 }"),
             },
             QueryStart {
-                query: q("inspector::Double", "inspector::Double(5)")
+                query: q("inspector::Double", "Double { x: 5 }")
             },
             CacheCheck {
-                query: q("inspector::Double", "inspector::Double(5)"),
+                query: q("inspector::Double", "Double { x: 5 }"),
                 valid: false
             },
             EarlyCutoffCheck {
-                query: q("inspector::Double", "inspector::Double(5)"),
+                query: q("inspector::Double", "Double { x: 5 }"),
                 output_changed: true
             },
             QueryEnd {
-                query: q("inspector::Double", "inspector::Double(5)"),
+                query: q("inspector::Double", "Double { x: 5 }"),
                 result: Changed
             },
             // AddThenDouble completes
             EarlyCutoffCheck {
-                query: q(
-                    "inspector::AddThenDouble",
-                    "inspector::AddThenDouble((2, 3))"
-                ),
+                query: q("inspector::AddThenDouble", "AddThenDouble { a: 2, b: 3 }"),
                 output_changed: true
             },
             QueryEnd {
-                query: q(
-                    "inspector::AddThenDouble",
-                    "inspector::AddThenDouble((2, 3))"
-                ),
+                query: q("inspector::AddThenDouble", "AddThenDouble { a: 2, b: 3 }"),
                 result: Changed
             },
         ]
@@ -249,20 +231,20 @@ fn test_asset_events() {
             QueryStart {
                 query: q(
                     "inspector::ProcessSource",
-                    "inspector::ProcessSource(\"test\")"
+                    "ProcessSource { name: \"test\" }"
                 )
             },
             CacheCheck {
                 query: q(
                     "inspector::ProcessSource",
-                    "inspector::ProcessSource(\"test\")"
+                    "ProcessSource { name: \"test\" }"
                 ),
                 valid: false
             },
             AssetDependencyRegistered {
                 parent: q(
                     "inspector::ProcessSource",
-                    "inspector::ProcessSource(\"test\")"
+                    "ProcessSource { name: \"test\" }"
                 ),
                 asset: a("inspector::TestSource", "TestSource(\"test\")"),
             },
@@ -273,14 +255,14 @@ fn test_asset_events() {
             EarlyCutoffCheck {
                 query: q(
                     "inspector::ProcessSource",
-                    "inspector::ProcessSource(\"test\")"
+                    "ProcessSource { name: \"test\" }"
                 ),
                 output_changed: true
             },
             QueryEnd {
                 query: q(
                     "inspector::ProcessSource",
-                    "inspector::ProcessSource(\"test\")"
+                    "ProcessSource { name: \"test\" }"
                 ),
                 result: Changed
             },
@@ -352,18 +334,18 @@ fn test_early_cutoff_events() {
         to_kinds(&collector.trace()),
         vec![
             QueryStart {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))")
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 5, b: 5 }")
             },
             CacheCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 5, b: 5 }"),
                 valid: false
             },
             EarlyCutoffCheck {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 5, b: 5 }"),
                 output_changed: true
             },
             QueryEnd {
-                query: q("inspector::SimpleAdd", "inspector::SimpleAdd((5, 5))"),
+                query: q("inspector::SimpleAdd", "SimpleAdd { a: 5, b: 5 }"),
                 result: Changed
             },
         ]
@@ -375,18 +357,13 @@ fn test_cycle_detection_events() {
     use EventKind::*;
 
     // Create mutually recursive queries
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct CycleA(i32);
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
     struct CycleB(i32);
 
     impl query_flow::Query for CycleA {
-        type CacheKey = i32;
         type Output = i32;
-
-        fn cache_key(&self) -> Self::CacheKey {
-            self.0
-        }
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let b = db.query(CycleB(self.0))?;
@@ -399,12 +376,7 @@ fn test_cycle_detection_events() {
     }
 
     impl query_flow::Query for CycleB {
-        type CacheKey = i32;
         type Output = i32;
-
-        fn cache_key(&self) -> Self::CacheKey {
-            self.0
-        }
 
         fn query(self, db: &impl Db) -> Result<Arc<Self::Output>, QueryError> {
             let a = db.query(CycleA(self.0))?;
@@ -429,80 +401,76 @@ fn test_cycle_detection_events() {
             QueryStart {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 )
             },
             CacheCheck {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 ),
                 valid: false
             },
             DependencyRegistered {
                 parent: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 ),
                 dependency: q(
                     "inspector::test_cycle_detection_events::CycleB",
-                    "inspector::test_cycle_detection_events::CycleB(1)"
+                    "CycleB(1)"
                 ),
             },
             QueryStart {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleB",
-                    "inspector::test_cycle_detection_events::CycleB(1)"
+                    "CycleB(1)"
                 )
             },
             CacheCheck {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleB",
-                    "inspector::test_cycle_detection_events::CycleB(1)"
+                    "CycleB(1)"
                 ),
                 valid: false
             },
             DependencyRegistered {
                 parent: q(
                     "inspector::test_cycle_detection_events::CycleB",
-                    "inspector::test_cycle_detection_events::CycleB(1)"
+                    "CycleB(1)"
                 ),
                 dependency: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 ),
             },
             QueryStart {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 )
             },
             EventKind::CycleDetected {
-                path: vec![
-                    q("", "inspector::test_cycle_detection_events::CycleA(1)"),
-                    q("", "inspector::test_cycle_detection_events::CycleB(1)"),
-                    q("", "inspector::test_cycle_detection_events::CycleA(1)"),
-                ]
+                path: vec![q("", "CycleA(1)"), q("", "CycleB(1)"), q("", "CycleA(1)"),]
             },
             QueryEnd {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 ),
                 result: ExecutionResult::CycleDetected
             },
             QueryEnd {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleB",
-                    "inspector::test_cycle_detection_events::CycleB(1)"
+                    "CycleB(1)"
                 ),
                 result: ExecutionResult::CycleDetected
             },
             QueryEnd {
                 query: q(
                     "inspector::test_cycle_detection_events::CycleA",
-                    "inspector::test_cycle_detection_events::CycleA(1)"
+                    "CycleA(1)"
                 ),
                 result: ExecutionResult::CycleDetected
             },
@@ -524,12 +492,12 @@ fn test_query_invalidation_events() {
     collector.clear();
 
     // Invalidate
-    runtime.invalidate::<SimpleAdd>(&(1, 2));
+    runtime.invalidate(&SimpleAdd::new(1, 2));
 
     assert_eq!(
         to_kinds(&collector.trace()),
         vec![QueryInvalidated {
-            query: q("inspector::SimpleAdd", "inspector::SimpleAdd((1, 2))"),
+            query: q("inspector::SimpleAdd", "SimpleAdd { a: 1, b: 2 }"),
             reason: InvalidationReason::ManualInvalidation,
         }]
     );

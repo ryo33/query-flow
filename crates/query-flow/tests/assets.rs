@@ -1079,7 +1079,7 @@ fn test_locator_deps_registered_on_asset_not_query() {
     assert_eq!(LOCATOR_1_COUNT.load(Ordering::SeqCst), 1);
 
     // Invalidate the config query (but value stays "v1")
-    runtime.invalidate::<GetLocatorDepConfig1>(&());
+    runtime.invalidate(&GetLocatorDepConfig1 {});
 
     // Execute query again
     // IDEAL: Query should NOT re-execute (asset content unchanged)
@@ -1142,7 +1142,7 @@ fn test_locator_reexecutes_on_dep_change() {
 
     // Change config and invalidate
     *LOCATOR_DEP_CONFIG_2.lock().unwrap() = "v2".to_string();
-    runtime.invalidate::<GetLocatorDepConfig2>(&());
+    runtime.invalidate(&GetLocatorDepConfig2 {});
 
     // Access asset again
     // IDEAL: Asset's deps changed, so locator should re-execute
@@ -1209,7 +1209,7 @@ fn test_query_not_rerun_when_asset_unchanged() {
 
     // Change config and invalidate (but asset value will be the same)
     *LOCATOR_DEP_CONFIG_3.lock().unwrap() = "v2".to_string();
-    runtime.invalidate::<GetLocatorDepConfig3>(&());
+    runtime.invalidate(&GetLocatorDepConfig3 {});
 
     // Query again
     let result = runtime.query(ReadAsset3::new(LocatorDepAsset3("file".to_string())));
@@ -1278,7 +1278,7 @@ fn test_query_reruns_when_asset_changes() {
 
     // Change config (will change asset value)
     *LOCATOR_DEP_CONFIG_4.lock().unwrap() = "v2".to_string();
-    runtime.invalidate::<GetLocatorDepConfig4>(&());
+    runtime.invalidate(&GetLocatorDepConfig4 {});
 
     // Query again - should get new value
     let result = runtime.query(ReadAsset4::new(LocatorDepAsset4("file".to_string())));
@@ -1386,7 +1386,12 @@ fn test_locator_multiple_deps_one_changes() {
     assert_eq!(key.query_count(), 1);
 
     // Invalidate config "a" (but value stays same for early cutoff test)
-    runtime.invalidate::<GetMultiDepConfig>(&"a".to_string());
+    // Note: GetMultiDepConfig uses keys(_name) so only _name matters for identity
+    runtime.invalidate(&GetMultiDepConfig::new(
+        "a".to_string(),
+        String::new(),               // dummy value (not part of key)
+        Arc::new(AtomicU32::new(0)), // dummy count (not part of key)
+    ));
 
     // Query again - locator should re-run but query should NOT (early cutoff)
     let result = runtime.query(ReadMultiDepAsset::new("file".to_string(), key.clone()));
@@ -1487,7 +1492,12 @@ fn test_locator_duplicate_deps() {
     assert_eq!(key.query_count(), 1);
 
     // Invalidate the config query
-    runtime.invalidate::<GetDupConfig>(&"cfg".to_string());
+    // Note: GetDupConfig uses keys(_name) so only _name matters for identity
+    runtime.invalidate(&GetDupConfig::new(
+        "cfg".to_string(),
+        String::new(),               // dummy value (not part of key)
+        Arc::new(AtomicU32::new(0)), // dummy count (not part of key)
+    ));
 
     // Query again - locator should re-run exactly once
     // Asset value unchanged so query should NOT re-run (early cutoff)
@@ -1741,7 +1751,12 @@ fn test_nested_asset_locator_deps() {
     assert_eq!(key.query_count(), 1);
 
     // Invalidate config (value stays same for early cutoff test)
-    runtime.invalidate::<GetNestedConfig>(&"cfg".to_string());
+    // Note: GetNestedConfig uses keys(_name) so only _name matters for identity
+    runtime.invalidate(&GetNestedConfig::new(
+        "cfg".to_string(),
+        String::new(),               // dummy value (not part of key)
+        Arc::new(AtomicU32::new(0)), // dummy count (not part of key)
+    ));
 
     // Inner locator re-runs, but inner value unchanged
     // → outer locator should NOT re-run (early cutoff at inner)

@@ -129,11 +129,11 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
             .collect()
     };
 
-    // Generate struct definition
-    let struct_def = generate_struct(&parsed, &struct_name);
+    // Generate struct definition (with Hash/Eq based on key_params)
+    let struct_def = generate_struct(&parsed, &struct_name, &key_params);
 
     // Generate Query impl
-    let query_impl = generate_query_impl(&parsed, &struct_name, &key_params, &attr)?;
+    let query_impl = generate_query_impl(&parsed, &struct_name, &attr)?;
 
     Ok(quote! {
         #input_fn
@@ -260,7 +260,7 @@ fn extract_arc_inner(ty: &Type) -> Option<Type> {
     None
 }
 
-fn generate_struct(parsed: &ParsedFn, struct_name: &Ident) -> TokenStream {
+fn generate_struct(parsed: &ParsedFn, struct_name: &Ident, key_params: &[&Param]) -> TokenStream {
     let vis = &parsed.vis;
     let fields: Vec<_> = parsed
         .params
@@ -301,20 +301,78 @@ fn generate_struct(parsed: &ParsedFn, struct_name: &Ident) -> TokenStream {
         }
     };
 
+    // Check if we need custom Hash/Eq implementations (when keys() specifies a subset of fields)
+    let all_fields_are_keys = key_params.len() == parsed.params.len()
+        && key_params
+            .iter()
+            .all(|kp| parsed.params.iter().any(|p| p.name == kp.name));
+
+    let hash_eq_impl = if all_fields_are_keys {
+        // All fields are keys, use derive
+        quote! {}
+    } else {
+        // Custom keys specified, generate custom Hash/Eq
+        let key_names: Vec<_> = key_params.iter().map(|p| &p.name).collect();
+
+        let hash_body = if key_params.is_empty() {
+            // No key fields means all instances are equal
+            quote! {}
+        } else {
+            quote! {
+                #( self.#key_names.hash(state); )*
+            }
+        };
+
+        let eq_body = if key_params.is_empty() {
+            quote! { true }
+        } else {
+            let comparisons: Vec<_> = key_params
+                .iter()
+                .map(|p| {
+                    let name = &p.name;
+                    quote! { self.#name == other.#name }
+                })
+                .collect();
+            quote! { #( #comparisons )&&* }
+        };
+
+        quote! {
+            impl ::std::hash::Hash for #struct_name {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    #hash_body
+                }
+            }
+
+            impl ::std::cmp::PartialEq for #struct_name {
+                fn eq(&self, other: &Self) -> bool {
+                    #eq_body
+                }
+            }
+
+            impl ::std::cmp::Eq for #struct_name {}
+        }
+    };
+
+    let derives = if all_fields_are_keys {
+        quote! { #[derive(Clone, Debug, Hash, PartialEq, Eq)] }
+    } else {
+        quote! { #[derive(Clone, Debug)] }
+    };
+
     quote! {
-        #[derive(Clone, Debug)]
+        #derives
         #vis struct #struct_name {
             #( #fields ),*
         }
 
         #new_impl
+        #hash_eq_impl
     }
 }
 
 fn generate_query_impl(
     parsed: &ParsedFn,
     struct_name: &Ident,
-    key_params: &[&Param],
     attr: &QueryAttr,
 ) -> Result<TokenStream, Error> {
     let output_ty = &parsed.output_ty;
@@ -339,34 +397,6 @@ fn generate_query_impl(
         )
     };
 
-    // Generate CacheKey type
-    let cache_key_ty = match key_params.len() {
-        0 => quote! { () },
-        1 => {
-            let ty = &key_params[0].ty;
-            quote! { #ty }
-        }
-        _ => {
-            let types: Vec<_> = key_params.iter().map(|p| &p.ty).collect();
-            quote! { ( #( #types ),* ) }
-        }
-    };
-
-    // Generate cache_key() body
-    // Note: For 0 params, we use an empty block which evaluates to ()
-    // to avoid clippy::unused_unit warning
-    let cache_key_body = match key_params.len() {
-        0 => quote! {},
-        1 => {
-            let name = &key_params[0].name;
-            quote! { self.#name.clone() }
-        }
-        _ => {
-            let names: Vec<_> = key_params.iter().map(|p| &p.name).collect();
-            quote! { ( #( self.#names.clone() ),* ) }
-        }
-    };
-
     let output_eq_impl = match &attr.output_eq {
         // Default: use PartialEq
         OutputEq::None | OutputEq::PartialEq => quote! {
@@ -384,12 +414,7 @@ fn generate_query_impl(
 
     Ok(quote! {
         impl ::query_flow::Query for #struct_name {
-            type CacheKey = #cache_key_ty;
             type Output = #actual_output_ty;
-
-            fn cache_key(&self) -> Self::CacheKey {
-                #cache_key_body
-            }
 
             fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                 #query_body
@@ -436,7 +461,7 @@ mod tests {
                 Ok(x * 2)
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct MyQuery {
                 pub x: i32
             }
@@ -449,12 +474,7 @@ mod tests {
             }
 
             impl ::query_flow::Query for MyQuery {
-                type CacheKey = i32;
                 type Output = i32;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    self.x.clone()
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     my_query(db, self.x).map(::std::sync::Arc::new)
@@ -485,7 +505,7 @@ mod tests {
                 Ok(a + b)
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct Simple {
                 pub a: i32,
                 pub b: i32
@@ -499,12 +519,7 @@ mod tests {
             }
 
             impl ::query_flow::Query for Simple {
-                type CacheKey = (i32, i32);
                 type Output = i32;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    (self.a.clone(), self.b.clone())
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     simple(db, self.a, self.b).map(::std::sync::Arc::new)
@@ -535,7 +550,7 @@ mod tests {
                 Ok(42)
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct NoParams {
             }
 
@@ -553,12 +568,7 @@ mod tests {
             }
 
             impl ::query_flow::Query for NoParams {
-                type CacheKey = ();
                 type Output = i32;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    // Empty body - evaluates to () without explicit unit expression
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     no_params(db).map(::std::sync::Arc::new)
@@ -589,7 +599,7 @@ mod tests {
                 Ok(Arc::new(x.to_string()))
             }
 
-            #[derive(Clone, Debug)]
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
             struct ReturnsArc {
                 pub x: i32
             }
@@ -602,15 +612,267 @@ mod tests {
             }
 
             impl ::query_flow::Query for ReturnsArc {
-                type CacheKey = i32;
                 type Output = String;
-
-                fn cache_key(&self) -> Self::CacheKey {
-                    self.x.clone()
-                }
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     returns_arc(db, self.x)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_subset() {
+        // Test keys(a) with multiple params - only 'a' should be used for Hash/Eq
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn with_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(vec![format_ident!("a")]),
+            name: None,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq that only uses 'a'
+        let expected = quote! {
+            fn with_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug)]
+            struct WithKeys {
+                pub a: i32,
+                pub b: String,
+                pub c: bool
+            }
+
+            impl WithKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String, c: bool) -> Self {
+                    Self { a, b, c }
+                }
+            }
+
+            impl ::std::hash::Hash for WithKeys {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.a.hash(state);
+                }
+            }
+
+            impl ::std::cmp::PartialEq for WithKeys {
+                fn eq(&self, other: &Self) -> bool {
+                    self.a == other.a
+                }
+            }
+
+            impl ::std::cmp::Eq for WithKeys {}
+
+            impl ::query_flow::Query for WithKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    with_keys(db, self.a, self.b, self.c).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_multiple() {
+        // Test keys(a, c) with three params - only 'a' and 'c' should be used for Hash/Eq
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn multi_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(vec![format_ident!("a"), format_ident!("c")]),
+            name: None,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq that uses both 'a' and 'c'
+        let expected = quote! {
+            fn multi_keys(db: &impl Db, a: i32, b: String, c: bool) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug)]
+            struct MultiKeys {
+                pub a: i32,
+                pub b: String,
+                pub c: bool
+            }
+
+            impl MultiKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String, c: bool) -> Self {
+                    Self { a, b, c }
+                }
+            }
+
+            impl ::std::hash::Hash for MultiKeys {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.a.hash(state);
+                    self.c.hash(state);
+                }
+            }
+
+            impl ::std::cmp::PartialEq for MultiKeys {
+                fn eq(&self, other: &Self) -> bool {
+                    self.a == other.a && self.c == other.c
+                }
+            }
+
+            impl ::std::cmp::Eq for MultiKeys {}
+
+            impl ::query_flow::Query for MultiKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    multi_keys(db, self.a, self.b, self.c).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_all_explicit() {
+        // Test keys(a, b) when all params are specified - should use derive, not custom impl
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn all_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(vec![format_ident!("a"), format_ident!("b")]),
+            name: None,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // When all params are keys, should use derive instead of custom impl
+        let expected = quote! {
+            fn all_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+            struct AllKeys {
+                pub a: i32,
+                pub b: String
+            }
+
+            impl AllKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String) -> Self {
+                    Self { a, b }
+                }
+            }
+
+            impl ::query_flow::Query for AllKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    all_keys(db, self.a, self.b).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_keys_unknown_error() {
+        // Test that specifying an unknown key produces an error
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn bad_keys(db: &impl Db, a: i32) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(vec![format_ident!("unknown")]),
+            name: None,
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unknown parameter `unknown` in keys"));
+    }
+
+    #[test]
+    fn test_query_macro_keys_empty() {
+        // Test empty keys() - all instances are equal (edge case)
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn empty_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        // Empty keys means no fields are used for Hash/Eq
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(vec![]),
+            name: None,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq with empty body / always true
+        let expected = quote! {
+            fn empty_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+
+            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+            struct EmptyKeys {
+                pub a: i32,
+                pub b: String
+            }
+
+            impl EmptyKeys {
+                #[doc = r" Create a new query instance."]
+                fn new(a: i32, b: String) -> Self {
+                    Self { a, b }
+                }
+            }
+
+            impl ::query_flow::Query for EmptyKeys {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    empty_keys(db, self.a, self.b).map(::std::sync::Arc::new)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

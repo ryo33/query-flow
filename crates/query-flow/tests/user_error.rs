@@ -240,7 +240,7 @@ mod error_comparator_default {
         assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
 
         // Invalidate Level 1 and rerun Level 3
-        runtime.invalidate::<ErrorLevel1>(&-1);
+        runtime.invalidate(&ErrorLevel1::new(-1));
 
         let result2 = runtime.query(ErrorLevel3::new(-1));
         assert!(matches!(result2, Err(QueryError::UserError(_))));
@@ -321,7 +321,7 @@ mod error_comparator_custom {
         assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
 
         // Invalidate Level 1 and rerun Level 3
-        runtime.invalidate::<ErrorLevel1>(&-1);
+        runtime.invalidate(&ErrorLevel1::new(-1));
 
         let result2 = runtime.query(ErrorLevel3::new(-1));
         assert!(matches!(result2, Err(QueryError::UserError(_))));
@@ -397,7 +397,7 @@ mod error_comparator_always_equal {
         assert_eq!(ERROR_LEVEL3_CALL_COUNT.load(Ordering::SeqCst), 1);
 
         // Invalidate Level 1 and rerun Level 3
-        runtime.invalidate::<ErrorLevel1>(&-1);
+        runtime.invalidate(&ErrorLevel1::new(-1));
 
         let result2 = runtime.query(ErrorLevel3::new(-1));
         assert!(matches!(result2, Err(QueryError::UserError(_))));
@@ -565,7 +565,7 @@ mod transition_ok_to_error {
 
         // Change to error state
         TRANSITION_VALUE.store(u32::MAX, Ordering::SeqCst); // Will be -1 as i32
-        runtime.invalidate::<TransitionSource>(&());
+        runtime.invalidate(&TransitionSource {});
 
         // Should now get error
         let result = runtime.query(TransitionDependent::new());
@@ -616,7 +616,7 @@ mod transition_error_to_ok {
 
         // Change to Ok state
         TRANSITION_VALUE.store(5, Ordering::SeqCst);
-        runtime.invalidate::<TransitionSource>(&());
+        runtime.invalidate(&TransitionSource {});
 
         // Should now get Ok
         let result = runtime.query(TransitionDependent::new());

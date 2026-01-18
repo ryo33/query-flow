@@ -279,6 +279,9 @@ mod tests {
                     },
                     AssetRequested {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                    },
+                    AssetLocated {
+                        asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
@@ -364,6 +367,9 @@ mod tests {
                     },
                     AssetRequested {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                    },
+                    AssetLocated {
+                        asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
@@ -381,6 +387,9 @@ mod tests {
                     },
                     AssetRequested {
                         asset: a("calc::Variable", "Variable(\"x\")"),
+                    },
+                    AssetLocated {
+                        asset: a("calc::Variable", "Variable(\"x\")"),
                         state: AssetState::Ready
                     },
                     // y variable lookup
@@ -389,6 +398,9 @@ mod tests {
                         asset: a("calc::Variable", "Variable(\"y\")"),
                     },
                     AssetRequested {
+                        asset: a("calc::Variable", "Variable(\"y\")"),
+                    },
+                    AssetLocated {
                         asset: a("calc::Variable", "Variable(\"y\")"),
                         state: AssetState::Ready
                     },
@@ -456,6 +468,9 @@ mod tests {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
+                        asset: a("calc::SourceFile", "SourceFile(\"main\")"),
+                    },
+                    AssetLocated {
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                         state: AssetState::Ready
                     },

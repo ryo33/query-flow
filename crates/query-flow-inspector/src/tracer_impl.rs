@@ -168,8 +168,21 @@ impl Tracer for EventSinkTracer {
     }
 
     #[inline]
-    fn on_asset_requested(&self, asset: &AssetCacheKey, state: TracerAssetState) {
+    fn on_asset_requested(&self, ctx: &SpanContext, asset: &AssetCacheKey) {
         self.sink.emit(FlowEvent::AssetRequested {
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
+            asset: asset.into(),
+        });
+    }
+
+    #[inline]
+    fn on_asset_located(&self, ctx: &SpanContext, asset: &AssetCacheKey, state: TracerAssetState) {
+        self.sink.emit(FlowEvent::AssetLocated {
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             asset: asset.into(),
             state: state.into(),
         });

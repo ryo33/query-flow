@@ -250,6 +250,9 @@ fn test_asset_events() {
             },
             AssetRequested {
                 asset: a("inspector::TestSource", "TestSource(\"test\")"),
+            },
+            AssetLocated {
+                asset: a("inspector::TestSource", "TestSource(\"test\")"),
                 state: AssetState::Ready
             },
             EarlyCutoffCheck {

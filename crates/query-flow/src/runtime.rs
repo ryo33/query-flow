@@ -1264,10 +1264,21 @@ impl<T: Tracer> QueryRuntime<T> {
         let asset_cache_key = AssetCacheKey::new(key.clone());
         let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
-        // Helper to emit AssetRequested event
-        let emit_requested = |tracer: &T, asset_key: &AssetCacheKey, state: TracerAssetState| {
-            tracer.on_asset_requested(asset_key, state);
+        // Create a span for this asset request (like queries do)
+        // This ensures child queries called from locators show as children of this asset
+        let asset_span_id = self.tracer.new_span_id();
+        let (trace_id, parent_span_id) = SPAN_STACK.with(|stack| match &*stack.borrow() {
+            SpanStack::Empty => (self.tracer.new_trace_id(), None),
+            SpanStack::Active(tid, spans) => (*tid, spans.last().copied()),
+        });
+        let span_ctx = SpanContext {
+            span_id: asset_span_id,
+            trace_id,
+            parent_span_id,
         };
+
+        // Push asset span to stack so child queries see this asset as their parent
+        let _span_guard = SpanStackGuard::push(trace_id, asset_span_id);
 
         // Check whale cache first (single atomic read)
         if let Some(node) = self.whale.get(&full_cache_key) {
@@ -1303,7 +1314,13 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
+                            // Cache hit: start + end immediately (no locator runs)
+                            self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+                            self.tracer.on_asset_located(
+                                &span_ctx,
+                                &asset_cache_key,
+                                TracerAssetState::Ready,
+                            );
                             match arc.clone().downcast::<K::Asset>() {
                                 Ok(value) => {
                                     return Ok((AssetLoadingState::ready(key, value), changed_at))
@@ -1320,8 +1337,10 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(
-                                &self.tracer,
+                            // Cache hit: start + end immediately (no locator runs)
+                            self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+                            self.tracer.on_asset_located(
+                                &span_ctx,
                                 &asset_cache_key,
                                 TracerAssetState::NotFound,
                             );
@@ -1329,8 +1348,10 @@ impl<T: Tracer> QueryRuntime<T> {
                         }
                         None => {
                             // Loading state - no value to be inconsistent with
-                            emit_requested(
-                                &self.tracer,
+                            // Cache hit: start + end immediately (no locator runs)
+                            self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+                            self.tracer.on_asset_located(
+                                &span_ctx,
                                 &asset_cache_key,
                                 TracerAssetState::Loading,
                             );
@@ -1350,6 +1371,9 @@ impl<T: Tracer> QueryRuntime<T> {
         check_cycle(&full_cache_key)?;
         let _guard = StackGuard::push(full_cache_key.clone());
 
+        // Notify tracer BEFORE locator runs (START event) so child queries appear as children
+        self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+
         let locator_ctx = LocatorContext::new(self, full_cache_key.clone());
         let locator_result =
             self.locators
@@ -1363,7 +1387,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     value: arc,
                     durability: durability_level,
                 }) => {
-                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
+                    // END event after locator completes
+                    self.tracer.on_asset_located(
+                        &span_ctx,
+                        &asset_cache_key,
+                        TracerAssetState::Ready,
+                    );
 
                     let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                         Ok(v) => v,
@@ -1408,7 +1437,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                 }
                 Ok(ErasedLocateResult::Pending) => {
-                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
+                    // END event after locator completes with pending
+                    self.tracer.on_asset_located(
+                        &span_ctx,
+                        &asset_cache_key,
+                        TracerAssetState::Loading,
+                    );
 
                     // Add to pending list for Pending result
                     self.pending
@@ -1449,6 +1483,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     }
                 }
                 Err(QueryError::UserError(err)) => {
+                    // END event after locator completes with error
+                    self.tracer.on_asset_located(
+                        &span_ctx,
+                        &asset_cache_key,
+                        TracerAssetState::NotFound,
+                    );
                     // Locator returned a user error - cache it as AssetError
                     let entry = CachedEntry::AssetError(err.clone());
                     let _ = self.whale.register(
@@ -1468,7 +1508,9 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // No locator registered or locator returned None - mark as pending
         // (no locator was called, so no deps to track)
-        emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
+        // END event - no locator ran
+        self.tracer
+            .on_asset_located(&span_ctx, &asset_cache_key, TracerAssetState::Loading);
         self.pending
             .insert::<K>(asset_cache_key.clone(), key.clone());
 
@@ -1508,10 +1550,21 @@ impl<T: Tracer> QueryRuntime<T> {
         let asset_cache_key = AssetCacheKey::new(key.clone());
         let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
-        // Helper to emit AssetRequested event
-        let emit_requested = |tracer: &T, asset_key: &AssetCacheKey, state: TracerAssetState| {
-            tracer.on_asset_requested(asset_key, state);
+        // Create a span for this asset request (like queries do)
+        // This ensures child queries called from locators show as children of this asset
+        let asset_span_id = self.tracer.new_span_id();
+        let (trace_id, parent_span_id) = SPAN_STACK.with(|stack| match &*stack.borrow() {
+            SpanStack::Empty => (self.tracer.new_trace_id(), None),
+            SpanStack::Active(tid, spans) => (*tid, spans.last().copied()),
+        });
+        let span_ctx = SpanContext {
+            span_id: asset_span_id,
+            trace_id,
+            parent_span_id,
         };
+
+        // Push asset span to stack so child queries see this asset as their parent
+        let _span_guard = SpanStackGuard::push(trace_id, asset_span_id);
 
         // Check whale cache first (single atomic read)
         if let Some(node) = self.whale.get(&full_cache_key) {
@@ -1547,7 +1600,13 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
+                            // Cache hit: start + end immediately (no locator runs)
+                            self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+                            self.tracer.on_asset_located(
+                                &span_ctx,
+                                &asset_cache_key,
+                                TracerAssetState::Ready,
+                            );
                             match arc.clone().downcast::<K::Asset>() {
                                 Ok(value) => {
                                     return Ok((AssetLoadingState::ready(key, value), changed_at))
@@ -1564,8 +1623,10 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(
-                                &self.tracer,
+                            // Cache hit: start + end immediately (no locator runs)
+                            self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+                            self.tracer.on_asset_located(
+                                &span_ctx,
                                 &asset_cache_key,
                                 TracerAssetState::NotFound,
                             );
@@ -1573,8 +1634,10 @@ impl<T: Tracer> QueryRuntime<T> {
                         }
                         None => {
                             // Loading state - no value to be inconsistent with
-                            emit_requested(
-                                &self.tracer,
+                            // Cache hit: start + end immediately (no locator runs)
+                            self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+                            self.tracer.on_asset_located(
+                                &span_ctx,
                                 &asset_cache_key,
                                 TracerAssetState::Loading,
                             );
@@ -1595,6 +1658,9 @@ impl<T: Tracer> QueryRuntime<T> {
         check_cycle(&full_cache_key)?;
         let _guard = StackGuard::push(full_cache_key.clone());
 
+        // START event before locator runs
+        self.tracer.on_asset_requested(&span_ctx, &asset_cache_key);
+
         let locator_ctx = LocatorContext::new(self, full_cache_key.clone());
         let locator_result =
             self.locators
@@ -1608,7 +1674,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     value: arc,
                     durability: durability_level,
                 }) => {
-                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
+                    // END event after locator completes
+                    self.tracer.on_asset_located(
+                        &span_ctx,
+                        &asset_cache_key,
+                        TracerAssetState::Ready,
+                    );
 
                     let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                         Ok(v) => v,
@@ -1653,7 +1724,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                 }
                 Ok(ErasedLocateResult::Pending) => {
-                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
+                    // END event after locator completes with pending
+                    self.tracer.on_asset_located(
+                        &span_ctx,
+                        &asset_cache_key,
+                        TracerAssetState::Loading,
+                    );
 
                     // Add to pending list for Pending result
                     self.pending
@@ -1694,6 +1770,12 @@ impl<T: Tracer> QueryRuntime<T> {
                     }
                 }
                 Err(QueryError::UserError(err)) => {
+                    // END event after locator completes with error
+                    self.tracer.on_asset_located(
+                        &span_ctx,
+                        &asset_cache_key,
+                        TracerAssetState::NotFound,
+                    );
                     // Locator returned a user error - cache it as AssetError
                     let entry = CachedEntry::AssetError(err.clone());
                     let _ = self.whale.register(
@@ -1712,7 +1794,9 @@ impl<T: Tracer> QueryRuntime<T> {
         }
 
         // No locator registered or locator returned None - mark as pending
-        emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
+        // END event - no locator ran
+        self.tracer
+            .on_asset_located(&span_ctx, &asset_cache_key, TracerAssetState::Loading);
         self.pending
             .insert::<K>(asset_cache_key.clone(), key.clone());
 

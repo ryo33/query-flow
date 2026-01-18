@@ -261,8 +261,22 @@ pub enum FlowEvent {
     },
 
     // === Asset Events ===
-    /// Asset was requested.
-    AssetRequested { asset: AssetKey, state: AssetState },
+    /// Asset was requested (START event, before locator runs).
+    AssetRequested {
+        span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        asset: AssetKey,
+    },
+
+    /// Asset locator finished execution (END event).
+    AssetLocated {
+        span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        asset: AssetKey,
+        state: AssetState,
+    },
 
     /// Asset was resolved with a value.
     AssetResolved {
@@ -328,6 +342,9 @@ pub enum EventKind {
     },
     AssetRequested {
         asset: AssetKey,
+    },
+    AssetLocated {
+        asset: AssetKey,
         state: AssetState,
     },
     AssetResolved {
@@ -384,7 +401,10 @@ impl From<&FlowEvent> for EventKind {
                 query: query.clone(),
                 output_changed: *output_changed,
             },
-            FlowEvent::AssetRequested { asset, state } => EventKind::AssetRequested {
+            FlowEvent::AssetRequested { asset, .. } => EventKind::AssetRequested {
+                asset: asset.clone(),
+            },
+            FlowEvent::AssetLocated { asset, state, .. } => EventKind::AssetLocated {
                 asset: asset.clone(),
                 state: state.clone(),
             },

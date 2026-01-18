@@ -173,9 +173,25 @@ pub trait Tracer: Send + Sync + 'static {
     ) {
     }
 
-    /// Called when an asset is requested.
+    /// Called when an asset is requested (START event).
+    ///
+    /// This is called BEFORE the locator executes. Child queries called by
+    /// the locator will appear as children of this asset in the trace tree.
     #[inline]
-    fn on_asset_requested(&self, _asset: &AssetCacheKey, _state: TracerAssetState) {}
+    fn on_asset_requested(&self, _ctx: &SpanContext, _asset: &AssetCacheKey) {}
+
+    /// Called when an asset locator finishes execution.
+    ///
+    /// This is the "end" event for assets, corresponding to `on_query_end` for queries.
+    /// Called after the locator executes with the final state.
+    #[inline]
+    fn on_asset_located(
+        &self,
+        _ctx: &SpanContext,
+        _asset: &AssetCacheKey,
+        _state: TracerAssetState,
+    ) {
+    }
 
     /// Called when an asset is resolved with a value.
     #[inline]

@@ -67,6 +67,20 @@ impl FromMeta for OutputEq {
     }
 }
 
+/// Debug format option: `debug = "format string"`
+#[derive(Debug, Default)]
+pub enum DebugFormat {
+    #[default]
+    Derive,
+    Custom(String),
+}
+
+impl FromMeta for DebugFormat {
+    fn from_string(value: &str) -> darling::Result<Self> {
+        Ok(DebugFormat::Custom(value.to_string()))
+    }
+}
+
 /// Options for the `#[query]` attribute.
 #[derive(Debug, Default, FromMeta)]
 pub struct QueryAttr {
@@ -88,6 +102,11 @@ pub struct QueryAttr {
     /// Mutually exclusive with `keys`.
     #[darling(default)]
     singleton: bool,
+
+    /// Custom debug format string: `debug = "Fetch({id})"`.
+    /// Uses std::fmt syntax: `{field}` for Display, `{field:?}` for Debug.
+    #[darling(default)]
+    debug: DebugFormat,
 }
 
 /// A parsed function parameter.
@@ -102,6 +121,169 @@ struct ParsedFn {
     name: Ident,
     params: Vec<Param>,
     output_ty: Type,
+}
+
+/// A segment of a parsed debug format string.
+#[derive(Debug, PartialEq)]
+enum FormatSegment {
+    /// Literal text (e.g., "Fetch(" or ")")
+    Literal(String),
+    /// Field reference with optional format specifier
+    /// `{field}` -> Display, `{field:?}` -> Debug, `{field:#?}` -> Pretty Debug
+    Field { name: String, specifier: String },
+}
+
+/// Parse a format string into segments.
+/// Handles `{field}`, `{field:?}`, `{field:#?}`, `{{`, and `}}`.
+fn parse_format_string(format: &str) -> Result<Vec<FormatSegment>, String> {
+    let mut segments = Vec::new();
+    let mut chars = format.chars().peekable();
+    let mut current_literal = String::new();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                // Check for escaped brace
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    current_literal.push('{');
+                } else {
+                    // Flush current literal
+                    if !current_literal.is_empty() {
+                        segments.push(FormatSegment::Literal(current_literal.clone()));
+                        current_literal.clear();
+                    }
+                    // Parse field reference
+                    let mut field_content = String::new();
+                    let mut found_close = false;
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            found_close = true;
+                            break;
+                        }
+                        field_content.push(ch);
+                    }
+                    if !found_close {
+                        return Err("unclosed `{` in format string".to_string());
+                    }
+
+                    // Parse field name and specifier
+                    let (name, specifier) = if let Some(colon_pos) = field_content.find(':') {
+                        (
+                            field_content[..colon_pos].to_string(),
+                            field_content[colon_pos + 1..].to_string(),
+                        )
+                    } else {
+                        (field_content, String::new())
+                    };
+
+                    if name.is_empty() {
+                        return Err("empty field name in format string".to_string());
+                    }
+
+                    segments.push(FormatSegment::Field { name, specifier });
+                }
+            }
+            '}' => {
+                // Check for escaped brace
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    current_literal.push('}');
+                } else {
+                    return Err("unmatched `}` in format string".to_string());
+                }
+            }
+            _ => {
+                current_literal.push(c);
+            }
+        }
+    }
+
+    // Flush remaining literal
+    if !current_literal.is_empty() {
+        segments.push(FormatSegment::Literal(current_literal));
+    }
+
+    Ok(segments)
+}
+
+/// Validate that all field references in segments exist in params.
+fn validate_format_fields(segments: &[FormatSegment], params: &[Param]) -> Result<(), Error> {
+    for segment in segments {
+        if let FormatSegment::Field { name, .. } = segment {
+            if !params.iter().any(|p| p.name == name.as_str()) {
+                return Err(Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("unknown field `{}` in debug format string", name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Generate a custom Debug impl from the format string.
+fn generate_custom_debug(
+    struct_name: &Ident,
+    format: &str,
+    params: &[Param],
+) -> Result<TokenStream, Error> {
+    let segments =
+        parse_format_string(format).map_err(|e| Error::new(proc_macro2::Span::call_site(), e))?;
+
+    validate_format_fields(&segments, params)?;
+
+    // Build the write! format string and arguments
+    let mut fmt_string = String::new();
+    let mut fmt_args: Vec<TokenStream> = Vec::new();
+
+    for segment in &segments {
+        match segment {
+            FormatSegment::Literal(text) => {
+                // Escape any braces for the write! macro
+                for c in text.chars() {
+                    if c == '{' {
+                        fmt_string.push_str("{{");
+                    } else if c == '}' {
+                        fmt_string.push_str("}}");
+                    } else {
+                        fmt_string.push(c);
+                    }
+                }
+            }
+            FormatSegment::Field { name, specifier } => {
+                let field_ident = format_ident!("{}", name);
+                if specifier.is_empty() {
+                    // Display formatting
+                    fmt_string.push_str("{}");
+                    fmt_args.push(quote! { &self.#field_ident });
+                } else if specifier == "?" {
+                    // Debug formatting
+                    fmt_string.push_str("{:?}");
+                    fmt_args.push(quote! { &self.#field_ident });
+                } else if specifier == "#?" {
+                    // Pretty Debug formatting
+                    fmt_string.push_str("{:#?}");
+                    fmt_args.push(quote! { &self.#field_ident });
+                } else {
+                    // Pass through other specifiers
+                    fmt_string.push('{');
+                    fmt_string.push(':');
+                    fmt_string.push_str(specifier);
+                    fmt_string.push('}');
+                    fmt_args.push(quote! { &self.#field_ident });
+                }
+            }
+        }
+    }
+
+    Ok(quote! {
+        impl ::std::fmt::Debug for #struct_name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, #fmt_string #(, #fmt_args)*)
+            }
+        }
+    })
 }
 
 pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, Error> {
@@ -159,7 +341,7 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
     };
 
     // Generate struct definition (with Hash/Eq based on key_params)
-    let struct_def = generate_struct(&parsed, &struct_name, &key_params);
+    let struct_def = generate_struct(&parsed, &struct_name, &key_params, &attr.debug)?;
 
     // Generate Query impl
     let query_impl = generate_query_impl(&parsed, &struct_name, &attr)?;
@@ -289,7 +471,12 @@ fn extract_arc_inner(ty: &Type) -> Option<Type> {
     None
 }
 
-fn generate_struct(parsed: &ParsedFn, struct_name: &Ident, key_params: &[&Param]) -> TokenStream {
+fn generate_struct(
+    parsed: &ParsedFn,
+    struct_name: &Ident,
+    key_params: &[&Param],
+    debug: &DebugFormat,
+) -> Result<TokenStream, Error> {
     let vis = &parsed.vis;
     let fields: Vec<_> = parsed
         .params
@@ -382,13 +569,22 @@ fn generate_struct(parsed: &ParsedFn, struct_name: &Ident, key_params: &[&Param]
         }
     };
 
-    let derives = if all_fields_are_keys {
-        quote! { #[derive(Clone, Debug, Hash, PartialEq, Eq)] }
-    } else {
-        quote! { #[derive(Clone, Debug)] }
+    // Determine if we use derive(Debug) or custom Debug impl
+    let use_derive_debug = matches!(debug, DebugFormat::Derive);
+
+    let derives = match (all_fields_are_keys, use_derive_debug) {
+        (true, true) => quote! { #[derive(Clone, Debug, Hash, PartialEq, Eq)] },
+        (true, false) => quote! { #[derive(Clone, Hash, PartialEq, Eq)] },
+        (false, true) => quote! { #[derive(Clone, Debug)] },
+        (false, false) => quote! { #[derive(Clone)] },
     };
 
-    quote! {
+    let custom_debug_impl = match debug {
+        DebugFormat::Derive => quote! {},
+        DebugFormat::Custom(format) => generate_custom_debug(struct_name, format, &parsed.params)?,
+    };
+
+    Ok(quote! {
         #derives
         #vis struct #struct_name {
             #( #fields ),*
@@ -396,7 +592,8 @@ fn generate_struct(parsed: &ParsedFn, struct_name: &Ident, key_params: &[&Param]
 
         #new_impl
         #hash_eq_impl
-    }
+        #custom_debug_impl
+    })
 }
 
 fn generate_query_impl(
@@ -670,6 +867,7 @@ mod tests {
             keys: Keys(Some(vec![format_ident!("a")])),
             name: None,
             singleton: false,
+            debug: DebugFormat::Derive,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -737,6 +935,7 @@ mod tests {
             keys: Keys(Some(vec![format_ident!("a"), format_ident!("c")])),
             name: None,
             singleton: false,
+            debug: DebugFormat::Derive,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -805,6 +1004,7 @@ mod tests {
             keys: Keys(Some(vec![format_ident!("a"), format_ident!("b")])),
             name: None,
             singleton: false,
+            debug: DebugFormat::Derive,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -857,6 +1057,7 @@ mod tests {
             keys: Keys(Some(vec![format_ident!("unknown")])),
             name: None,
             singleton: false,
+            debug: DebugFormat::Derive,
         };
         let result = generate_query(attr, input_fn);
 
@@ -881,6 +1082,7 @@ mod tests {
             keys: Keys(Some(vec![])),
             name: None,
             singleton: false,
+            debug: DebugFormat::Derive,
         };
         let result = generate_query(attr, input_fn);
 
@@ -903,6 +1105,7 @@ mod tests {
             keys: Keys(None),
             name: None,
             singleton: true,
+            debug: DebugFormat::Derive,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -967,6 +1170,7 @@ mod tests {
             keys: Keys(Some(vec![format_ident!("a")])),
             name: None,
             singleton: true,
+            debug: DebugFormat::Derive,
         };
         let result = generate_query(attr, input_fn);
 
@@ -975,5 +1179,211 @@ mod tests {
         assert!(err
             .to_string()
             .contains("`singleton` and `keys` are mutually exclusive"));
+    }
+
+    #[test]
+    fn test_query_macro_custom_debug() {
+        // Test custom debug format string
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn fetch_user(db: &impl Db, id: u64, include_deleted: bool) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("Fetch({id})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Debug impl instead of derive
+        let expected = quote! {
+            fn fetch_user(db: &impl Db, id: u64, include_deleted: bool) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            struct FetchUser {
+                pub id: u64,
+                pub include_deleted: bool
+            }
+
+            impl FetchUser {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64, include_deleted: bool) -> Self {
+                    Self { id, include_deleted }
+                }
+            }
+
+            impl ::std::fmt::Debug for FetchUser {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "Fetch({})", &self.id)
+                }
+            }
+
+            impl ::query_flow::Query for FetchUser {
+                type Output = String;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    fetch_user(db, self.id, self.include_deleted).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_debug_unknown_field_error() {
+        // Test that referencing an unknown field in debug format produces an error
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn bad_debug(db: &impl Db, id: u64) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("Query({unknown_field})".to_string()),
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown field `unknown_field` in debug format string"));
+    }
+
+    #[test]
+    fn test_query_macro_debug_with_keys() {
+        // Test debug format combined with keys() subset
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn query_with_both(db: &impl Db, id: u64, opts: String) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("id")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("Query({id:?})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate custom Hash/Eq (for keys) AND custom Debug (for debug format)
+        let expected = quote! {
+            fn query_with_both(db: &impl Db, id: u64, opts: String) -> Result<i32, QueryError> {
+                Ok(42)
+            }
+
+            #[derive(Clone)]
+            struct QueryWithBoth {
+                pub id: u64,
+                pub opts: String
+            }
+
+            impl QueryWithBoth {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64, opts: String) -> Self {
+                    Self { id, opts }
+                }
+            }
+
+            impl ::std::hash::Hash for QueryWithBoth {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.id.hash(state);
+                }
+            }
+
+            impl ::std::cmp::PartialEq for QueryWithBoth {
+                fn eq(&self, other: &Self) -> bool {
+                    self.id == other.id
+                }
+            }
+
+            impl ::std::cmp::Eq for QueryWithBoth {}
+
+            impl ::std::fmt::Debug for QueryWithBoth {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "Query({:?})", &self.id)
+                }
+            }
+
+            impl ::query_flow::Query for QueryWithBoth {
+                type Output = i32;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    query_with_both(db, self.id, self.opts).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_parse_format_string() {
+        // Test the format string parser directly
+        let result = parse_format_string("Fetch({id})").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::Literal("Fetch(".to_string()),
+                FormatSegment::Field {
+                    name: "id".to_string(),
+                    specifier: String::new()
+                },
+                FormatSegment::Literal(")".to_string()),
+            ]
+        );
+
+        // Test with Debug specifier
+        let result = parse_format_string("Query({name:?})").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::Literal("Query(".to_string()),
+                FormatSegment::Field {
+                    name: "name".to_string(),
+                    specifier: "?".to_string()
+                },
+                FormatSegment::Literal(")".to_string()),
+            ]
+        );
+
+        // Test with escaped braces
+        let result = parse_format_string("{{literal}} {field}").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::Literal("{literal} ".to_string()),
+                FormatSegment::Field {
+                    name: "field".to_string(),
+                    specifier: String::new()
+                },
+            ]
+        );
+
+        // Test error cases
+        assert!(parse_format_string("unclosed {brace").is_err());
+        assert!(parse_format_string("unmatched }").is_err());
+        assert!(parse_format_string("empty {}").is_err());
     }
 }

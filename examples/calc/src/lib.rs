@@ -48,7 +48,8 @@ pub struct Variable(pub String);
 // ============================================================================
 
 /// Parse source text into an expression.
-#[query]
+/// Uses custom debug format for cleaner trace output.
+#[query(debug = "Parse({file_name:?})")]
 pub fn parse_expr(db: &impl Db, file_name: String) -> Result<Expr, QueryError> {
     // Get source from asset, default to empty string if not found
     let source = db
@@ -60,7 +61,8 @@ pub fn parse_expr(db: &impl Db, file_name: String) -> Result<Expr, QueryError> {
 }
 
 /// Evaluate an expression from a file.
-#[query]
+/// Uses custom debug format for cleaner trace output.
+#[query(debug = "Eval({file_name:?})")]
 pub fn eval_file(db: &impl Db, file_name: String) -> Result<i64, QueryError> {
     let expr = db.query(ParseExpr::new(file_name.clone()))?;
     eval_expr(db, &expr)
@@ -254,25 +256,25 @@ mod tests {
                         changed: true
                     },
                     QueryStart {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }")
+                        query: q("calc::EvalFile", "Eval(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         valid: false
                     },
                     DependencyRegistered {
-                        parent: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
-                        dependency: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
+                        dependency: q("calc::ParseExpr", "Parse(\"main\")"),
                     },
                     QueryStart {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }")
+                        query: q("calc::ParseExpr", "Parse(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         valid: false
                     },
                     AssetDependencyRegistered {
-                        parent: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        parent: q("calc::ParseExpr", "Parse(\"main\")"),
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
@@ -280,19 +282,19 @@ mod tests {
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         result: Changed
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         result: Changed
                     },
                 ]
@@ -339,25 +341,25 @@ mod tests {
                         changed: true
                     },
                     QueryStart {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }")
+                        query: q("calc::EvalFile", "Eval(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         valid: false
                     },
                     DependencyRegistered {
-                        parent: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
-                        dependency: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
+                        dependency: q("calc::ParseExpr", "Parse(\"main\")"),
                     },
                     QueryStart {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }")
+                        query: q("calc::ParseExpr", "Parse(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         valid: false
                     },
                     AssetDependencyRegistered {
-                        parent: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        parent: q("calc::ParseExpr", "Parse(\"main\")"),
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
@@ -365,16 +367,16 @@ mod tests {
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         result: Changed
                     },
                     // x variable lookup
                     AssetDependencyRegistered {
-                        parent: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
                         asset: a("calc::Variable", "Variable(\"x\")"),
                     },
                     AssetRequested {
@@ -383,7 +385,7 @@ mod tests {
                     },
                     // y variable lookup
                     AssetDependencyRegistered {
-                        parent: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
                         asset: a("calc::Variable", "Variable(\"y\")"),
                     },
                     AssetRequested {
@@ -391,11 +393,11 @@ mod tests {
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         result: Changed
                     },
                 ]
@@ -432,25 +434,25 @@ mod tests {
                         changed: true
                     },
                     QueryStart {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }")
+                        query: q("calc::EvalFile", "Eval(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         valid: false
                     },
                     DependencyRegistered {
-                        parent: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
-                        dependency: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        parent: q("calc::EvalFile", "Eval(\"main\")"),
+                        dependency: q("calc::ParseExpr", "Parse(\"main\")"),
                     },
                     QueryStart {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }")
+                        query: q("calc::ParseExpr", "Parse(\"main\")")
                     },
                     CacheCheck {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         valid: false
                     },
                     AssetDependencyRegistered {
-                        parent: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        parent: q("calc::ParseExpr", "Parse(\"main\")"),
                         asset: a("calc::SourceFile", "SourceFile(\"main\")"),
                     },
                     AssetRequested {
@@ -458,19 +460,19 @@ mod tests {
                         state: AssetState::Ready
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::ParseExpr", "ParseExpr { file_name: \"main\" }"),
+                        query: q("calc::ParseExpr", "Parse(\"main\")"),
                         result: Changed
                     },
                     EarlyCutoffCheck {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         output_changed: true
                     },
                     QueryEnd {
-                        query: q("calc::EvalFile", "EvalFile { file_name: \"main\" }"),
+                        query: q("calc::EvalFile", "Eval(\"main\")"),
                         result: Changed
                     },
                 ]

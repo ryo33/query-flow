@@ -172,6 +172,12 @@ impl<E: std::error::Error + Send + Sync + 'static> TypedErr<E> {
     }
 }
 
+impl<E> From<TypedErr<E>> for QueryError {
+    fn from(err: TypedErr<E>) -> Self {
+        QueryError::UserError(err.arc)
+    }
+}
+
 impl<E: std::error::Error + Send + Sync + 'static> Deref for TypedErr<E> {
     type Target = E;
 

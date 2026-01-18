@@ -57,8 +57,8 @@ mod tracer_impl;
 
 pub use collector::EventCollector;
 pub use events::{
-    to_kinds, AssetKey, AssetState, EventKind, ExecutionResult, ExecutionTrace, FlowEvent,
-    InvalidationReason, QueryKey, SpanId,
+    to_kinds, AssetKey, AssetState, CycleKey, EventKind, ExecutionResult, ExecutionTrace,
+    FlowEvent, InvalidationReason, QueryKey, SpanId,
 };
 pub use sink::{EventSink, FilterSink, MultiplexSink, NullSink};
 pub use span_context::new_span_id;

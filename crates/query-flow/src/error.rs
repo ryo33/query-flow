@@ -30,10 +30,11 @@ pub enum QueryError {
     /// Dependency cycle detected.
     ///
     /// The query graph contains a cycle, which would cause infinite recursion.
-    /// The `path` contains a debug representation of the cycle.
+    /// The `path` contains the cache keys forming the cycle, which may include
+    /// both queries and assets when asset locators are involved.
     Cycle {
-        /// Debug representation of the queries forming the cycle.
-        path: Vec<String>,
+        /// The cache keys forming the cycle.
+        path: Vec<FullCacheKey>,
     },
 
     /// Query execution was cancelled.
@@ -80,7 +81,8 @@ impl fmt::Display for QueryError {
                 write!(f, "query suspended: waiting for {}", asset.debug_repr())
             }
             QueryError::Cycle { path } => {
-                write!(f, "dependency cycle detected: {}", path.join(" -> "))
+                let path_str: Vec<String> = path.iter().map(|k| k.debug_repr()).collect();
+                write!(f, "dependency cycle detected: {}", path_str.join(" -> "))
             }
             QueryError::Cancelled => write!(f, "query cancelled"),
             QueryError::MissingDependency { description } => {

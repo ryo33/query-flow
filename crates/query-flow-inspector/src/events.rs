@@ -11,8 +11,8 @@ pub use query_flow::SpanId;
 
 // Import tracer types for From impls
 use query_flow::{
-    ExecutionResult as TracerExecutionResult, InvalidationReason as TracerInvalidationReason,
-    TracerAssetKey, TracerAssetState, TracerQueryKey,
+    AssetCacheKey, ExecutionResult as TracerExecutionResult, FullCacheKey,
+    InvalidationReason as TracerInvalidationReason, QueryCacheKey, TracerAssetState,
 };
 
 /// Represents a query key in a type-erased manner.
@@ -33,11 +33,20 @@ impl QueryKey {
     }
 }
 
-impl From<TracerQueryKey> for QueryKey {
-    fn from(key: TracerQueryKey) -> Self {
+impl From<&FullCacheKey> for QueryKey {
+    fn from(key: &FullCacheKey) -> Self {
         Self {
-            query_type: key.query_type.to_string(),
-            cache_key_debug: key.cache_key_debug,
+            query_type: key.type_name().to_string(),
+            cache_key_debug: key.debug_repr(),
+        }
+    }
+}
+
+impl From<&QueryCacheKey> for QueryKey {
+    fn from(key: &QueryCacheKey) -> Self {
+        Self {
+            query_type: key.type_name().to_string(),
+            cache_key_debug: key.debug_repr(),
         }
     }
 }
@@ -60,11 +69,47 @@ impl AssetKey {
     }
 }
 
-impl From<TracerAssetKey> for AssetKey {
-    fn from(key: TracerAssetKey) -> Self {
+impl From<&FullCacheKey> for AssetKey {
+    fn from(key: &FullCacheKey) -> Self {
         Self {
-            asset_type: key.asset_type.to_string(),
-            key_debug: key.key_debug,
+            asset_type: key.type_name().to_string(),
+            key_debug: key.debug_repr(),
+        }
+    }
+}
+
+impl From<&AssetCacheKey> for AssetKey {
+    fn from(key: &AssetCacheKey) -> Self {
+        Self {
+            asset_type: key.type_name().to_string(),
+            key_debug: key.debug_repr(),
+        }
+    }
+}
+
+/// Represents a key in a cycle path, which can be either a query or an asset.
+///
+/// Cycles can involve both queries and assets when asset locators call queries
+/// or other assets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CycleKey {
+    /// A query in the cycle path.
+    Query(QueryKey),
+    /// An asset in the cycle path.
+    Asset(AssetKey),
+}
+
+impl From<&FullCacheKey> for CycleKey {
+    fn from(key: &FullCacheKey) -> Self {
+        match key {
+            FullCacheKey::Query(q) => CycleKey::Query(q.into()),
+            FullCacheKey::Asset(a) => CycleKey::Asset(a.into()),
+            FullCacheKey::QuerySetSentinel(s) => {
+                CycleKey::Query(QueryKey::new(s.type_name(), "sentinel"))
+            }
+            FullCacheKey::AssetKeySetSentinel(s) => {
+                CycleKey::Asset(AssetKey::new(s.type_name(), "sentinel"))
+            }
         }
     }
 }
@@ -86,14 +131,14 @@ impl From<TracerInvalidationReason> for InvalidationReason {
     fn from(reason: TracerInvalidationReason) -> Self {
         match reason {
             TracerInvalidationReason::DependencyChanged { dep } => {
-                InvalidationReason::DependencyChanged { dep: dep.into() }
+                InvalidationReason::DependencyChanged { dep: (&dep).into() }
             }
             TracerInvalidationReason::AssetChanged { asset } => InvalidationReason::AssetChanged {
-                asset: asset.into(),
+                asset: (&asset).into(),
             },
             TracerInvalidationReason::ManualInvalidation => InvalidationReason::ManualInvalidation,
             TracerInvalidationReason::AssetRemoved { asset } => InvalidationReason::AssetRemoved {
-                asset: asset.into(),
+                asset: (&asset).into(),
             },
         }
     }
@@ -221,7 +266,9 @@ pub enum FlowEvent {
 
     // === Error Events ===
     /// Dependency cycle was detected.
-    CycleDetected { path: Vec<QueryKey> },
+    ///
+    /// The path can contain both queries and assets since cycles may involve asset locators.
+    CycleDetected { path: Vec<CycleKey> },
 
     /// Missing dependency error occurred.
     MissingDependency {
@@ -278,7 +325,7 @@ pub enum EventKind {
         reason: InvalidationReason,
     },
     CycleDetected {
-        path: Vec<QueryKey>,
+        path: Vec<CycleKey>,
     },
     MissingDependency {
         query: QueryKey,
@@ -414,7 +461,10 @@ fn matches_query(event: &FlowEvent, query: &QueryKey) -> bool {
             parent, dependency, ..
         } => parent == query || dependency == query,
         FlowEvent::AssetDependencyRegistered { parent, .. } => parent == query,
-        FlowEvent::CycleDetected { path } => path.contains(query),
+        FlowEvent::CycleDetected { path } => path.iter().any(|k| match k {
+            CycleKey::Query(q) => q == query,
+            CycleKey::Asset(_) => false,
+        }),
         _ => false,
     }
 }

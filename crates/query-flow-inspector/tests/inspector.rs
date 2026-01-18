@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
 use query_flow_inspector::{
-    to_kinds, AssetKey, AssetState, EventCollector, EventKind, EventSinkTracer, ExecutionResult,
-    QueryKey,
+    to_kinds, AssetKey, AssetState, CycleKey, EventCollector, EventKind, EventSinkTracer,
+    ExecutionResult, QueryKey,
 };
 
 // ============================================================================
@@ -451,7 +451,20 @@ fn test_cycle_detection_events() {
                 )
             },
             EventKind::CycleDetected {
-                path: vec![q("", "CycleA(1)"), q("", "CycleB(1)"), q("", "CycleA(1)"),]
+                path: vec![
+                    CycleKey::Query(q(
+                        "inspector::test_cycle_detection_events::CycleA",
+                        "CycleA(1)"
+                    )),
+                    CycleKey::Query(q(
+                        "inspector::test_cycle_detection_events::CycleB",
+                        "CycleB(1)"
+                    )),
+                    CycleKey::Query(q(
+                        "inspector::test_cycle_detection_events::CycleA",
+                        "CycleA(1)"
+                    )),
+                ]
             },
             QueryEnd {
                 query: q(

@@ -37,11 +37,18 @@ impl<T: Eq + 'static> DynEq for T {
 pub trait CacheKey: DynHash + DynEq + Debug + Send + Sync {
     /// Get the key as `Any` for downcasting.
     fn as_any(&self) -> &dyn Any;
+
+    /// Get the type name for this key.
+    fn type_name(&self) -> &'static str;
 }
 
 impl<T: Hash + Eq + Debug + Send + Sync + 'static> CacheKey for T {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
     }
 }
 
@@ -84,6 +91,11 @@ impl QueryCacheKey {
     /// Get a reference to the type-erased key.
     pub fn key(&self) -> &Arc<dyn CacheKey> {
         &self.key
+    }
+
+    /// Get the type name for this query key.
+    pub fn type_name(&self) -> &'static str {
+        self.key.type_name()
     }
 }
 
@@ -145,6 +157,11 @@ impl AssetCacheKey {
     pub fn key(&self) -> &Arc<dyn CacheKey> {
         &self.key
     }
+
+    /// Get the type name for this asset key.
+    pub fn type_name(&self) -> &'static str {
+        self.key.type_name()
+    }
 }
 
 impl Debug for AssetCacheKey {
@@ -175,6 +192,7 @@ impl Eq for AssetCacheKey {}
 #[derive(Clone, Copy)]
 pub struct QuerySetSentinelKey {
     query_type: TypeId,
+    type_name: &'static str,
 }
 
 impl QuerySetSentinelKey {
@@ -182,12 +200,18 @@ impl QuerySetSentinelKey {
     pub fn new<Q: 'static>() -> Self {
         Self {
             query_type: TypeId::of::<Q>(),
+            type_name: std::any::type_name::<Q>(),
         }
     }
 
     /// Get the query type ID.
     pub fn query_type(&self) -> TypeId {
         self.query_type
+    }
+
+    /// Get the type name for this query set sentinel.
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
     }
 }
 
@@ -218,6 +242,7 @@ impl Eq for QuerySetSentinelKey {}
 #[derive(Clone, Copy)]
 pub struct AssetKeySetSentinelKey {
     asset_key_type: TypeId,
+    type_name: &'static str,
 }
 
 impl AssetKeySetSentinelKey {
@@ -225,12 +250,18 @@ impl AssetKeySetSentinelKey {
     pub fn new<K: 'static>() -> Self {
         Self {
             asset_key_type: TypeId::of::<K>(),
+            type_name: std::any::type_name::<K>(),
         }
     }
 
     /// Get the asset key type ID.
     pub fn asset_key_type(&self) -> TypeId {
         self.asset_key_type
+    }
+
+    /// Get the type name for this asset key set sentinel.
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
     }
 }
 
@@ -298,6 +329,16 @@ impl FullCacheKey {
             FullCacheKey::Query(k) => Some(k.key()),
             FullCacheKey::Asset(k) => Some(k.key()),
             FullCacheKey::QuerySetSentinel(_) | FullCacheKey::AssetKeySetSentinel(_) => None,
+        }
+    }
+
+    /// Get the type name for this key.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            FullCacheKey::Query(k) => k.type_name(),
+            FullCacheKey::Asset(k) => k.type_name(),
+            FullCacheKey::QuerySetSentinel(k) => k.type_name(),
+            FullCacheKey::AssetKeySetSentinel(k) => k.type_name(),
         }
     }
 }

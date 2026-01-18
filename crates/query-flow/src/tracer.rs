@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use query_flow::{QueryRuntime, Tracer, SpanId};
+//! use query_flow::{QueryRuntime, Tracer, SpanId, QueryCacheKey};
 //!
 //! // Custom tracer implementation
 //! struct MyTracer;
@@ -17,7 +17,7 @@
 //!         SpanId(1)
 //!     }
 //!
-//!     fn on_query_start(&self, span_id: SpanId, query: TracerQueryKey) {
+//!     fn on_query_start(&self, span_id: SpanId, query: &QueryCacheKey) {
 //!         println!("Query started: {:?}", query);
 //!     }
 //! }
@@ -28,51 +28,11 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::key::FullCacheKey;
+use crate::key::{AssetCacheKey, FullCacheKey, QueryCacheKey};
 
 /// Unique identifier for a query execution span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanId(pub u64);
-
-/// Represents a query key in a type-erased manner for tracing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TracerQueryKey {
-    /// The query type name (e.g., "calc::ParseExpr")
-    pub query_type: &'static str,
-    /// Debug representation of the cache key (e.g., "(\"main.txt\",)")
-    pub cache_key_debug: String,
-}
-
-impl TracerQueryKey {
-    /// Create a new tracer query key.
-    #[inline]
-    pub fn new(query_type: &'static str, cache_key_debug: impl Into<String>) -> Self {
-        Self {
-            query_type,
-            cache_key_debug: cache_key_debug.into(),
-        }
-    }
-}
-
-/// Represents an asset key in a type-erased manner for tracing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TracerAssetKey {
-    /// The asset type name (e.g., "calc::SourceFile")
-    pub asset_type: &'static str,
-    /// Debug representation of the key (e.g., "SourceFile(\"main.txt\")")
-    pub key_debug: String,
-}
-
-impl TracerAssetKey {
-    /// Create a new tracer asset key.
-    #[inline]
-    pub fn new(asset_type: &'static str, key_debug: impl Into<String>) -> Self {
-        Self {
-            asset_type,
-            key_debug: key_debug.into(),
-        }
-    }
-}
 
 /// Query execution result classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,13 +66,13 @@ pub enum TracerAssetState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidationReason {
     /// A dependency query changed its output.
-    DependencyChanged { dep: TracerQueryKey },
+    DependencyChanged { dep: FullCacheKey },
     /// An asset dependency was updated.
-    AssetChanged { asset: TracerAssetKey },
+    AssetChanged { asset: FullCacheKey },
     /// Manual invalidation was triggered.
     ManualInvalidation,
     /// An asset was removed.
-    AssetRemoved { asset: TracerAssetKey },
+    AssetRemoved { asset: FullCacheKey },
 }
 
 /// Tracer trait for observing query-flow execution.
@@ -135,24 +95,26 @@ pub trait Tracer: Send + Sync + 'static {
     fn new_span_id(&self) -> SpanId;
 
     /// Called when a query execution starts.
+    ///
+    /// Use `query.type_name()` to get the query type and `query.debug_repr()` for the key.
     #[inline]
-    fn on_query_start(&self, _span_id: SpanId, _query: TracerQueryKey) {}
+    fn on_query_start(&self, _span_id: SpanId, _query: &QueryCacheKey) {}
 
     /// Called when cache validity is checked.
     #[inline]
-    fn on_cache_check(&self, _span_id: SpanId, _query: TracerQueryKey, _valid: bool) {}
+    fn on_cache_check(&self, _span_id: SpanId, _query: &QueryCacheKey, _valid: bool) {}
 
     /// Called when a query execution ends.
     #[inline]
-    fn on_query_end(&self, _span_id: SpanId, _query: TracerQueryKey, _result: ExecutionResult) {}
+    fn on_query_end(&self, _span_id: SpanId, _query: &QueryCacheKey, _result: ExecutionResult) {}
 
     /// Called when a query dependency is registered during execution.
     #[inline]
     fn on_dependency_registered(
         &self,
         _span_id: SpanId,
-        _parent: TracerQueryKey,
-        _dependency: TracerQueryKey,
+        _parent: &FullCacheKey,
+        _dependency: &FullCacheKey,
     ) {
     }
 
@@ -161,8 +123,8 @@ pub trait Tracer: Send + Sync + 'static {
     fn on_asset_dependency_registered(
         &self,
         _span_id: SpanId,
-        _parent: TracerQueryKey,
-        _asset: TracerAssetKey,
+        _parent: &FullCacheKey,
+        _asset: &FullCacheKey,
     ) {
     }
 
@@ -171,63 +133,36 @@ pub trait Tracer: Send + Sync + 'static {
     fn on_early_cutoff_check(
         &self,
         _span_id: SpanId,
-        _query: TracerQueryKey,
+        _query: &QueryCacheKey,
         _output_changed: bool,
     ) {
     }
 
     /// Called when an asset is requested.
     #[inline]
-    fn on_asset_requested(&self, _asset: TracerAssetKey, _state: TracerAssetState) {}
+    fn on_asset_requested(&self, _asset: &AssetCacheKey, _state: TracerAssetState) {}
 
     /// Called when an asset is resolved with a value.
     #[inline]
-    fn on_asset_resolved(&self, _asset: TracerAssetKey, _changed: bool) {}
+    fn on_asset_resolved(&self, _asset: &AssetCacheKey, _changed: bool) {}
 
     /// Called when an asset is invalidated.
     #[inline]
-    fn on_asset_invalidated(&self, _asset: TracerAssetKey) {}
+    fn on_asset_invalidated(&self, _asset: &AssetCacheKey) {}
 
     /// Called when a query is invalidated.
     #[inline]
-    fn on_query_invalidated(&self, _query: TracerQueryKey, _reason: InvalidationReason) {}
+    fn on_query_invalidated(&self, _query: &QueryCacheKey, _reason: InvalidationReason) {}
 
     /// Called when a dependency cycle is detected.
+    ///
+    /// The path can contain both queries and assets since cycles may involve asset locators.
     #[inline]
-    fn on_cycle_detected(&self, _path: Vec<TracerQueryKey>) {}
+    fn on_cycle_detected(&self, _path: &[FullCacheKey]) {}
 
     /// Called when a missing dependency error occurs.
     #[inline]
-    fn on_missing_dependency(&self, _query: TracerQueryKey, _dependency_description: String) {}
-
-    /// Called when a query is accessed, providing the [`FullCacheKey`] for GC tracking.
-    ///
-    /// This is called at the start of each query execution, before `on_query_start`.
-    /// Use this to track access times or reference counts for garbage collection.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use query_flow::{FullCacheKey, Tracer, SpanId};
-    /// use std::collections::HashMap;
-    /// use std::sync::Mutex;
-    /// use std::time::Instant;
-    ///
-    /// struct GcTracer {
-    ///     access_times: Mutex<HashMap<FullCacheKey, Instant>>,
-    /// }
-    ///
-    /// impl Tracer for GcTracer {
-    ///     fn new_span_id(&self) -> SpanId { SpanId(0) }
-    ///
-    ///     fn on_query_key(&self, full_key: &FullCacheKey) {
-    ///         self.access_times.lock().unwrap()
-    ///             .insert(full_key.clone(), Instant::now());
-    ///     }
-    /// }
-    /// ```
-    #[inline]
-    fn on_query_key(&self, _full_key: &FullCacheKey) {}
+    fn on_missing_dependency(&self, _query: &QueryCacheKey, _dependency_description: &str) {}
 }
 
 /// Zero-cost tracer that discards all events.
@@ -249,6 +184,7 @@ impl Tracer for NoopTracer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::key::QueryCacheKey;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
@@ -271,11 +207,11 @@ mod tests {
             SpanId(1)
         }
 
-        fn on_query_start(&self, _span_id: SpanId, _query: TracerQueryKey) {
+        fn on_query_start(&self, _span_id: SpanId, _query: &QueryCacheKey) {
             self.start_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn on_query_end(&self, _span_id: SpanId, _query: TracerQueryKey, _result: ExecutionResult) {
+        fn on_query_end(&self, _span_id: SpanId, _query: &QueryCacheKey, _result: ExecutionResult) {
             self.end_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -291,11 +227,11 @@ mod tests {
     #[test]
     fn test_counting_tracer() {
         let tracer = CountingTracer::new();
-        let key = TracerQueryKey::new("TestQuery", "()");
+        let key = QueryCacheKey::new(("TestQuery",));
 
-        tracer.on_query_start(SpanId(1), key.clone());
-        tracer.on_query_start(SpanId(2), key.clone());
-        tracer.on_query_end(SpanId(1), key, ExecutionResult::Changed);
+        tracer.on_query_start(SpanId(1), &key);
+        tracer.on_query_start(SpanId(2), &key);
+        tracer.on_query_end(SpanId(1), &key, ExecutionResult::Changed);
 
         assert_eq!(tracer.start_count.load(Ordering::Relaxed), 2);
         assert_eq!(tracer.end_count.load(Ordering::Relaxed), 1);

@@ -20,8 +20,7 @@ use crate::storage::{
     QueryRegistry, VerifierStorage,
 };
 use crate::tracer::{
-    ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetKey,
-    TracerAssetState, TracerQueryKey,
+    ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetState,
 };
 use crate::QueryError;
 
@@ -82,8 +81,8 @@ fn check_cycle(key: &FullCacheKey) -> Result<(), QueryError> {
     if cycle_detected {
         let path = QUERY_STACK.with(|stack| {
             let stack = stack.borrow();
-            let mut path: Vec<String> = stack.iter().map(|k| k.debug_repr().to_string()).collect();
-            path.push(key.debug_repr().to_string());
+            let mut path: Vec<FullCacheKey> = stack.iter().cloned().collect();
+            path.push(key.clone());
             path
         });
         return Err(QueryError::Cycle { path });
@@ -319,17 +318,14 @@ impl<T: Tracer> QueryRuntime<T> {
         &self,
         query: Q,
     ) -> Result<(Result<Arc<Q::Output>, Arc<anyhow::Error>>, RevisionCounter), QueryError> {
-        let full_key = QueryCacheKey::new(query.clone()).into();
-
-        // Emit query key event for GC tracking (before other events)
-        self.tracer.on_query_key(&full_key);
+        let query_cache_key = QueryCacheKey::new(query.clone());
+        let full_key: FullCacheKey = query_cache_key.clone().into();
 
         // Create execution context and emit start event
         let span_id = self.tracer.new_span_id();
         let exec_ctx = ExecutionContext::new(span_id);
-        let query_key = TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr());
 
-        self.tracer.on_query_start(span_id, query_key.clone());
+        self.tracer.on_query_start(span_id, &query_cache_key);
 
         // Check for cycles using thread-local stack
         let cycle_detected = QUERY_STACK.with(|stack| {
@@ -340,19 +336,14 @@ impl<T: Tracer> QueryRuntime<T> {
         if cycle_detected {
             let path = QUERY_STACK.with(|stack| {
                 let stack = stack.borrow();
-                let mut path: Vec<String> =
-                    stack.iter().map(|k| k.debug_repr().to_string()).collect();
-                path.push(full_key.debug_repr().to_string());
+                let mut path: Vec<FullCacheKey> = stack.iter().cloned().collect();
+                path.push(full_key.clone());
                 path
             });
 
-            self.tracer.on_cycle_detected(
-                path.iter()
-                    .map(|s| TracerQueryKey::new("", s.clone()))
-                    .collect(),
-            );
+            self.tracer.on_cycle_detected(&path);
             self.tracer
-                .on_query_end(span_id, query_key.clone(), ExecutionResult::CycleDetected);
+                .on_query_end(span_id, &query_cache_key, ExecutionResult::CycleDetected);
 
             return Err(QueryError::Cycle { path });
         }
@@ -364,9 +355,9 @@ impl<T: Tracer> QueryRuntime<T> {
         if self.whale.is_verified_at(&full_key, &current_rev) {
             // Single atomic access to get both cached value and revision
             if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
-                self.tracer.on_cache_check(span_id, query_key.clone(), true);
+                self.tracer.on_cache_check(span_id, &query_cache_key, true);
                 self.tracer
-                    .on_query_end(span_id, query_key.clone(), ExecutionResult::CacheHit);
+                    .on_query_end(span_id, &query_cache_key, ExecutionResult::CacheHit);
 
                 return match cached {
                     CachedValue::Ok(output) => Ok((Ok(output), revision)),
@@ -401,9 +392,9 @@ impl<T: Tracer> QueryRuntime<T> {
                     // Deps didn't change their changed_at, mark as verified and use cached
                     self.whale.mark_verified(&full_key, &current_rev);
 
-                    self.tracer.on_cache_check(span_id, query_key.clone(), true);
+                    self.tracer.on_cache_check(span_id, &query_cache_key, true);
                     self.tracer
-                        .on_query_end(span_id, query_key.clone(), ExecutionResult::CacheHit);
+                        .on_query_end(span_id, &query_cache_key, ExecutionResult::CacheHit);
 
                     return match cached {
                         CachedValue::Ok(output) => Ok((Ok(output), revision)),
@@ -414,12 +405,11 @@ impl<T: Tracer> QueryRuntime<T> {
             }
         }
 
-        self.tracer
-            .on_cache_check(span_id, query_key.clone(), false);
+        self.tracer.on_cache_check(span_id, &query_cache_key, false);
 
         // Execute the query with cycle tracking
         let _guard = StackGuard::push(full_key.clone());
-        let result = self.execute_query::<Q>(&query, &full_key, exec_ctx);
+        let result = self.execute_query::<Q>(&query, &query_cache_key, &full_key, exec_ctx);
         drop(_guard);
 
         // Emit end event
@@ -433,7 +423,7 @@ impl<T: Tracer> QueryRuntime<T> {
             },
         };
         self.tracer
-            .on_query_end(span_id, query_key.clone(), exec_result);
+            .on_query_end(span_id, &query_cache_key, exec_result);
 
         result.map(|(inner_result, _, revision)| (inner_result, revision))
     }
@@ -447,6 +437,7 @@ impl<T: Tracer> QueryRuntime<T> {
     fn execute_query<Q: Query>(
         &self,
         query: &Q,
+        query_cache_key: &QueryCacheKey,
         full_key: &FullCacheKey,
         exec_ctx: ExecutionContext,
     ) -> Result<
@@ -470,7 +461,6 @@ impl<T: Tracer> QueryRuntime<T> {
         let ctx = QueryContext {
             runtime: self,
             current_key: full_key.clone(),
-            parent_query_type: std::any::type_name::<Q>(),
             exec_ctx,
             deps: RefCell::new(Vec::new()),
         };
@@ -507,7 +497,7 @@ impl<T: Tracer> QueryRuntime<T> {
                 // Emit early cutoff check event
                 self.tracer.on_early_cutoff_check(
                     exec_ctx.span_id(),
-                    TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
+                    query_cache_key,
                     output_changed,
                 );
 
@@ -566,7 +556,7 @@ impl<T: Tracer> QueryRuntime<T> {
                 // Emit early cutoff check event
                 self.tracer.on_early_cutoff_check(
                     exec_ctx.span_id(),
-                    TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
+                    query_cache_key,
                     output_changed,
                 );
 
@@ -617,12 +607,11 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// This also invalidates any queries that depend on this one.
     pub fn invalidate<Q: Query>(&self, query: &Q) {
-        let full_key: FullCacheKey = QueryCacheKey::new(query.clone()).into();
+        let query_cache_key = QueryCacheKey::new(query.clone());
+        let full_key: FullCacheKey = query_cache_key.clone().into();
 
-        self.tracer.on_query_invalidated(
-            TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
-            InvalidationReason::ManualInvalidation,
-        );
+        self.tracer
+            .on_query_invalidated(&query_cache_key, InvalidationReason::ManualInvalidation);
 
         // Update whale to invalidate dependents (register with None to clear cached value)
         // Use stable durability to increment all revision counters, ensuring queries
@@ -640,12 +629,11 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// This also invalidates any queries that depend on this one.
     pub fn remove_query<Q: Query>(&self, query: &Q) {
-        let full_key: FullCacheKey = QueryCacheKey::new(query.clone()).into();
+        let query_cache_key = QueryCacheKey::new(query.clone());
+        let full_key: FullCacheKey = query_cache_key.clone().into();
 
-        self.tracer.on_query_invalidated(
-            TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
-            InvalidationReason::ManualInvalidation,
-        );
+        self.tracer
+            .on_query_invalidated(&query_cache_key, InvalidationReason::ManualInvalidation);
 
         // Remove verifier if exists
         self.verifiers.remove(&full_key);
@@ -1059,10 +1047,9 @@ impl<T: Tracer> QueryRuntime<T> {
             .expect("update_with_compare with no dependencies cannot fail");
 
         // Emit asset resolved event (with changed status)
-        self.tracer.on_asset_resolved(
-            TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
-            result.changed,
-        );
+        let asset_cache_key = AssetCacheKey::new(key.clone());
+        self.tracer
+            .on_asset_resolved(&asset_cache_key, result.changed);
 
         // Register asset key in registry for list_asset_keys
         let is_new_asset = self.asset_key_registry.register(&key);
@@ -1116,10 +1103,9 @@ impl<T: Tracer> QueryRuntime<T> {
             .expect("update_with_compare with no dependencies cannot fail");
 
         // Emit asset resolved event
-        self.tracer.on_asset_resolved(
-            TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
-            result.changed,
-        );
+        let asset_cache_key = AssetCacheKey::new(key.clone());
+        self.tracer
+            .on_asset_resolved(&asset_cache_key, result.changed);
 
         // Register asset key in registry for list_asset_keys
         let is_new_asset = self.asset_key_registry.register(&key);
@@ -1150,10 +1136,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Emit asset invalidated event
-        self.tracer.on_asset_invalidated(TracerAssetKey::new(
-            std::any::type_name::<K>(),
-            format!("{:?}", key),
-        ));
+        self.tracer.on_asset_invalidated(&asset_cache_key);
 
         // Add to pending FIRST (before clearing whale state)
         // This ensures: readers see either old value, or Loading+pending
@@ -1222,11 +1205,8 @@ impl<T: Tracer> QueryRuntime<T> {
         let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Helper to emit AssetRequested event
-        let emit_requested = |tracer: &T, key: &K, state: TracerAssetState| {
-            tracer.on_asset_requested(
-                TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
-                state,
-            );
+        let emit_requested = |tracer: &T, asset_key: &AssetCacheKey, state: TracerAssetState| {
+            tracer.on_asset_requested(asset_key, state);
         };
 
         // Check whale cache first (single atomic read)
@@ -1263,7 +1243,7 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+                            emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
                             match arc.clone().downcast::<K::Asset>() {
                                 Ok(value) => {
                                     return Ok((AssetLoadingState::ready(key, value), changed_at))
@@ -1280,12 +1260,20 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
+                            emit_requested(
+                                &self.tracer,
+                                &asset_cache_key,
+                                TracerAssetState::NotFound,
+                            );
                             return Err(QueryError::UserError(err.clone()));
                         }
                         None => {
                             // Loading state - no value to be inconsistent with
-                            emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                            emit_requested(
+                                &self.tracer,
+                                &asset_cache_key,
+                                TracerAssetState::Loading,
+                            );
                             return Ok((AssetLoadingState::loading(key), changed_at));
                         }
                         _ => {
@@ -1315,7 +1303,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     value: arc,
                     durability: durability_level,
                 }) => {
-                    emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
 
                     let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                         Ok(v) => v,
@@ -1360,7 +1348,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                 }
                 Ok(ErasedLocateResult::Pending) => {
-                    emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
 
                     // Add to pending list for Pending result
                     self.pending
@@ -1420,7 +1408,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // No locator registered or locator returned None - mark as pending
         // (no locator was called, so no deps to track)
-        emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+        emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
         self.pending
             .insert::<K>(asset_cache_key.clone(), key.clone());
 
@@ -1461,11 +1449,8 @@ impl<T: Tracer> QueryRuntime<T> {
         let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Helper to emit AssetRequested event
-        let emit_requested = |tracer: &T, key: &K, state: TracerAssetState| {
-            tracer.on_asset_requested(
-                TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
-                state,
-            );
+        let emit_requested = |tracer: &T, asset_key: &AssetCacheKey, state: TracerAssetState| {
+            tracer.on_asset_requested(asset_key, state);
         };
 
         // Check whale cache first (single atomic read)
@@ -1502,7 +1487,7 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+                            emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
                             match arc.clone().downcast::<K::Asset>() {
                                 Ok(value) => {
                                     return Ok((AssetLoadingState::ready(key, value), changed_at))
@@ -1519,12 +1504,20 @@ impl<T: Tracer> QueryRuntime<T> {
                             if !has_locator_deps {
                                 check_leaf_asset_consistency(changed_at)?;
                             }
-                            emit_requested(&self.tracer, &key, TracerAssetState::NotFound);
+                            emit_requested(
+                                &self.tracer,
+                                &asset_cache_key,
+                                TracerAssetState::NotFound,
+                            );
                             return Err(QueryError::UserError(err.clone()));
                         }
                         None => {
                             // Loading state - no value to be inconsistent with
-                            emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                            emit_requested(
+                                &self.tracer,
+                                &asset_cache_key,
+                                TracerAssetState::Loading,
+                            );
                             return Ok((AssetLoadingState::loading(key), changed_at));
                         }
                         _ => {
@@ -1555,7 +1548,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     value: arc,
                     durability: durability_level,
                 }) => {
-                    emit_requested(&self.tracer, &key, TracerAssetState::Ready);
+                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Ready);
 
                     let typed_value: Arc<K::Asset> = match arc.downcast::<K::Asset>() {
                         Ok(v) => v,
@@ -1600,7 +1593,7 @@ impl<T: Tracer> QueryRuntime<T> {
                     return Ok((AssetLoadingState::ready(key, typed_value), result.revision));
                 }
                 Ok(ErasedLocateResult::Pending) => {
-                    emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+                    emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
 
                     // Add to pending list for Pending result
                     self.pending
@@ -1659,7 +1652,7 @@ impl<T: Tracer> QueryRuntime<T> {
         }
 
         // No locator registered or locator returned None - mark as pending
-        emit_requested(&self.tracer, &key, TracerAssetState::Loading);
+        emit_requested(&self.tracer, &asset_cache_key, TracerAssetState::Loading);
         self.pending
             .insert::<K>(asset_cache_key.clone(), key.clone());
 
@@ -1757,7 +1750,6 @@ impl ConsistencyTracker {
 pub struct QueryContext<'a, T: Tracer = NoopTracer> {
     runtime: &'a QueryRuntime<T>,
     current_key: FullCacheKey,
-    parent_query_type: &'static str,
     exec_ctx: ExecutionContext,
     deps: RefCell<Vec<FullCacheKey>>,
 }
@@ -1781,8 +1773,8 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
         // Emit dependency registered event
         self.runtime.tracer.on_dependency_registered(
             self.exec_ctx.span_id(),
-            TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
-            TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
+            &self.current_key,
+            &full_key,
         );
 
         // Record this as a dependency
@@ -1836,13 +1828,13 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
     pub fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
-        let full_cache_key = AssetCacheKey::new(key.clone()).into();
+        let full_cache_key: FullCacheKey = AssetCacheKey::new(key.clone()).into();
 
         // 1. Emit asset dependency registered event
         self.runtime.tracer.on_asset_dependency_registered(
             self.exec_ctx.span_id(),
-            TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
-            TracerAssetKey::new(std::any::type_name::<K>(), format!("{:?}", key)),
+            &self.current_key,
+            &full_cache_key,
         );
 
         // 2. Record dependency on this asset
@@ -1883,8 +1875,8 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
 
         self.runtime.tracer.on_dependency_registered(
             self.exec_ctx.span_id(),
-            TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
-            TracerQueryKey::new("QuerySet", sentinel.debug_repr()),
+            &self.current_key,
+            &sentinel,
         );
 
         // Ensure sentinel exists in whale (for dependency tracking)
@@ -1931,8 +1923,8 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
 
         self.runtime.tracer.on_asset_dependency_registered(
             self.exec_ctx.span_id(),
-            TracerQueryKey::new(self.parent_query_type, self.current_key.debug_repr()),
-            TracerAssetKey::new("AssetKeySet", sentinel.debug_repr()),
+            &self.current_key,
+            &sentinel,
         );
 
         // Ensure sentinel exists in whale (for dependency tracking)
@@ -2595,7 +2587,7 @@ mod tests {
             assert!(runtime.changed_at(&Leaf { id: 1 }).is_none());
         }
 
-        // Test tracer receives on_query_key calls
+        // Test tracer receives on_query_start calls (for GC tracking)
         struct GcTracker {
             accessed_keys: Mutex<HashSet<String>>,
             access_count: AtomicUsize,
@@ -2615,17 +2607,17 @@ mod tests {
                 SpanId(1)
             }
 
-            fn on_query_key(&self, full_key: &FullCacheKey) {
+            fn on_query_start(&self, _span_id: SpanId, query_key: &QueryCacheKey) {
                 self.accessed_keys
                     .lock()
                     .unwrap()
-                    .insert(full_key.debug_repr().to_string());
+                    .insert(query_key.debug_repr().to_string());
                 self.access_count.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         #[test]
-        fn test_tracer_receives_on_query_key() {
+        fn test_tracer_receives_on_query_start() {
             let tracker = GcTracker::new();
             let runtime = QueryRuntime::with_tracer(tracker);
 
@@ -2633,7 +2625,7 @@ mod tests {
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
             let _ = runtime.query(Leaf { id: 2 }).unwrap();
 
-            // Tracer should have received on_query_key calls
+            // Tracer should have received on_query_start calls
             let count = runtime.tracer().access_count.load(Ordering::Relaxed);
             assert_eq!(count, 2);
 
@@ -2643,7 +2635,7 @@ mod tests {
         }
 
         #[test]
-        fn test_tracer_receives_on_query_key_for_cache_hits() {
+        fn test_tracer_receives_on_query_start_for_cache_hits() {
             let tracker = GcTracker::new();
             let runtime = QueryRuntime::with_tracer(tracker);
 
@@ -2651,7 +2643,7 @@ mod tests {
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
 
-            // Tracer should have received on_query_key for both calls
+            // Tracer should have received on_query_start for both calls
             let count = runtime.tracer().access_count.load(Ordering::Relaxed);
             assert_eq!(count, 2);
         }

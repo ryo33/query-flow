@@ -63,10 +63,7 @@ pub use loading::AssetLoadingState;
 pub use query::Query;
 pub use query_flow_macros::{asset_key, asset_locator, query};
 pub use runtime::{ErrorComparator, Polled, QueryContext, QueryRuntime, QueryRuntimeBuilder};
-pub use tracer::{
-    ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetKey,
-    TracerAssetState, TracerQueryKey,
-};
+pub use tracer::{ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetState};
 
 // Re-export RevisionCounter from whale for use with poll() and changed_at()
 pub use whale::RevisionCounter;

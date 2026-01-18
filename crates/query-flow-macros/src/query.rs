@@ -131,10 +131,12 @@ enum FormatSegment {
     /// Field reference with optional format specifier
     /// `{field}` -> Display, `{field:?}` -> Debug, `{field:#?}` -> Pretty Debug
     Field { name: String, specifier: String },
+    /// Type name placeholder `{Self}` -> struct name
+    TypeName,
 }
 
 /// Parse a format string into segments.
-/// Handles `{field}`, `{field:?}`, `{field:#?}`, `{{`, and `}}`.
+/// Handles `{field}`, `{field:?}`, `{field:#?}`, `{Self}`, `{{`, and `}}`.
 fn parse_format_string(format: &str) -> Result<Vec<FormatSegment>, String> {
     let mut segments = Vec::new();
     let mut chars = format.chars().peekable();
@@ -181,7 +183,15 @@ fn parse_format_string(format: &str) -> Result<Vec<FormatSegment>, String> {
                         return Err("empty field name in format string".to_string());
                     }
 
-                    segments.push(FormatSegment::Field { name, specifier });
+                    // Check for special {Self} placeholder
+                    if name == "Self" {
+                        if !specifier.is_empty() {
+                            return Err("{Self} does not support format specifiers".to_string());
+                        }
+                        segments.push(FormatSegment::TypeName);
+                    } else {
+                        segments.push(FormatSegment::Field { name, specifier });
+                    }
                 }
             }
             '}' => {
@@ -273,6 +283,10 @@ fn generate_custom_debug(
                     fmt_string.push('}');
                     fmt_args.push(quote! { &self.#field_ident });
                 }
+            }
+            FormatSegment::TypeName => {
+                // Embed struct name directly as literal
+                fmt_string.push_str(&struct_name.to_string());
             }
         }
     }
@@ -1381,9 +1395,83 @@ mod tests {
             ]
         );
 
+        // Test with {Self} type name placeholder
+        let result = parse_format_string("{Self}({id})").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                FormatSegment::TypeName,
+                FormatSegment::Literal("(".to_string()),
+                FormatSegment::Field {
+                    name: "id".to_string(),
+                    specifier: String::new()
+                },
+                FormatSegment::Literal(")".to_string()),
+            ]
+        );
+
         // Test error cases
         assert!(parse_format_string("unclosed {brace").is_err());
         assert!(parse_format_string("unmatched }").is_err());
         assert!(parse_format_string("empty {}").is_err());
+        assert!(parse_format_string("{Self:?}").is_err()); // Self doesn't support specifiers
+    }
+
+    #[test]
+    fn test_query_macro_debug_with_self() {
+        // Test debug format with {Self} placeholder
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn fetch_user(db: &impl Db, id: u64) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("{Self}({id})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        // Should generate Debug impl with struct name embedded
+        let expected = quote! {
+            fn fetch_user(db: &impl Db, id: u64) -> Result<String, QueryError> {
+                Ok(format!("user {}", id))
+            }
+
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            struct FetchUser {
+                pub id: u64
+            }
+
+            impl FetchUser {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64) -> Self {
+                    Self { id }
+                }
+            }
+
+            impl ::std::fmt::Debug for FetchUser {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "FetchUser({})", &self.id)
+                }
+            }
+
+            impl ::query_flow::Query for FetchUser {
+                type Output = String;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    fetch_user(db, self.id).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
     }
 }

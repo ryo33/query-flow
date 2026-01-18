@@ -7,7 +7,7 @@ use std::sync::Arc;
 use papaya::HashMap;
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel};
-use crate::key::{FullCacheKey, KeyKind};
+use crate::key::{AssetCacheKey, FullCacheKey};
 use crate::query::Query;
 
 /// Cached query result (success or user error).
@@ -177,8 +177,8 @@ impl<T: crate::Tracer> LocatorStorage<T> {
 
 /// Thread-safe storage for pending asset requests.
 pub(crate) struct PendingStorage {
-    /// Map from FullCacheKey (for assets) to type-erased key
-    pending: HashMap<FullCacheKey, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+    /// Map from AssetCacheKey to type-erased key
+    pending: HashMap<AssetCacheKey, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
 }
 
 impl Default for PendingStorage {
@@ -196,13 +196,13 @@ impl PendingStorage {
     }
 
     /// Add a pending asset request.
-    pub fn insert<K: AssetKey>(&self, full_key: FullCacheKey, key: K) {
+    pub fn insert<K: AssetKey>(&self, asset_key: AssetCacheKey, key: K) {
         let pinned = self.pending.pin();
-        pinned.insert(full_key, Arc::new(key) as Arc<dyn Any + Send + Sync>);
+        pinned.insert(asset_key, Arc::new(key) as Arc<dyn Any + Send + Sync>);
     }
 
     /// Remove a pending asset request.
-    pub fn remove(&self, key: &FullCacheKey) -> bool {
+    pub fn remove(&self, key: &AssetCacheKey) -> bool {
         let pinned = self.pending.pin();
         pinned.remove(key).is_some()
     }
@@ -219,7 +219,7 @@ impl PendingStorage {
         let key_type = TypeId::of::<K>();
         pinned
             .iter()
-            .filter(|(k, _)| matches!(k.kind(), KeyKind::Asset(t) if t == key_type))
+            .filter(|(k, _)| k.asset_key_type() == key_type)
             .filter_map(|(_, v)| v.downcast_ref::<K>().cloned())
             .collect()
     }
@@ -229,16 +229,12 @@ impl PendingStorage {
         let pinned = self.pending.pin();
         pinned
             .iter()
-            .filter_map(|(k, v)| {
-                if let KeyKind::Asset(type_id) = k.kind() {
-                    Some(crate::asset::PendingAsset::new_from_parts(
-                        type_id,
-                        &k.debug_repr(),
-                        v.clone(),
-                    ))
-                } else {
-                    None
-                }
+            .map(|(k, v)| {
+                crate::asset::PendingAsset::new_from_parts(
+                    k.asset_key_type(),
+                    &k.debug_repr(),
+                    v.clone(),
+                )
             })
             .collect()
     }

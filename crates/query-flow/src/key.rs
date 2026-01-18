@@ -48,99 +48,37 @@ impl<T: Hash + Eq + Debug + Send + Sync + 'static> CacheKey for T {
 // Enable Hash for dyn CacheKey using the dyn-hash crate
 dyn_hash::hash_trait_object!(CacheKey);
 
-/// The kind of cache key, used for type discrimination.
+/// Cache key for a query.
 ///
-/// This allows different types of keys (queries, assets, sentinels)
-/// to be distinguished even if they have the same underlying value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyKind {
-    /// A query key, parameterized by the query type.
-    Query(TypeId),
-    /// An asset key, parameterized by the asset key type.
-    Asset(TypeId),
-    /// Sentinel for query set tracking (used by `list_queries`).
-    QuerySetSentinel(TypeId),
-    /// Sentinel for asset key set tracking (used by `list_asset_keys`).
-    AssetKeySetSentinel(TypeId),
-}
-
-/// Full cache key that includes type discrimination and the actual key value.
-///
-/// This is the key type used internally by the runtime for all cache operations.
-/// It combines:
-/// - `KeyKind`: Distinguishes between queries, assets, and sentinels
-/// - The actual key value: Stored as `Arc<dyn CacheKey>` for type erasure
-///
-/// # Design
-///
-/// Unlike the previous design, this does not pre-compute the hash or
-/// allocate a debug string. Hash is computed on-demand via `dyn-hash`,
-/// and debug representation uses the key's `Debug` implementation.
-pub struct FullCacheKey {
-    /// The kind and type of key
-    kind: KeyKind,
-    /// The actual key value, type-erased
+/// Stores the query type and the query value as a type-erased `Arc<dyn CacheKey>`.
+#[derive(Clone)]
+pub struct QueryCacheKey {
+    query_type: TypeId,
     key: Arc<dyn CacheKey>,
 }
 
-impl FullCacheKey {
-    /// Create a new full cache key for a query.
-    ///
-    /// The key is stored and can be downcast back to the original type.
-    pub fn new<Q: 'static, K: CacheKey>(key: K) -> Self {
+impl QueryCacheKey {
+    /// Create a new query cache key.
+    pub fn new<Q: CacheKey + 'static>(query: Q) -> Self {
         Self {
-            kind: KeyKind::Query(TypeId::of::<Q>()),
-            key: Arc::new(key),
-        }
-    }
-
-    /// Create a cache key for an asset.
-    pub fn for_asset<K: CacheKey + 'static>(key: K) -> Self {
-        Self {
-            kind: KeyKind::Asset(TypeId::of::<K>()),
-            key: Arc::new(key),
-        }
-    }
-
-    /// Create a sentinel key representing "all queries of type Q".
-    ///
-    /// This is used by `list_queries` to track dependencies on the set of queries,
-    /// rather than individual query values.
-    pub fn query_set_sentinel<Q: 'static>() -> Self {
-        Self {
-            kind: KeyKind::QuerySetSentinel(TypeId::of::<Q>()),
-            key: Arc::new(()),
-        }
-    }
-
-    /// Create a sentinel key representing "all asset keys of type K".
-    ///
-    /// This is used by `list_asset_keys` to track dependencies on the set of asset keys,
-    /// rather than individual asset values.
-    pub fn asset_key_set_sentinel<K: 'static>() -> Self {
-        Self {
-            kind: KeyKind::AssetKeySetSentinel(TypeId::of::<K>()),
-            key: Arc::new(()),
+            query_type: TypeId::of::<Q>(),
+            key: Arc::new(query),
         }
     }
 
     /// Get the debug representation of this key.
-    ///
-    /// This is computed lazily from the key's `Debug` implementation.
     pub fn debug_repr(&self) -> String {
         format!("{:?}", self.key)
     }
 
-    /// Get the kind of this key.
-    pub fn kind(&self) -> KeyKind {
-        self.kind
-    }
-
     /// Downcast the key to its original type.
-    ///
-    /// Returns `None` if the key is not of type `K`.
     pub fn downcast<K: 'static>(&self) -> Option<&K> {
         self.key.as_any().downcast_ref()
+    }
+
+    /// Get the query type ID.
+    pub fn query_type(&self) -> TypeId {
+        self.query_type
     }
 
     /// Get a reference to the type-erased key.
@@ -149,37 +87,278 @@ impl FullCacheKey {
     }
 }
 
-impl Clone for FullCacheKey {
-    fn clone(&self) -> Self {
+impl Debug for QueryCacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.key)
+    }
+}
+
+impl Hash for QueryCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.query_type.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl PartialEq for QueryCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.query_type == other.query_type && self.key.dyn_eq(other.key.as_any())
+    }
+}
+
+impl Eq for QueryCacheKey {}
+
+/// Cache key for an asset.
+///
+/// Stores the asset key type and the key value as a type-erased `Arc<dyn CacheKey>`.
+#[derive(Clone)]
+pub struct AssetCacheKey {
+    asset_key_type: TypeId,
+    key: Arc<dyn CacheKey>,
+}
+
+impl AssetCacheKey {
+    /// Create a new asset cache key.
+    pub fn new<K: CacheKey + 'static>(key: K) -> Self {
         Self {
-            kind: self.kind,
-            key: Arc::clone(&self.key),
+            asset_key_type: TypeId::of::<K>(),
+            key: Arc::new(key),
+        }
+    }
+
+    /// Get the debug representation of this key.
+    pub fn debug_repr(&self) -> String {
+        format!("{:?}", self.key)
+    }
+
+    /// Downcast the key to its original type.
+    pub fn downcast<K: 'static>(&self) -> Option<&K> {
+        self.key.as_any().downcast_ref()
+    }
+
+    /// Get the asset key type ID.
+    pub fn asset_key_type(&self) -> TypeId {
+        self.asset_key_type
+    }
+
+    /// Get a reference to the type-erased key.
+    pub fn key(&self) -> &Arc<dyn CacheKey> {
+        &self.key
+    }
+}
+
+impl Debug for AssetCacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Asset({:?})", self.key)
+    }
+}
+
+impl Hash for AssetCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.asset_key_type.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl PartialEq for AssetCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.asset_key_type == other.asset_key_type && self.key.dyn_eq(other.key.as_any())
+    }
+}
+
+impl Eq for AssetCacheKey {}
+
+/// Sentinel for tracking all queries of a type.
+///
+/// Used by `list_queries` to track dependencies on the set of queries,
+/// rather than individual query values.
+#[derive(Clone, Copy)]
+pub struct QuerySetSentinelKey {
+    query_type: TypeId,
+}
+
+impl QuerySetSentinelKey {
+    /// Create a new query set sentinel key.
+    pub fn new<Q: 'static>() -> Self {
+        Self {
+            query_type: TypeId::of::<Q>(),
+        }
+    }
+
+    /// Get the query type ID.
+    pub fn query_type(&self) -> TypeId {
+        self.query_type
+    }
+}
+
+impl Debug for QuerySetSentinelKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QuerySet({:?})", self.query_type)
+    }
+}
+
+impl Hash for QuerySetSentinelKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.query_type.hash(state);
+    }
+}
+
+impl PartialEq for QuerySetSentinelKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.query_type == other.query_type
+    }
+}
+
+impl Eq for QuerySetSentinelKey {}
+
+/// Sentinel for tracking all asset keys of a type.
+///
+/// Used by `list_asset_keys` to track dependencies on the set of asset keys,
+/// rather than individual asset values.
+#[derive(Clone, Copy)]
+pub struct AssetKeySetSentinelKey {
+    asset_key_type: TypeId,
+}
+
+impl AssetKeySetSentinelKey {
+    /// Create a new asset key set sentinel key.
+    pub fn new<K: 'static>() -> Self {
+        Self {
+            asset_key_type: TypeId::of::<K>(),
+        }
+    }
+
+    /// Get the asset key type ID.
+    pub fn asset_key_type(&self) -> TypeId {
+        self.asset_key_type
+    }
+}
+
+impl Debug for AssetKeySetSentinelKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AssetKeySet({:?})", self.asset_key_type)
+    }
+}
+
+impl Hash for AssetKeySetSentinelKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.asset_key_type.hash(state);
+    }
+}
+
+impl PartialEq for AssetKeySetSentinelKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.asset_key_type == other.asset_key_type
+    }
+}
+
+impl Eq for AssetKeySetSentinelKey {}
+
+/// Unified cache key for whale storage.
+///
+/// Used where all key kinds need to be handled together (whale, generic invalidation).
+/// Each variant wraps a specific key type.
+#[derive(Clone)]
+pub enum FullCacheKey {
+    /// A query key.
+    Query(QueryCacheKey),
+    /// An asset key.
+    Asset(AssetCacheKey),
+    /// Sentinel for query set tracking (used by `list_queries`).
+    QuerySetSentinel(QuerySetSentinelKey),
+    /// Sentinel for asset key set tracking (used by `list_asset_keys`).
+    AssetKeySetSentinel(AssetKeySetSentinelKey),
+}
+
+impl FullCacheKey {
+    /// Get the debug representation of this key.
+    pub fn debug_repr(&self) -> String {
+        match self {
+            FullCacheKey::Query(k) => k.debug_repr(),
+            FullCacheKey::Asset(k) => k.debug_repr(),
+            FullCacheKey::QuerySetSentinel(k) => format!("{:?}", k),
+            FullCacheKey::AssetKeySetSentinel(k) => format!("{:?}", k),
+        }
+    }
+
+    /// Downcast the key to its original type.
+    ///
+    /// Returns `None` if the key is not of type `K`.
+    pub fn downcast<K: 'static>(&self) -> Option<&K> {
+        match self {
+            FullCacheKey::Query(k) => k.downcast(),
+            FullCacheKey::Asset(k) => k.downcast(),
+            FullCacheKey::QuerySetSentinel(_) | FullCacheKey::AssetKeySetSentinel(_) => None,
+        }
+    }
+
+    /// Get a reference to the type-erased key (for Query and Asset variants).
+    pub fn key(&self) -> Option<&Arc<dyn CacheKey>> {
+        match self {
+            FullCacheKey::Query(k) => Some(k.key()),
+            FullCacheKey::Asset(k) => Some(k.key()),
+            FullCacheKey::QuerySetSentinel(_) | FullCacheKey::AssetKeySetSentinel(_) => None,
         }
     }
 }
 
 impl Debug for FullCacheKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
-            KeyKind::Query(_) => write!(f, "{:?}", self.key),
-            KeyKind::Asset(_) => write!(f, "Asset({:?})", self.key),
-            KeyKind::QuerySetSentinel(type_id) => write!(f, "QuerySet({:?})", type_id),
-            KeyKind::AssetKeySetSentinel(type_id) => write!(f, "AssetKeySet({:?})", type_id),
+        match self {
+            FullCacheKey::Query(k) => write!(f, "{:?}", k),
+            FullCacheKey::Asset(k) => write!(f, "{:?}", k),
+            FullCacheKey::QuerySetSentinel(k) => write!(f, "{:?}", k),
+            FullCacheKey::AssetKeySetSentinel(k) => write!(f, "{:?}", k),
         }
     }
 }
 
 impl Hash for FullCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.kind.hash(state);
-        self.key.hash(state);
+        std::mem::discriminant(self).hash(state);
+        match self {
+            FullCacheKey::Query(k) => k.hash(state),
+            FullCacheKey::Asset(k) => k.hash(state),
+            FullCacheKey::QuerySetSentinel(k) => k.hash(state),
+            FullCacheKey::AssetKeySetSentinel(k) => k.hash(state),
+        }
     }
 }
 
 impl PartialEq for FullCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.key.dyn_eq(other.key.as_any())
+        match (self, other) {
+            (FullCacheKey::Query(a), FullCacheKey::Query(b)) => a == b,
+            (FullCacheKey::Asset(a), FullCacheKey::Asset(b)) => a == b,
+            (FullCacheKey::QuerySetSentinel(a), FullCacheKey::QuerySetSentinel(b)) => a == b,
+            (FullCacheKey::AssetKeySetSentinel(a), FullCacheKey::AssetKeySetSentinel(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
 impl Eq for FullCacheKey {}
+
+impl From<QueryCacheKey> for FullCacheKey {
+    fn from(key: QueryCacheKey) -> Self {
+        FullCacheKey::Query(key)
+    }
+}
+
+impl From<AssetCacheKey> for FullCacheKey {
+    fn from(key: AssetCacheKey) -> Self {
+        FullCacheKey::Asset(key)
+    }
+}
+
+impl From<QuerySetSentinelKey> for FullCacheKey {
+    fn from(key: QuerySetSentinelKey) -> Self {
+        FullCacheKey::QuerySetSentinel(key)
+    }
+}
+
+impl From<AssetKeySetSentinelKey> for FullCacheKey {
+    fn from(key: AssetKeySetSentinelKey) -> Self {
+        FullCacheKey::AssetKeySetSentinel(key)
+    }
+}

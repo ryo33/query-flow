@@ -10,7 +10,9 @@ use whale::{Durability, GetOrInsertResult, RevisionCounter, Runtime as WhaleRunt
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel, PendingAsset};
 use crate::db::Db;
-use crate::key::FullCacheKey;
+use crate::key::{
+    AssetCacheKey, AssetKeySetSentinelKey, FullCacheKey, QueryCacheKey, QuerySetSentinelKey,
+};
 use crate::loading::AssetLoadingState;
 use crate::query::Query;
 use crate::storage::{
@@ -317,7 +319,7 @@ impl<T: Tracer> QueryRuntime<T> {
         &self,
         query: Q,
     ) -> Result<(Result<Arc<Q::Output>, Arc<anyhow::Error>>, RevisionCounter), QueryError> {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key = QueryCacheKey::new(query.clone()).into();
 
         // Emit query key event for GC tracking (before other events)
         self.tracer.on_query_key(&full_key);
@@ -533,7 +535,7 @@ impl<T: Tracer> QueryRuntime<T> {
                 // Register query in registry for list_queries
                 let is_new_query = self.query_registry.register(query);
                 if is_new_query {
-                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+                    let sentinel = QuerySetSentinelKey::new::<Q>().into();
                     let _ = self
                         .whale
                         .register(sentinel, None, Durability::stable(), vec![]);
@@ -592,7 +594,7 @@ impl<T: Tracer> QueryRuntime<T> {
                 // Register query in registry for list_queries
                 let is_new_query = self.query_registry.register(query);
                 if is_new_query {
-                    let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+                    let sentinel = QuerySetSentinelKey::new::<Q>().into();
                     let _ = self
                         .whale
                         .register(sentinel, None, Durability::stable(), vec![]);
@@ -615,7 +617,7 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// This also invalidates any queries that depend on this one.
     pub fn invalidate<Q: Query>(&self, query: &Q) {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key: FullCacheKey = QueryCacheKey::new(query.clone()).into();
 
         self.tracer.on_query_invalidated(
             TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
@@ -638,7 +640,7 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// This also invalidates any queries that depend on this one.
     pub fn remove_query<Q: Query>(&self, query: &Q) {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key: FullCacheKey = QueryCacheKey::new(query.clone()).into();
 
         self.tracer.on_query_invalidated(
             TracerQueryKey::new(std::any::type_name::<Q>(), full_key.debug_repr()),
@@ -653,7 +655,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // Remove from registry and update sentinel for list_queries
         if self.query_registry.remove::<Q>(query) {
-            let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+            let sentinel = QuerySetSentinelKey::new::<Q>().into();
             let _ = self
                 .whale
                 .register(sentinel, None, Durability::stable(), vec![]);
@@ -731,7 +733,7 @@ impl<T: Tracer> QueryRuntime<T> {
     /// }
     /// ```
     pub fn changed_at<Q: Query>(&self, query: &Q) -> Option<RevisionCounter> {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key = QueryCacheKey::new(query.clone()).into();
         self.whale.get(&full_key).map(|node| node.changed_at)
     }
 }
@@ -781,7 +783,7 @@ impl<T: Tracer> QueryRuntime<T> {
     /// }
     /// ```
     pub fn remove_query_if_unused<Q: Query>(&self, query: &Q) -> bool {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key = QueryCacheKey::new(query.clone()).into();
         self.remove_if_unused(&full_key)
     }
 
@@ -1025,10 +1027,10 @@ impl<T: Tracer> QueryRuntime<T> {
         error: impl Into<anyhow::Error>,
         durability: DurabilityLevel,
     ) {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let asset_cache_key = AssetCacheKey::new(key.clone());
 
         // Remove from pending BEFORE registering the error
-        self.pending.remove(&full_cache_key);
+        self.pending.remove(&asset_cache_key);
 
         // Prepare the error entry
         let error_arc = Arc::new(error.into());
@@ -1040,7 +1042,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let result = self
             .whale
             .update_with_compare(
-                full_cache_key,
+                asset_cache_key.into(),
                 Some(entry),
                 |old_data, _new_data| {
                     // Compare old and new errors using error_comparator
@@ -1066,7 +1068,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let is_new_asset = self.asset_key_registry.register(&key);
         if is_new_asset {
             // Update sentinel to invalidate list_asset_keys dependents
-            let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+            let sentinel = AssetKeySetSentinelKey::new::<K>().into();
             let _ = self
                 .whale
                 .register(sentinel, None, Durability::stable(), vec![]);
@@ -1079,10 +1081,10 @@ impl<T: Tracer> QueryRuntime<T> {
         value: K::Asset,
         durability_level: DurabilityLevel,
     ) {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let asset_cache_key = AssetCacheKey::new(key.clone());
 
         // Remove from pending BEFORE registering the value
-        self.pending.remove(&full_cache_key);
+        self.pending.remove(&asset_cache_key);
 
         // Prepare the new entry
         let value_arc: Arc<K::Asset> = Arc::new(value);
@@ -1094,7 +1096,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let result = self
             .whale
             .update_with_compare(
-                full_cache_key,
+                asset_cache_key.into(),
                 Some(entry),
                 |old_data, _new_data| {
                     // Compare old and new values
@@ -1123,7 +1125,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let is_new_asset = self.asset_key_registry.register(&key);
         if is_new_asset {
             // Update sentinel to invalidate list_asset_keys dependents
-            let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+            let sentinel = AssetKeySetSentinelKey::new::<K>().into();
             let _ = self
                 .whale
                 .register(sentinel, None, Durability::stable(), vec![]);
@@ -1144,7 +1146,8 @@ impl<T: Tracer> QueryRuntime<T> {
     /// // User should fetch the new value and call resolve_asset
     /// ```
     pub fn invalidate_asset<K: AssetKey>(&self, key: &K) {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let asset_cache_key = AssetCacheKey::new(key.clone());
+        let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Emit asset invalidated event
         self.tracer.on_asset_invalidated(TracerAssetKey::new(
@@ -1155,7 +1158,7 @@ impl<T: Tracer> QueryRuntime<T> {
         // Add to pending FIRST (before clearing whale state)
         // This ensures: readers see either old value, or Loading+pending
         self.pending
-            .insert::<K>(full_cache_key.clone(), key.clone());
+            .insert::<K>(asset_cache_key.clone(), key.clone());
 
         // Atomic: clear cached value + invalidate dependents
         // Using None for data means "needs to be loaded"
@@ -1170,10 +1173,11 @@ impl<T: Tracer> QueryRuntime<T> {
     /// Unlike `invalidate_asset`, this removes all traces of the asset.
     /// Dependent queries will go through the locator again on next access.
     pub fn remove_asset<K: AssetKey>(&self, key: &K) {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let asset_cache_key = AssetCacheKey::new(key.clone());
+        let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Remove from pending first
-        self.pending.remove(&full_cache_key);
+        self.pending.remove(&asset_cache_key);
 
         // Remove from whale (this also cleans up dependency edges)
         // whale.remove() invalidates dependents before removing
@@ -1181,7 +1185,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
         // Remove from registry and update sentinel for list_asset_keys
         if self.asset_key_registry.remove::<K>(key) {
-            let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+            let sentinel = AssetKeySetSentinelKey::new::<K>().into();
             let _ = self
                 .whale
                 .register(sentinel, None, Durability::stable(), vec![]);
@@ -1214,7 +1218,8 @@ impl<T: Tracer> QueryRuntime<T> {
         &self,
         key: K,
     ) -> Result<(AssetLoadingState<K>, RevisionCounter), QueryError> {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let asset_cache_key = AssetCacheKey::new(key.clone());
+        let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Helper to emit AssetRequested event
         let emit_requested = |tracer: &T, key: &K, state: TracerAssetState| {
@@ -1359,7 +1364,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
                     // Add to pending list for Pending result
                     self.pending
-                        .insert::<K>(full_cache_key.clone(), key.clone());
+                        .insert::<K>(asset_cache_key.clone(), key.clone());
                     match self
                         .whale
                         .get_or_insert(full_cache_key, None, Durability::volatile(), locator_deps)
@@ -1417,7 +1422,7 @@ impl<T: Tracer> QueryRuntime<T> {
         // (no locator was called, so no deps to track)
         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
         self.pending
-            .insert::<K>(full_cache_key.clone(), key.clone());
+            .insert::<K>(asset_cache_key.clone(), key.clone());
 
         match self
             .whale
@@ -1452,7 +1457,8 @@ impl<T: Tracer> QueryRuntime<T> {
         key: K,
         _ctx: &QueryContext<'_, T>,
     ) -> Result<(AssetLoadingState<K>, RevisionCounter), QueryError> {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let asset_cache_key = AssetCacheKey::new(key.clone());
+        let full_cache_key: FullCacheKey = asset_cache_key.clone().into();
 
         // Helper to emit AssetRequested event
         let emit_requested = |tracer: &T, key: &K, state: TracerAssetState| {
@@ -1598,7 +1604,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
                     // Add to pending list for Pending result
                     self.pending
-                        .insert::<K>(full_cache_key.clone(), key.clone());
+                        .insert::<K>(asset_cache_key.clone(), key.clone());
                     match self
                         .whale
                         .get_or_insert(full_cache_key, None, Durability::volatile(), locator_deps)
@@ -1655,7 +1661,7 @@ impl<T: Tracer> QueryRuntime<T> {
         // No locator registered or locator returned None - mark as pending
         emit_requested(&self.tracer, &key, TracerAssetState::Loading);
         self.pending
-            .insert::<K>(full_cache_key.clone(), key.clone());
+            .insert::<K>(asset_cache_key.clone(), key.clone());
 
         match self
             .whale
@@ -1770,7 +1776,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     /// }
     /// ```
     pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key: FullCacheKey = QueryCacheKey::new(query.clone()).into();
 
         // Emit dependency registered event
         self.runtime.tracer.on_dependency_registered(
@@ -1830,7 +1836,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// Returns `Err(QueryError::MissingDependency)` if the asset was not found.
     pub fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let full_cache_key = AssetCacheKey::new(key.clone()).into();
 
         // 1. Emit asset dependency registered event
         self.runtime.tracer.on_asset_dependency_registered(
@@ -1873,7 +1879,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     /// ```
     pub fn list_queries<Q: Query>(&self) -> Vec<Q> {
         // Record dependency on the sentinel (set-level dependency)
-        let sentinel = FullCacheKey::query_set_sentinel::<Q>();
+        let sentinel: FullCacheKey = QuerySetSentinelKey::new::<Q>().into();
 
         self.runtime.tracer.on_dependency_registered(
             self.exec_ctx.span_id(),
@@ -1921,7 +1927,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     /// ```
     pub fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
         // Record dependency on the sentinel (set-level dependency)
-        let sentinel = FullCacheKey::asset_key_set_sentinel::<K>();
+        let sentinel: FullCacheKey = AssetKeySetSentinelKey::new::<K>().into();
 
         self.runtime.tracer.on_asset_dependency_registered(
             self.exec_ctx.span_id(),
@@ -1996,7 +2002,7 @@ impl<'a, T: Tracer> LocatorContext<'a, T> {
 
 impl<T: Tracer> Db for LocatorContext<'_, T> {
     fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
-        let full_key = FullCacheKey::new::<Q, Q>(query.clone());
+        let full_key = QueryCacheKey::new(query.clone()).into();
 
         // Record this as a dependency of the asset being located
         self.deps.borrow_mut().push(full_key);
@@ -2010,7 +2016,7 @@ impl<T: Tracer> Db for LocatorContext<'_, T> {
     }
 
     fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
-        let full_cache_key = FullCacheKey::for_asset(key.clone());
+        let full_cache_key = AssetCacheKey::new(key.clone()).into();
 
         // Record this as a dependency of the asset being located
         self.deps.borrow_mut().push(full_cache_key);
@@ -2530,7 +2536,7 @@ mod tests {
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
 
             // Get the key
-            let full_key = FullCacheKey::new::<Leaf, Leaf>(Leaf { id: 1 });
+            let full_key = QueryCacheKey::new(Leaf { id: 1 }).into();
 
             // Query should exist
             assert!(runtime.changed_at(&Leaf { id: 1 }).is_some());
@@ -2580,7 +2586,7 @@ mod tests {
             // Execute a leaf query
             let _ = runtime.query(Leaf { id: 1 }).unwrap();
 
-            let full_key = FullCacheKey::new::<Leaf, Leaf>(Leaf { id: 1 });
+            let full_key = QueryCacheKey::new(Leaf { id: 1 }).into();
 
             // Should be removable via FullCacheKey
             assert!(runtime.remove_if_unused(&full_key));

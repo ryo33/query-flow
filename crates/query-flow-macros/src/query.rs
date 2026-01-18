@@ -7,8 +7,9 @@ use syn::{
 };
 
 /// Wrapper for parsing a list of identifiers: `keys(a, b, c)`
+/// None = not specified (use default), Some(vec) = explicitly specified
 #[derive(Debug, Default)]
-struct Keys(Vec<Ident>);
+struct Keys(Option<Vec<Ident>>);
 
 impl FromMeta for Keys {
     fn from_list(items: &[NestedMeta]) -> darling::Result<Self> {
@@ -27,7 +28,7 @@ impl FromMeta for Keys {
                 }
             }
         }
-        Ok(Keys(idents))
+        Ok(Keys(Some(idents)))
     }
 }
 
@@ -75,13 +76,18 @@ pub struct QueryAttr {
     #[darling(default)]
     output_eq: OutputEq,
 
-    /// Params that form the cache key. Default: all params except ctx.
+    /// Params that form the cache key. Default: all params.
     #[darling(default)]
     keys: Keys,
 
     /// Override the generated struct name. Default: PascalCase of function name.
     #[darling(default)]
     name: Option<String>,
+
+    /// Singleton query: no cache key, all instances share one cache entry.
+    /// Mutually exclusive with `keys`.
+    #[darling(default)]
+    singleton: bool,
 }
 
 /// A parsed function parameter.
@@ -108,25 +114,48 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
         None => format_ident!("{}", parsed.name.to_string().to_upper_camel_case()),
     };
 
+    // Validate singleton and keys are mutually exclusive
+    if attr.singleton && attr.keys.0.is_some() {
+        return Err(Error::new(
+            input_fn.sig.span(),
+            "`singleton` and `keys` are mutually exclusive",
+        ));
+    }
+
     // Determine which params are keys
-    let key_params: Vec<&Param> = if attr.keys.0.is_empty() {
-        // Default: all params are keys
-        parsed.params.iter().collect()
+    let key_params: Vec<&Param> = if attr.singleton {
+        // Singleton: no keys, all instances share one cache entry
+        vec![]
     } else {
-        // Validate that specified keys exist
-        for key in &attr.keys.0 {
-            if !parsed.params.iter().any(|p| p.name == *key) {
+        match &attr.keys.0 {
+            None => {
+                // Default: all params are keys
+                parsed.params.iter().collect()
+            }
+            Some(keys) if keys.is_empty() => {
+                // Empty keys() is an error - use singleton instead
                 return Err(Error::new(
-                    key.span(),
-                    format!("unknown parameter `{}` in keys", key),
+                    input_fn.sig.span(),
+                    "empty `keys()` is not allowed; use `singleton` for queries with no cache key",
                 ));
             }
+            Some(keys) => {
+                // Validate that specified keys exist
+                for key in keys {
+                    if !parsed.params.iter().any(|p| p.name == *key) {
+                        return Err(Error::new(
+                            key.span(),
+                            format!("unknown parameter `{}` in keys", key),
+                        ));
+                    }
+                }
+                parsed
+                    .params
+                    .iter()
+                    .filter(|p| keys.contains(&p.name))
+                    .collect()
+            }
         }
-        parsed
-            .params
-            .iter()
-            .filter(|p| attr.keys.0.contains(&p.name))
-            .collect()
     };
 
     // Generate struct definition (with Hash/Eq based on key_params)
@@ -638,8 +667,9 @@ mod tests {
 
         let attr = QueryAttr {
             output_eq: OutputEq::None,
-            keys: Keys(vec![format_ident!("a")]),
+            keys: Keys(Some(vec![format_ident!("a")])),
             name: None,
+            singleton: false,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -704,8 +734,9 @@ mod tests {
 
         let attr = QueryAttr {
             output_eq: OutputEq::None,
-            keys: Keys(vec![format_ident!("a"), format_ident!("c")]),
+            keys: Keys(Some(vec![format_ident!("a"), format_ident!("c")])),
             name: None,
+            singleton: false,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -771,8 +802,9 @@ mod tests {
 
         let attr = QueryAttr {
             output_eq: OutputEq::None,
-            keys: Keys(vec![format_ident!("a"), format_ident!("b")]),
+            keys: Keys(Some(vec![format_ident!("a"), format_ident!("b")])),
             name: None,
+            singleton: false,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
@@ -822,57 +854,94 @@ mod tests {
 
         let attr = QueryAttr {
             output_eq: OutputEq::None,
-            keys: Keys(vec![format_ident!("unknown")]),
+            keys: Keys(Some(vec![format_ident!("unknown")])),
             name: None,
+            singleton: false,
         };
         let result = generate_query(attr, input_fn);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("unknown parameter `unknown` in keys"));
+        assert!(err
+            .to_string()
+            .contains("unknown parameter `unknown` in keys"));
     }
 
     #[test]
-    fn test_query_macro_keys_empty() {
-        // Test empty keys() - all instances are equal (edge case)
+    fn test_query_macro_keys_empty_error() {
+        // Test empty keys() produces an error
         let input_fn: ItemFn = syn::parse_quote! {
             fn empty_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
                 Ok(a)
             }
         };
 
-        // Empty keys means no fields are used for Hash/Eq
         let attr = QueryAttr {
             output_eq: OutputEq::None,
-            keys: Keys(vec![]),
+            keys: Keys(Some(vec![])),
             name: None,
+            singleton: false,
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty `keys()` is not allowed"));
+    }
+
+    #[test]
+    fn test_query_macro_singleton() {
+        // Test singleton attribute - no cache key, all instances share one entry
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn singleton_query(db: &impl Db, format: String) -> Result<String, QueryError> {
+                Ok(format!("result: {}", format))
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: true,
         };
         let output = generate_query(attr, input_fn).unwrap();
 
-        // Should generate custom Hash/Eq with empty body / always true
+        // Should generate custom Hash/Eq with no keys (all instances equal)
         let expected = quote! {
-            fn empty_keys(db: &impl Db, a: i32, b: String) -> Result<i32, QueryError> {
-                Ok(a)
+            fn singleton_query(db: &impl Db, format: String) -> Result<String, QueryError> {
+                Ok(format!("result: {}", format))
             }
 
-            #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-            struct EmptyKeys {
-                pub a: i32,
-                pub b: String
+            #[derive(Clone, Debug)]
+            struct SingletonQuery {
+                pub format: String
             }
 
-            impl EmptyKeys {
+            impl SingletonQuery {
                 #[doc = r" Create a new query instance."]
-                fn new(a: i32, b: String) -> Self {
-                    Self { a, b }
+                fn new(format: String) -> Self {
+                    Self { format }
                 }
             }
 
-            impl ::query_flow::Query for EmptyKeys {
-                type Output = i32;
+            impl ::std::hash::Hash for SingletonQuery {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                }
+            }
+
+            impl ::std::cmp::PartialEq for SingletonQuery {
+                fn eq(&self, other: &Self) -> bool {
+                    true
+                }
+            }
+
+            impl ::std::cmp::Eq for SingletonQuery {}
+
+            impl ::query_flow::Query for SingletonQuery {
+                type Output = String;
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
-                    empty_keys(db, self.a, self.b).map(::std::sync::Arc::new)
+                    singleton_query(db, self.format).map(::std::sync::Arc::new)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
@@ -882,5 +951,29 @@ mod tests {
         };
 
         assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_singleton_keys_mutually_exclusive() {
+        // Test that singleton and keys cannot be used together
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn bad_query(db: &impl Db, a: i32) -> Result<i32, QueryError> {
+                Ok(a)
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("a")])),
+            name: None,
+            singleton: true,
+        };
+        let result = generate_query(attr, input_fn);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("`singleton` and `keys` are mutually exclusive"));
     }
 }

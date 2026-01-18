@@ -58,7 +58,7 @@ mod tracer_impl;
 pub use collector::EventCollector;
 pub use events::{
     to_kinds, AssetKey, AssetState, CycleKey, EventKind, ExecutionResult, ExecutionTrace,
-    FlowEvent, InvalidationReason, QueryKey, SpanId,
+    FlowEvent, InvalidationReason, QueryKey, SpanContext, SpanId, TraceId,
 };
 pub use sink::{EventSink, FilterSink, MultiplexSink, NullSink};
 pub use span_context::new_span_id;
@@ -76,27 +76,36 @@ mod tests {
 
         // Directly emit events to the collector
         let span_id = new_span_id();
+        let trace_id = TraceId(1);
         let query = QueryKey::new("MyQuery", "(1, 2)");
 
         collector.emit(FlowEvent::QueryStart {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
         });
 
         collector.emit(FlowEvent::CacheCheck {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
             valid: false,
         });
 
         collector.emit(FlowEvent::EarlyCutoffCheck {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
             output_changed: true,
         });
 
         collector.emit(FlowEvent::QueryEnd {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query,
             result: ExecutionResult::Changed,
             duration: Duration::from_millis(5),

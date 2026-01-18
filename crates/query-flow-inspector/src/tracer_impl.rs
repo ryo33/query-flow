@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use query_flow::{
     AssetCacheKey, ExecutionResult as TracerExecutionResult, FullCacheKey,
-    InvalidationReason as TracerInvalidationReason, QueryCacheKey, SpanId, Tracer,
-    TracerAssetState,
+    InvalidationReason as TracerInvalidationReason, QueryCacheKey, SpanContext, SpanId, TraceId,
+    Tracer, TracerAssetState,
 };
 
 use crate::events::FlowEvent;
@@ -19,6 +19,8 @@ use crate::sink::EventSink;
 
 /// Global span ID counter for EventSinkTracer.
 static SPAN_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Global trace ID counter for EventSinkTracer.
+static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// A `Tracer` implementation that forwards events to an `EventSink`.
 ///
@@ -64,37 +66,53 @@ impl Tracer for EventSinkTracer {
     }
 
     #[inline]
-    fn on_query_start(&self, span_id: SpanId, query: &QueryCacheKey) {
+    fn new_trace_id(&self) -> TraceId {
+        TraceId(TRACE_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[inline]
+    fn on_query_start(&self, ctx: &SpanContext, query: &QueryCacheKey) {
         self.start_times
             .lock()
             .unwrap()
-            .insert(span_id, Instant::now());
+            .insert(ctx.span_id, Instant::now());
         self.sink.emit(FlowEvent::QueryStart {
-            span_id,
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             query: query.into(),
         });
     }
 
     #[inline]
-    fn on_cache_check(&self, span_id: SpanId, query: &QueryCacheKey, valid: bool) {
+    fn on_cache_check(&self, ctx: &SpanContext, query: &QueryCacheKey, valid: bool) {
         self.sink.emit(FlowEvent::CacheCheck {
-            span_id,
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             query: query.into(),
             valid,
         });
     }
 
     #[inline]
-    fn on_query_end(&self, span_id: SpanId, query: &QueryCacheKey, result: TracerExecutionResult) {
+    fn on_query_end(
+        &self,
+        ctx: &SpanContext,
+        query: &QueryCacheKey,
+        result: TracerExecutionResult,
+    ) {
         let duration = self
             .start_times
             .lock()
             .unwrap()
-            .remove(&span_id)
+            .remove(&ctx.span_id)
             .map(|start| start.elapsed())
             .unwrap_or(Duration::ZERO);
         self.sink.emit(FlowEvent::QueryEnd {
-            span_id,
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             query: query.into(),
             result: result.into(),
             duration,
@@ -104,12 +122,14 @@ impl Tracer for EventSinkTracer {
     #[inline]
     fn on_dependency_registered(
         &self,
-        span_id: SpanId,
+        ctx: &SpanContext,
         parent: &FullCacheKey,
         dependency: &FullCacheKey,
     ) {
         self.sink.emit(FlowEvent::DependencyRegistered {
-            span_id,
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             parent: parent.into(),
             dependency: dependency.into(),
         });
@@ -118,21 +138,30 @@ impl Tracer for EventSinkTracer {
     #[inline]
     fn on_asset_dependency_registered(
         &self,
-        span_id: SpanId,
+        ctx: &SpanContext,
         parent: &FullCacheKey,
         asset: &FullCacheKey,
     ) {
         self.sink.emit(FlowEvent::AssetDependencyRegistered {
-            span_id,
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             parent: parent.into(),
             asset: asset.into(),
         });
     }
 
     #[inline]
-    fn on_early_cutoff_check(&self, span_id: SpanId, query: &QueryCacheKey, output_changed: bool) {
+    fn on_early_cutoff_check(
+        &self,
+        ctx: &SpanContext,
+        query: &QueryCacheKey,
+        output_changed: bool,
+    ) {
         self.sink.emit(FlowEvent::EarlyCutoffCheck {
-            span_id,
+            span_id: ctx.span_id,
+            trace_id: ctx.trace_id,
+            parent_span_id: ctx.parent_span_id,
             query: query.into(),
             output_changed,
         });
@@ -197,11 +226,17 @@ mod tests {
 
         // Generate some events
         let span_id = tracer.new_span_id();
+        let trace_id = tracer.new_trace_id();
+        let ctx = SpanContext {
+            span_id,
+            trace_id,
+            parent_span_id: None,
+        };
         let query = QueryCacheKey::new(("TestQuery",));
 
-        tracer.on_query_start(span_id, &query);
-        tracer.on_cache_check(span_id, &query, false);
-        tracer.on_query_end(span_id, &query, TracerExecutionResult::Changed);
+        tracer.on_query_start(&ctx, &query);
+        tracer.on_cache_check(&ctx, &query, false);
+        tracer.on_query_end(&ctx, &query, TracerExecutionResult::Changed);
 
         // Check events were collected
         let events = collector.events();

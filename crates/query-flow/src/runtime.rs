@@ -20,7 +20,8 @@ use crate::storage::{
     QueryRegistry, VerifierStorage,
 };
 use crate::tracer::{
-    ExecutionResult, InvalidationReason, NoopTracer, SpanId, Tracer, TracerAssetState,
+    ExecutionResult, InvalidationReason, NoopTracer, SpanContext, SpanId, TraceId, Tracer,
+    TracerAssetState,
 };
 use crate::QueryError;
 
@@ -41,6 +42,16 @@ thread_local! {
     /// Set during query execution, used by all nested locator calls.
     /// Uses Rc since thread-local is single-threaded.
     static CONSISTENCY_TRACKER: RefCell<Option<Rc<ConsistencyTracker>>> = const { RefCell::new(None) };
+
+    /// Stack for tracking parent-child query relationships.
+    static SPAN_STACK: RefCell<SpanStack> = const { RefCell::new(SpanStack::Empty) };
+}
+
+/// Thread-local span stack state.
+/// Empty when no query is executing; Active with trace_id and span stack during execution.
+enum SpanStack {
+    Empty,
+    Active(TraceId, Vec<SpanId>),
 }
 
 /// Check a leaf asset against the current consistency tracker (if any).
@@ -108,25 +119,56 @@ impl Drop for StackGuard {
     }
 }
 
+/// RAII guard for pushing/popping from span stack.
+struct SpanStackGuard;
+
+impl SpanStackGuard {
+    /// Push a span onto the stack. Sets trace_id if this is the root span.
+    fn push(trace_id: TraceId, span_id: SpanId) -> Self {
+        SPAN_STACK.with(|stack| {
+            let mut s = stack.borrow_mut();
+            match &mut *s {
+                SpanStack::Empty => *s = SpanStack::Active(trace_id, vec![span_id]),
+                SpanStack::Active(_, spans) => spans.push(span_id),
+            }
+        });
+        SpanStackGuard
+    }
+}
+
+impl Drop for SpanStackGuard {
+    fn drop(&mut self) {
+        SPAN_STACK.with(|stack| {
+            let mut s = stack.borrow_mut();
+            if let SpanStack::Active(_, spans) = &mut *s {
+                spans.pop();
+                if spans.is_empty() {
+                    *s = SpanStack::Empty;
+                }
+            }
+        });
+    }
+}
+
 /// Execution context passed through query execution.
 ///
-/// Contains a span ID for tracing correlation.
+/// Contains a SpanContext for tracing correlation with parent-child relationships.
 #[derive(Clone, Copy)]
 pub struct ExecutionContext {
-    span_id: SpanId,
+    span_ctx: SpanContext,
 }
 
 impl ExecutionContext {
-    /// Create a new execution context with the given span ID.
+    /// Create a new execution context with the given span context.
     #[inline]
-    pub fn new(span_id: SpanId) -> Self {
-        Self { span_id }
+    pub fn new(span_ctx: SpanContext) -> Self {
+        Self { span_ctx }
     }
 
-    /// Get the span ID for this execution context.
+    /// Get the span context for this execution context.
     #[inline]
-    pub fn span_id(&self) -> SpanId {
-        self.span_id
+    pub fn span_ctx(&self) -> &SpanContext {
+        &self.span_ctx
     }
 }
 
@@ -321,11 +363,23 @@ impl<T: Tracer> QueryRuntime<T> {
         let query_cache_key = QueryCacheKey::new(query.clone());
         let full_key: FullCacheKey = query_cache_key.clone().into();
 
-        // Create execution context and emit start event
+        // Create SpanContext with parent relationship from SPAN_STACK
         let span_id = self.tracer.new_span_id();
-        let exec_ctx = ExecutionContext::new(span_id);
+        let (trace_id, parent_span_id) = SPAN_STACK.with(|stack| match &*stack.borrow() {
+            SpanStack::Empty => (self.tracer.new_trace_id(), None),
+            SpanStack::Active(tid, spans) => (*tid, spans.last().copied()),
+        });
+        let span_ctx = SpanContext {
+            span_id,
+            trace_id,
+            parent_span_id,
+        };
 
-        self.tracer.on_query_start(span_id, &query_cache_key);
+        // Push to span stack and create execution context
+        let _span_guard = SpanStackGuard::push(trace_id, span_id);
+        let exec_ctx = ExecutionContext::new(span_ctx);
+
+        self.tracer.on_query_start(&span_ctx, &query_cache_key);
 
         // Check for cycles using thread-local stack
         let cycle_detected = QUERY_STACK.with(|stack| {
@@ -343,7 +397,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
             self.tracer.on_cycle_detected(&path);
             self.tracer
-                .on_query_end(span_id, &query_cache_key, ExecutionResult::CycleDetected);
+                .on_query_end(&span_ctx, &query_cache_key, ExecutionResult::CycleDetected);
 
             return Err(QueryError::Cycle { path });
         }
@@ -355,9 +409,10 @@ impl<T: Tracer> QueryRuntime<T> {
         if self.whale.is_verified_at(&full_key, &current_rev) {
             // Single atomic access to get both cached value and revision
             if let Some((cached, revision)) = self.get_cached_with_revision::<Q>(&full_key) {
-                self.tracer.on_cache_check(span_id, &query_cache_key, true);
                 self.tracer
-                    .on_query_end(span_id, &query_cache_key, ExecutionResult::CacheHit);
+                    .on_cache_check(&span_ctx, &query_cache_key, true);
+                self.tracer
+                    .on_query_end(&span_ctx, &query_cache_key, ExecutionResult::CacheHit);
 
                 return match cached {
                     CachedValue::Ok(output) => Ok((Ok(output), revision)),
@@ -392,9 +447,13 @@ impl<T: Tracer> QueryRuntime<T> {
                     // Deps didn't change their changed_at, mark as verified and use cached
                     self.whale.mark_verified(&full_key, &current_rev);
 
-                    self.tracer.on_cache_check(span_id, &query_cache_key, true);
                     self.tracer
-                        .on_query_end(span_id, &query_cache_key, ExecutionResult::CacheHit);
+                        .on_cache_check(&span_ctx, &query_cache_key, true);
+                    self.tracer.on_query_end(
+                        &span_ctx,
+                        &query_cache_key,
+                        ExecutionResult::CacheHit,
+                    );
 
                     return match cached {
                         CachedValue::Ok(output) => Ok((Ok(output), revision)),
@@ -405,7 +464,8 @@ impl<T: Tracer> QueryRuntime<T> {
             }
         }
 
-        self.tracer.on_cache_check(span_id, &query_cache_key, false);
+        self.tracer
+            .on_cache_check(&span_ctx, &query_cache_key, false);
 
         // Execute the query with cycle tracking
         let _guard = StackGuard::push(full_key.clone());
@@ -423,7 +483,7 @@ impl<T: Tracer> QueryRuntime<T> {
             },
         };
         self.tracer
-            .on_query_end(span_id, &query_cache_key, exec_result);
+            .on_query_end(&span_ctx, &query_cache_key, exec_result);
 
         result.map(|(inner_result, _, revision)| (inner_result, revision))
     }
@@ -496,7 +556,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
                 // Emit early cutoff check event
                 self.tracer.on_early_cutoff_check(
-                    exec_ctx.span_id(),
+                    exec_ctx.span_ctx(),
                     query_cache_key,
                     output_changed,
                 );
@@ -555,7 +615,7 @@ impl<T: Tracer> QueryRuntime<T> {
 
                 // Emit early cutoff check event
                 self.tracer.on_early_cutoff_check(
-                    exec_ctx.span_id(),
+                    exec_ctx.span_ctx(),
                     query_cache_key,
                     output_changed,
                 );
@@ -1772,7 +1832,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
 
         // Emit dependency registered event
         self.runtime.tracer.on_dependency_registered(
-            self.exec_ctx.span_id(),
+            self.exec_ctx.span_ctx(),
             &self.current_key,
             &full_key,
         );
@@ -1832,7 +1892,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
 
         // 1. Emit asset dependency registered event
         self.runtime.tracer.on_asset_dependency_registered(
-            self.exec_ctx.span_id(),
+            self.exec_ctx.span_ctx(),
             &self.current_key,
             &full_cache_key,
         );
@@ -1874,7 +1934,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
         let sentinel: FullCacheKey = QuerySetSentinelKey::new::<Q>().into();
 
         self.runtime.tracer.on_dependency_registered(
-            self.exec_ctx.span_id(),
+            self.exec_ctx.span_ctx(),
             &self.current_key,
             &sentinel,
         );
@@ -1922,7 +1982,7 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
         let sentinel: FullCacheKey = AssetKeySetSentinelKey::new::<K>().into();
 
         self.runtime.tracer.on_asset_dependency_registered(
-            self.exec_ctx.span_id(),
+            self.exec_ctx.span_ctx(),
             &self.current_key,
             &sentinel,
         );
@@ -2465,6 +2525,7 @@ mod tests {
     // Tests for GC APIs
     mod gc_tests {
         use super::*;
+        use crate::tracer::{SpanContext, SpanId, TraceId};
         use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
@@ -2607,7 +2668,11 @@ mod tests {
                 SpanId(1)
             }
 
-            fn on_query_start(&self, _span_id: SpanId, query_key: &QueryCacheKey) {
+            fn new_trace_id(&self) -> TraceId {
+                TraceId(1)
+            }
+
+            fn on_query_start(&self, _ctx: &SpanContext, query_key: &QueryCacheKey) {
                 self.accessed_keys
                     .lock()
                     .unwrap()

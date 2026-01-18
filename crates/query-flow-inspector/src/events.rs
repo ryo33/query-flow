@@ -6,8 +6,10 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-// Re-export SpanId from query-flow
-pub use query_flow::SpanId;
+// Re-export span types from query-flow
+// SpanContext is re-exported for downstream users even though it's not used directly here
+#[allow(unused_imports)]
+pub use query_flow::{SpanContext, SpanId, TraceId};
 
 // Import tracer types for From impls
 use query_flow::{
@@ -200,11 +202,18 @@ impl From<TracerAssetState> for AssetState {
 pub enum FlowEvent {
     // === Query Lifecycle ===
     /// Query execution started.
-    QueryStart { span_id: SpanId, query: QueryKey },
+    QueryStart {
+        span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        query: QueryKey,
+    },
 
     /// Cache validity check completed.
     CacheCheck {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         query: QueryKey,
         /// Whether the cached value was valid.
         valid: bool,
@@ -213,6 +222,8 @@ pub enum FlowEvent {
     /// Query execution completed.
     QueryEnd {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         query: QueryKey,
         result: ExecutionResult,
         /// Duration of the query execution.
@@ -223,6 +234,8 @@ pub enum FlowEvent {
     /// A query dependency was registered during execution.
     DependencyRegistered {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         parent: QueryKey,
         dependency: QueryKey,
     },
@@ -230,6 +243,8 @@ pub enum FlowEvent {
     /// An asset dependency was registered during execution.
     AssetDependencyRegistered {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         parent: QueryKey,
         asset: AssetKey,
     },
@@ -238,6 +253,8 @@ pub enum FlowEvent {
     /// Output comparison for early cutoff was performed.
     EarlyCutoffCheck {
         span_id: SpanId,
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
         query: QueryKey,
         /// Whether the output changed compared to the cached value.
         output_changed: bool,
@@ -419,7 +436,7 @@ impl ExecutionTrace {
     /// Get all query start events.
     pub fn query_starts(&self) -> impl Iterator<Item = (&SpanId, &QueryKey)> {
         self.events.iter().filter_map(|e| match e {
-            FlowEvent::QueryStart { span_id, query } => Some((span_id, query)),
+            FlowEvent::QueryStart { span_id, query, .. } => Some((span_id, query)),
             _ => None,
         })
     }
@@ -434,6 +451,7 @@ impl ExecutionTrace {
                 query,
                 result,
                 duration,
+                ..
             } => Some((span_id, query, result, duration)),
             _ => None,
         })
@@ -484,14 +502,19 @@ mod tests {
     fn test_execution_trace() {
         let mut trace = ExecutionTrace::new();
         let span_id = SpanId(1);
+        let trace_id = TraceId(1);
         let query = QueryKey::new("TestQuery", "(1)");
 
         trace.push(FlowEvent::QueryStart {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
         });
         trace.push(FlowEvent::QueryEnd {
             span_id,
+            trace_id,
+            parent_span_id: None,
             query: query.clone(),
             result: ExecutionResult::Changed,
             duration: Duration::from_millis(10),
@@ -505,6 +528,8 @@ mod tests {
     fn test_serde_roundtrip() {
         let event = FlowEvent::QueryStart {
             span_id: SpanId(42),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("TestQuery", "(1)"),
         };
 

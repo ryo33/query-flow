@@ -109,7 +109,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{QueryKey, SpanId};
+    use crate::events::{QueryKey, SpanId, TraceId};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
@@ -140,6 +140,8 @@ mod tests {
         let sink = NullSink;
         sink.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
         // No panic = success
@@ -165,6 +167,8 @@ mod tests {
 
         multiplex.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
 
@@ -180,6 +184,8 @@ mod tests {
         // This should pass the filter
         filter_sink.emit(FlowEvent::QueryStart {
             span_id: SpanId(1),
+            trace_id: TraceId(1),
+            parent_span_id: None,
             query: QueryKey::new("Test", "()"),
         });
 

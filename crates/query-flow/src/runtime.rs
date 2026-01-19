@@ -526,7 +526,8 @@ impl<T: Tracer> QueryRuntime<T> {
         };
 
         // Execute the query (clone because query() takes ownership)
-        let result = query.clone().query(&ctx);
+        let db = DbDispatch::QueryContext(&ctx);
+        let result = query.clone().query(&db);
 
         // Get collected dependencies
         let deps: Vec<FullCacheKey> = ctx.deps.borrow().clone();
@@ -1883,7 +1884,7 @@ impl ConsistencyTracker {
 /// Context provided to queries during execution.
 ///
 /// Use this to access dependencies via `query()`.
-pub struct QueryContext<'a, T: Tracer = NoopTracer> {
+pub(crate) struct QueryContext<'a, T: Tracer = NoopTracer> {
     runtime: &'a QueryRuntime<T>,
     current_key: FullCacheKey,
     exec_ctx: ExecutionContext,
@@ -2161,6 +2162,54 @@ impl<T: Tracer> Db for LocatorContext<'_, T> {
 
     fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
         self.runtime.list_asset_keys()
+    }
+}
+
+/// Enum dispatch wrapper for Db implementations.
+///
+/// Reduces monomorphization by providing a single concrete type
+/// for `&impl Db` parameters in user code.
+pub(crate) enum DbDispatch<'a, T: Tracer = NoopTracer> {
+    /// Query execution context (tracks query dependencies)
+    QueryContext(&'a QueryContext<'a, T>),
+    /// Locator execution context (tracks asset dependencies)
+    LocatorContext(&'a LocatorContext<'a, T>),
+}
+
+impl<T: Tracer> Db for DbDispatch<'_, T> {
+    fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
+        match self {
+            DbDispatch::QueryContext(ctx) => ctx.query(query),
+            DbDispatch::LocatorContext(ctx) => ctx.query(query),
+        }
+    }
+
+    fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError> {
+        match self {
+            DbDispatch::QueryContext(ctx) => ctx.asset(key),
+            DbDispatch::LocatorContext(ctx) => ctx.asset(key),
+        }
+    }
+
+    fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError> {
+        match self {
+            DbDispatch::QueryContext(ctx) => ctx.asset_state(key),
+            DbDispatch::LocatorContext(ctx) => ctx.asset_state(key),
+        }
+    }
+
+    fn list_queries<Q: Query>(&self) -> Vec<Q> {
+        match self {
+            DbDispatch::QueryContext(ctx) => ctx.list_queries(),
+            DbDispatch::LocatorContext(ctx) => ctx.list_queries(),
+        }
+    }
+
+    fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
+        match self {
+            DbDispatch::QueryContext(ctx) => ctx.list_asset_keys(),
+            DbDispatch::LocatorContext(ctx) => ctx.list_asset_keys(),
+        }
     }
 }
 

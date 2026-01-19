@@ -9,6 +9,7 @@ use papaya::HashMap;
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel};
 use crate::key::{AssetCacheKey, FullCacheKey};
 use crate::query::Query;
+use crate::runtime::DbDispatch;
 
 /// Cached query result (success or user error).
 ///
@@ -122,7 +123,8 @@ fn erased_locate_with_locator_ctx<K: AssetKey, L: AssetLocator<K>, T: crate::Tra
 ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
     let locator = locator.downcast_ref::<L>()?;
     let key = key.downcast_ref::<K>()?;
-    Some(locator.locate(locator_ctx, key).map(|result| match result {
+    let db = DbDispatch::LocatorContext(locator_ctx);
+    Some(locator.locate(&db, key).map(|result| match result {
         crate::asset::LocateResult::Ready { value, durability } => ErasedLocateResult::Ready {
             value: Arc::new(value) as Arc<dyn Any + Send + Sync>,
             durability,

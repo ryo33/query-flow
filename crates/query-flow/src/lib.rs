@@ -56,11 +56,11 @@ pub use asset::{AssetKey, AssetLocator, DurabilityLevel, LocateResult, PendingAs
 pub use db::Db;
 pub use error::{QueryError, QueryResultExt, TypedErr};
 pub use key::{
-    AssetCacheKey, AssetKeySetSentinelKey, CacheKey, FullCacheKey, QueryCacheKey,
+    AssetCacheKey, AssetKeySetSentinelKey, Cachable, CacheKey, FullCacheKey, QueryCacheKey,
     QuerySetSentinelKey,
 };
 pub use loading::AssetLoadingState;
-pub use query::Query;
+pub use query::{Query, QueryOutput};
 pub use query_flow_macros::{asset_key, asset_locator, query};
 pub use runtime::{ErrorComparator, Polled, QueryRuntime, QueryRuntimeBuilder};
 pub use tracer::{

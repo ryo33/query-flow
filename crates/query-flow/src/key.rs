@@ -403,3 +403,13 @@ impl From<AssetKeySetSentinelKey> for FullCacheKey {
         FullCacheKey::AssetKeySetSentinel(key)
     }
 }
+
+/// Convenience trait for types that can be used in query cache keys.
+///
+/// This trait combines all the bounds needed for a type to be used as a
+/// field in a generic query struct: `Hash + Eq + Clone + Debug + Send + Sync + 'static`.
+///
+/// Use this trait bound on generic type parameters that appear in query fields.
+/// For type parameters that only appear in the output, use `QueryOutput` instead.
+pub trait Cachable: std::hash::Hash + Eq + Clone + std::fmt::Debug + Send + Sync + 'static {}
+impl<T: std::hash::Hash + Eq + Clone + std::fmt::Debug + Send + Sync + 'static> Cachable for T {}

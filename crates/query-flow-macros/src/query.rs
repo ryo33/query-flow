@@ -3,7 +3,8 @@ use heck::ToUpperCamelCase as _;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    spanned::Spanned as _, Error, FnArg, Ident, ItemFn, Pat, PatType, ReturnType, Type, Visibility,
+    spanned::Spanned as _, Error, FnArg, Generics, Ident, ItemFn, Pat, PatType, ReturnType, Type,
+    Visibility,
 };
 
 /// Wrapper for parsing a list of identifiers: `keys(a, b, c)`
@@ -119,6 +120,7 @@ struct Param {
 struct ParsedFn {
     vis: Visibility,
     name: Ident,
+    generics: Generics,
     params: Vec<Param>,
     output_ty: Type,
 }
@@ -235,6 +237,7 @@ fn validate_format_fields(segments: &[FormatSegment], params: &[Param]) -> Resul
 /// Generate a custom Debug impl from the format string.
 fn generate_custom_debug(
     struct_name: &Ident,
+    generics: &Generics,
     format: &str,
     params: &[Param],
 ) -> Result<TokenStream, Error> {
@@ -242,6 +245,8 @@ fn generate_custom_debug(
         parse_format_string(format).map_err(|e| Error::new(proc_macro2::Span::call_site(), e))?;
 
     validate_format_fields(&segments, params)?;
+
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     // Build the write! format string and arguments
     let mut fmt_string = String::new();
@@ -292,7 +297,7 @@ fn generate_custom_debug(
     }
 
     Ok(quote! {
-        impl ::std::fmt::Debug for #struct_name {
+        impl #impl_generics ::std::fmt::Debug for #struct_name #ty_generics #where_clause {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 write!(f, #fmt_string #(, #fmt_args)*)
             }
@@ -370,6 +375,7 @@ pub fn generate_query(attr: QueryAttr, input_fn: ItemFn) -> Result<TokenStream, 
 fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     let vis = input_fn.vis.clone();
     let name = input_fn.sig.ident.clone();
+    let generics = input_fn.sig.generics.clone();
 
     // Check that first param is db: &impl Db
     let mut iter = input_fn.sig.inputs.iter();
@@ -402,6 +408,7 @@ fn parse_function(input_fn: &ItemFn) -> Result<ParsedFn, Error> {
     Ok(ParsedFn {
         vis,
         name,
+        generics,
         params,
         output_ty,
     })
@@ -485,6 +492,111 @@ fn extract_arc_inner(ty: &Type) -> Option<Type> {
     None
 }
 
+/// Recursively extract all type identifiers from a type.
+/// This is used to find which type parameters are actually used in fields.
+fn extract_type_idents(ty: &Type, idents: &mut std::collections::HashSet<Ident>) {
+    match ty {
+        Type::Path(type_path) => {
+            // Check if this is a simple ident (like T or E)
+            if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
+                let segment = &type_path.path.segments[0];
+                idents.insert(segment.ident.clone());
+            }
+            // Recurse into generic arguments
+            for segment in &type_path.path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    for arg in &args.args {
+                        if let syn::GenericArgument::Type(inner_ty) = arg {
+                            extract_type_idents(inner_ty, idents);
+                        }
+                    }
+                }
+            }
+        }
+        Type::Reference(type_ref) => {
+            extract_type_idents(&type_ref.elem, idents);
+        }
+        Type::Slice(type_slice) => {
+            extract_type_idents(&type_slice.elem, idents);
+        }
+        Type::Array(type_array) => {
+            extract_type_idents(&type_array.elem, idents);
+        }
+        Type::Tuple(type_tuple) => {
+            for elem in &type_tuple.elems {
+                extract_type_idents(elem, idents);
+            }
+        }
+        Type::Paren(type_paren) => {
+            extract_type_idents(&type_paren.elem, idents);
+        }
+        Type::Group(type_group) => {
+            extract_type_idents(&type_group.elem, idents);
+        }
+        Type::Ptr(type_ptr) => {
+            extract_type_idents(&type_ptr.elem, idents);
+        }
+        Type::TraitObject(type_trait_object) => {
+            for bound in &type_trait_object.bounds {
+                if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                    for segment in &trait_bound.path.segments {
+                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                            for arg in &args.args {
+                                if let syn::GenericArgument::Type(inner_ty) = arg {
+                                    extract_type_idents(inner_ty, idents);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Type::ImplTrait(type_impl_trait) => {
+            for bound in &type_impl_trait.bounds {
+                if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                    for segment in &trait_bound.path.segments {
+                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                            for arg in &args.args {
+                                if let syn::GenericArgument::Type(inner_ty) = arg {
+                                    extract_type_idents(inner_ty, idents);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Type::BareFn(type_fn) => {
+            for input in &type_fn.inputs {
+                extract_type_idents(&input.ty, idents);
+            }
+            if let syn::ReturnType::Type(_, ret_ty) = &type_fn.output {
+                extract_type_idents(ret_ty, idents);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find type parameters from generics that are not used in any of the params.
+/// These need PhantomData fields in the generated struct.
+fn unused_type_params(generics: &Generics, params: &[Param]) -> Vec<Ident> {
+    // Collect all type idents used in params
+    let mut used_idents = std::collections::HashSet::new();
+    for param in params {
+        extract_type_idents(&param.ty, &mut used_idents);
+    }
+
+    // Find type params not in used_idents
+    let mut unused = Vec::new();
+    for type_param in generics.type_params() {
+        if !used_idents.contains(&type_param.ident) {
+            unused.push(type_param.ident.clone());
+        }
+    }
+    unused
+}
+
 fn generate_struct(
     parsed: &ParsedFn,
     struct_name: &Ident,
@@ -492,7 +604,17 @@ fn generate_struct(
     debug: &DebugFormat,
 ) -> Result<TokenStream, Error> {
     let vis = &parsed.vis;
-    let fields: Vec<_> = parsed
+    let generics = &parsed.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    // Find type parameters not used in fields - they need PhantomData
+    let unused_params = unused_type_params(generics, &parsed.params);
+
+    // Check if there are any generic type params at all
+    let has_type_params = generics.type_params().count() > 0;
+
+    // Generate field definitions
+    let mut fields: Vec<_> = parsed
         .params
         .iter()
         .map(|p| {
@@ -502,30 +624,72 @@ fn generate_struct(
         })
         .collect();
 
+    // Add PhantomData fields for unused type params
+    let phantom_field_names: Vec<_> = unused_params
+        .iter()
+        .map(|p| format_ident!("_phantom_{}", p.to_string().to_lowercase()))
+        .collect();
+    for (phantom_name, type_param) in phantom_field_names.iter().zip(&unused_params) {
+        fields.push(quote! { #phantom_name: ::std::marker::PhantomData<#type_param> });
+    }
+
     let field_names: Vec<_> = parsed.params.iter().map(|p| &p.name).collect();
     let field_types: Vec<_> = parsed.params.iter().map(|p| &p.ty).collect();
 
-    let new_impl = if parsed.params.is_empty() {
+    // PhantomData initializers for new()
+    let phantom_inits: Vec<_> = phantom_field_names
+        .iter()
+        .map(|name| quote! { #name: ::std::marker::PhantomData })
+        .collect();
+
+    let new_impl = if parsed.params.is_empty() && phantom_field_names.is_empty() {
         quote! {
-            impl #struct_name {
+            impl #impl_generics #struct_name #ty_generics #where_clause {
                 /// Create a new query instance.
                 #vis fn new() -> Self {
                     Self {}
                 }
             }
 
-            impl ::std::default::Default for #struct_name {
+            impl #impl_generics ::std::default::Default for #struct_name #ty_generics #where_clause {
                 fn default() -> Self {
                     Self::new()
                 }
             }
         }
-    } else {
+    } else if parsed.params.is_empty() {
+        // Has phantom data but no regular fields
         quote! {
-            impl #struct_name {
+            impl #impl_generics #struct_name #ty_generics #where_clause {
+                /// Create a new query instance.
+                #vis fn new() -> Self {
+                    Self { #( #phantom_inits ),* }
+                }
+            }
+
+            impl #impl_generics ::std::default::Default for #struct_name #ty_generics #where_clause {
+                fn default() -> Self {
+                    Self::new()
+                }
+            }
+        }
+    } else if phantom_field_names.is_empty() {
+        // Has regular fields but no phantom data
+        quote! {
+            impl #impl_generics #struct_name #ty_generics #where_clause {
                 /// Create a new query instance.
                 #vis fn new(#( #field_names: #field_types ),*) -> Self {
                     Self { #( #field_names ),* }
+                }
+            }
+        }
+    } else {
+        // Has both regular fields and phantom data
+        quote! {
+            impl #impl_generics #struct_name #ty_generics #where_clause {
+                /// Create a new query instance.
+                #vis fn new(#( #field_names: #field_types ),*) -> Self {
+                    Self { #( #field_names, )* #( #phantom_inits ),* }
                 }
             }
         }
@@ -537,15 +701,30 @@ fn generate_struct(
             .iter()
             .all(|kp| parsed.params.iter().any(|p| p.name == kp.name));
 
-    let hash_eq_impl = if all_fields_are_keys {
-        // All fields are keys, use derive
+    // When we have any type parameters, we MUST generate manual impls for Hash/Eq/Clone/Debug.
+    // This is because:
+    // 1. PhantomData fields: derive would require bounds on phantom type params, but PhantomData
+    //    unconditionally implements these traits.
+    // 2. Type params in fields: `T: Cachable` doesn't give us `T: Hash + Eq` that derive needs.
+    //    (CacheKey uses DynHash/DynEq, not direct Hash/Eq)
+    // Manual impls delegate to the field types which must implement the traits.
+    let needs_manual_impls = has_type_params;
+
+    let hash_eq_impl = if all_fields_are_keys && !needs_manual_impls {
+        // All fields are keys and no phantom data, use derive
         quote! {}
     } else {
-        // Custom keys specified, generate custom Hash/Eq
-        let key_names: Vec<_> = key_params.iter().map(|p| &p.name).collect();
+        // Either custom keys specified or we have phantom data - generate custom Hash/Eq
+        let key_names: Vec<_> = if all_fields_are_keys {
+            // All fields are keys
+            parsed.params.iter().map(|p| &p.name).collect()
+        } else {
+            // Custom keys specified
+            key_params.iter().map(|p| &p.name).collect()
+        };
 
-        let hash_body = if key_params.is_empty() {
-            // No key fields means all instances are equal
+        let hash_body = if key_names.is_empty() {
+            // No key fields means all instances are equal (singleton)
             quote! {}
         } else {
             quote! {
@@ -553,13 +732,12 @@ fn generate_struct(
             }
         };
 
-        let eq_body = if key_params.is_empty() {
+        let eq_body = if key_names.is_empty() {
             quote! { true }
         } else {
-            let comparisons: Vec<_> = key_params
+            let comparisons: Vec<_> = key_names
                 .iter()
-                .map(|p| {
-                    let name = &p.name;
+                .map(|name| {
                     quote! { self.#name == other.#name }
                 })
                 .collect();
@@ -567,45 +745,106 @@ fn generate_struct(
         };
 
         quote! {
-            impl ::std::hash::Hash for #struct_name {
+            impl #impl_generics ::std::hash::Hash for #struct_name #ty_generics #where_clause {
                 fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
                     #hash_body
                 }
             }
 
-            impl ::std::cmp::PartialEq for #struct_name {
+            impl #impl_generics ::std::cmp::PartialEq for #struct_name #ty_generics #where_clause {
                 fn eq(&self, other: &Self) -> bool {
                     #eq_body
                 }
             }
 
-            impl ::std::cmp::Eq for #struct_name {}
+            impl #impl_generics ::std::cmp::Eq for #struct_name #ty_generics #where_clause {}
         }
+    };
+
+    // Generate Clone impl manually if we have phantom data
+    let clone_impl = if needs_manual_impls {
+        let clone_fields: Vec<_> = field_names
+            .iter()
+            .map(|name| quote! { #name: self.#name.clone() })
+            .collect();
+        let phantom_clones: Vec<_> = phantom_field_names
+            .iter()
+            .map(|name| quote! { #name: ::std::marker::PhantomData })
+            .collect();
+
+        quote! {
+            impl #impl_generics ::std::clone::Clone for #struct_name #ty_generics #where_clause {
+                fn clone(&self) -> Self {
+                    Self {
+                        #( #clone_fields, )*
+                        #( #phantom_clones ),*
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
     };
 
     // Determine if we use derive(Debug) or custom Debug impl
     let use_derive_debug = matches!(debug, DebugFormat::Derive);
 
-    let derives = match (all_fields_are_keys, use_derive_debug) {
-        (true, true) => quote! { #[derive(Clone, Debug, Hash, PartialEq, Eq)] },
-        (true, false) => quote! { #[derive(Clone, Hash, PartialEq, Eq)] },
-        (false, true) => quote! { #[derive(Clone, Debug)] },
-        (false, false) => quote! { #[derive(Clone)] },
+    // Generate Debug impl manually if we have phantom data and user wants derive debug
+    let debug_impl = if needs_manual_impls && use_derive_debug {
+        let debug_fields: Vec<_> = parsed
+            .params
+            .iter()
+            .map(|p| {
+                let name = &p.name;
+                let name_str = name.to_string();
+                quote! { .field(#name_str, &self.#name) }
+            })
+            .collect();
+        let struct_name_str = struct_name.to_string();
+
+        quote! {
+            impl #impl_generics ::std::fmt::Debug for #struct_name #ty_generics #where_clause {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct(#struct_name_str)
+                        #( #debug_fields )*
+                        .finish()
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // Derive macros - only if no phantom data
+    let derives = if needs_manual_impls {
+        // No derives when we have phantom data - we generate manual impls
+        quote! {}
+    } else {
+        match (all_fields_are_keys, use_derive_debug) {
+            (true, true) => quote! { #[derive(Clone, Debug, Hash, PartialEq, Eq)] },
+            (true, false) => quote! { #[derive(Clone, Hash, PartialEq, Eq)] },
+            (false, true) => quote! { #[derive(Clone, Debug)] },
+            (false, false) => quote! { #[derive(Clone)] },
+        }
     };
 
     let custom_debug_impl = match debug {
         DebugFormat::Derive => quote! {},
-        DebugFormat::Custom(format) => generate_custom_debug(struct_name, format, &parsed.params)?,
+        DebugFormat::Custom(format) => {
+            generate_custom_debug(struct_name, generics, format, &parsed.params)?
+        }
     };
 
     Ok(quote! {
         #derives
-        #vis struct #struct_name {
+        #vis struct #struct_name #impl_generics #where_clause {
             #( #fields ),*
         }
 
         #new_impl
+        #clone_impl
         #hash_eq_impl
+        #debug_impl
         #custom_debug_impl
     })
 }
@@ -616,6 +855,8 @@ fn generate_query_impl(
     attr: &QueryAttr,
 ) -> Result<TokenStream, Error> {
     let output_ty = &parsed.output_ty;
+    let generics = &parsed.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     // Check if the function returns Arc<T> - if so, Output = T and we pass through
     // Otherwise, Output = T and we wrap with Arc::new
@@ -653,7 +894,7 @@ fn generate_query_impl(
     };
 
     Ok(quote! {
-        impl ::query_flow::Query for #struct_name {
+        impl #impl_generics ::query_flow::Query for #struct_name #ty_generics #where_clause {
             type Output = #actual_output_ty;
 
             fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
@@ -1464,6 +1705,597 @@ mod tests {
 
                 fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
                     fetch_user(db, self.id).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_simple_generic() {
+        // Test a simple generic type parameter where T is only in output (PhantomData)
+        // When PhantomData is needed, we generate manual impls to avoid requiring bounds on T
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn parse_value<T: Clone>(db: &impl Db, data: Vec<u8>) -> Result<T, QueryError> {
+                todo!()
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn parse_value<T: Clone>(db: &impl Db, data: Vec<u8>) -> Result<T, QueryError> {
+                todo!()
+            }
+
+            struct ParseValue<T: Clone> {
+                pub data: Vec<u8>,
+                _phantom_t: ::std::marker::PhantomData<T>
+            }
+
+            impl<T: Clone> ParseValue<T> {
+                #[doc = r" Create a new query instance."]
+                fn new(data: Vec<u8>) -> Self {
+                    Self { data, _phantom_t: ::std::marker::PhantomData }
+                }
+            }
+
+            impl<T: Clone> ::std::clone::Clone for ParseValue<T> {
+                fn clone(&self) -> Self {
+                    Self {
+                        data: self.data.clone(),
+                        _phantom_t: ::std::marker::PhantomData
+                    }
+                }
+            }
+
+            impl<T: Clone> ::std::hash::Hash for ParseValue<T> {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.data.hash(state);
+                }
+            }
+
+            impl<T: Clone> ::std::cmp::PartialEq for ParseValue<T> {
+                fn eq(&self, other: &Self) -> bool {
+                    self.data == other.data
+                }
+            }
+
+            impl<T: Clone> ::std::cmp::Eq for ParseValue<T> {}
+
+            impl<T: Clone> ::std::fmt::Debug for ParseValue<T> {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct("ParseValue")
+                        .field("data", &self.data)
+                        .finish()
+                }
+            }
+
+            impl<T: Clone> ::query_flow::Query for ParseValue<T> {
+                type Output = T;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    parse_value(db, self.data).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_generic_with_where_clause() {
+        // Test generic with where clause - both T and E are unused in fields (PhantomData)
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn transform<T, E>(db: &impl Db, input: String) -> Result<T, QueryError>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                todo!()
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn transform<T, E>(db: &impl Db, input: String) -> Result<T, QueryError>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                todo!()
+            }
+
+            struct Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                pub input: String,
+                _phantom_t: ::std::marker::PhantomData<T>,
+                _phantom_e: ::std::marker::PhantomData<E>
+            }
+
+            impl<T, E> Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                #[doc = r" Create a new query instance."]
+                fn new(input: String) -> Self {
+                    Self { input, _phantom_t: ::std::marker::PhantomData, _phantom_e: ::std::marker::PhantomData }
+                }
+            }
+
+            impl<T, E> ::std::clone::Clone for Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                fn clone(&self) -> Self {
+                    Self {
+                        input: self.input.clone(),
+                        _phantom_t: ::std::marker::PhantomData,
+                        _phantom_e: ::std::marker::PhantomData
+                    }
+                }
+            }
+
+            impl<T, E> ::std::hash::Hash for Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.input.hash(state);
+                }
+            }
+
+            impl<T, E> ::std::cmp::PartialEq for Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                fn eq(&self, other: &Self) -> bool {
+                    self.input == other.input
+                }
+            }
+
+            impl<T, E> ::std::cmp::Eq for Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {}
+
+            impl<T, E> ::std::fmt::Debug for Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct("Transform")
+                        .field("input", &self.input)
+                        .finish()
+                }
+            }
+
+            impl<T, E> ::query_flow::Query for Transform<T, E>
+            where
+                T: Clone + Default,
+                E: std::error::Error,
+            {
+                type Output = T;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    transform(db, self.input).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_generic_used_in_field() {
+        // Test generic type used in a field (no PhantomData needed).
+        // Manual impls are still generated because T: Cachable doesn't give us T: Hash + Eq for derive.
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn process<T: Clone>(db: &impl Db, value: T) -> Result<String, QueryError> {
+                todo!()
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn process<T: Clone>(db: &impl Db, value: T) -> Result<String, QueryError> {
+                todo!()
+            }
+
+            struct Process<T: Clone> {
+                pub value: T
+            }
+
+            impl<T: Clone> Process<T> {
+                #[doc = r" Create a new query instance."]
+                fn new(value: T) -> Self {
+                    Self { value }
+                }
+            }
+
+            impl<T: Clone> ::std::clone::Clone for Process<T> {
+                fn clone(&self) -> Self {
+                    Self {
+                        value: self.value.clone(),
+                    }
+                }
+            }
+
+            impl<T: Clone> ::std::hash::Hash for Process<T> {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.value.hash(state);
+                }
+            }
+
+            impl<T: Clone> ::std::cmp::PartialEq for Process<T> {
+                fn eq(&self, other: &Self) -> bool {
+                    self.value == other.value
+                }
+            }
+
+            impl<T: Clone> ::std::cmp::Eq for Process<T> {}
+
+            impl<T: Clone> ::std::fmt::Debug for Process<T> {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct("Process")
+                        .field("value", &self.value)
+                        .finish()
+                }
+            }
+
+            impl<T: Clone> ::query_flow::Query for Process<T> {
+                type Output = String;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    process(db, self.value).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_generic_with_custom_debug() {
+        // Test generic with custom debug format - T is unused (PhantomData)
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn fetch<T>(db: &impl Db, id: u64) -> Result<T, QueryError> {
+                todo!()
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(None),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Custom("{Self}({id})".to_string()),
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn fetch<T>(db: &impl Db, id: u64) -> Result<T, QueryError> {
+                todo!()
+            }
+
+            struct Fetch<T> {
+                pub id: u64,
+                _phantom_t: ::std::marker::PhantomData<T>
+            }
+
+            impl<T> Fetch<T> {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64) -> Self {
+                    Self { id, _phantom_t: ::std::marker::PhantomData }
+                }
+            }
+
+            impl<T> ::std::clone::Clone for Fetch<T> {
+                fn clone(&self) -> Self {
+                    Self {
+                        id: self.id.clone(),
+                        _phantom_t: ::std::marker::PhantomData
+                    }
+                }
+            }
+
+            impl<T> ::std::hash::Hash for Fetch<T> {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.id.hash(state);
+                }
+            }
+
+            impl<T> ::std::cmp::PartialEq for Fetch<T> {
+                fn eq(&self, other: &Self) -> bool {
+                    self.id == other.id
+                }
+            }
+
+            impl<T> ::std::cmp::Eq for Fetch<T> {}
+
+            impl<T> ::std::fmt::Debug for Fetch<T> {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    write!(f, "Fetch({})", &self.id)
+                }
+            }
+
+            impl<T> ::query_flow::Query for Fetch<T> {
+                type Output = T;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    fetch(db, self.id).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_generic_partial_phantom() {
+        // Test where some type params are used in fields and others aren't
+        // T is used in field, U is only in output (PhantomData)
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn convert<T, U>(db: &impl Db, input: T) -> Result<U, QueryError> {
+                todo!()
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn convert<T, U>(db: &impl Db, input: T) -> Result<U, QueryError> {
+                todo!()
+            }
+
+            struct Convert<T, U> {
+                pub input: T,
+                _phantom_u: ::std::marker::PhantomData<U>
+            }
+
+            impl<T, U> Convert<T, U> {
+                #[doc = r" Create a new query instance."]
+                fn new(input: T) -> Self {
+                    Self { input, _phantom_u: ::std::marker::PhantomData }
+                }
+            }
+
+            impl<T, U> ::std::clone::Clone for Convert<T, U> {
+                fn clone(&self) -> Self {
+                    Self {
+                        input: self.input.clone(),
+                        _phantom_u: ::std::marker::PhantomData
+                    }
+                }
+            }
+
+            impl<T, U> ::std::hash::Hash for Convert<T, U> {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.input.hash(state);
+                }
+            }
+
+            impl<T, U> ::std::cmp::PartialEq for Convert<T, U> {
+                fn eq(&self, other: &Self) -> bool {
+                    self.input == other.input
+                }
+            }
+
+            impl<T, U> ::std::cmp::Eq for Convert<T, U> {}
+
+            impl<T, U> ::std::fmt::Debug for Convert<T, U> {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct("Convert")
+                        .field("input", &self.input)
+                        .finish()
+                }
+            }
+
+            impl<T, U> ::query_flow::Query for Convert<T, U> {
+                type Output = U;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    convert(db, self.input).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_generic_with_keys() {
+        // Test generic with keys attribute (subset of fields as keys)
+        // T is unused (PhantomData), only id is used as key
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn cached_parse<T>(db: &impl Db, id: u64, opts: String) -> Result<T, QueryError> {
+                todo!()
+            }
+        };
+
+        let attr = QueryAttr {
+            output_eq: OutputEq::None,
+            keys: Keys(Some(vec![format_ident!("id")])),
+            name: None,
+            singleton: false,
+            debug: DebugFormat::Derive,
+        };
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn cached_parse<T>(db: &impl Db, id: u64, opts: String) -> Result<T, QueryError> {
+                todo!()
+            }
+
+            struct CachedParse<T> {
+                pub id: u64,
+                pub opts: String,
+                _phantom_t: ::std::marker::PhantomData<T>
+            }
+
+            impl<T> CachedParse<T> {
+                #[doc = r" Create a new query instance."]
+                fn new(id: u64, opts: String) -> Self {
+                    Self { id, opts, _phantom_t: ::std::marker::PhantomData }
+                }
+            }
+
+            impl<T> ::std::clone::Clone for CachedParse<T> {
+                fn clone(&self) -> Self {
+                    Self {
+                        id: self.id.clone(),
+                        opts: self.opts.clone(),
+                        _phantom_t: ::std::marker::PhantomData
+                    }
+                }
+            }
+
+            impl<T> ::std::hash::Hash for CachedParse<T> {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                    self.id.hash(state);
+                }
+            }
+
+            impl<T> ::std::cmp::PartialEq for CachedParse<T> {
+                fn eq(&self, other: &Self) -> bool {
+                    self.id == other.id
+                }
+            }
+
+            impl<T> ::std::cmp::Eq for CachedParse<T> {}
+
+            impl<T> ::std::fmt::Debug for CachedParse<T> {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct("CachedParse")
+                        .field("id", &self.id)
+                        .field("opts", &self.opts)
+                        .finish()
+                }
+            }
+
+            impl<T> ::query_flow::Query for CachedParse<T> {
+                type Output = T;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    cached_parse(db, self.id, self.opts).map(::std::sync::Arc::new)
+                }
+
+                fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {
+                    old == new
+                }
+            }
+        };
+
+        assert_eq!(normalize_tokens(output), normalize_tokens(expected));
+    }
+
+    #[test]
+    fn test_query_macro_no_params_with_generic() {
+        // Test generic query with no parameters (only PhantomData)
+        let input_fn: ItemFn = syn::parse_quote! {
+            fn get_default<T: Default>(db: &impl Db) -> Result<T, QueryError> {
+                Ok(T::default())
+            }
+        };
+
+        let attr = QueryAttr::default();
+        let output = generate_query(attr, input_fn).unwrap();
+
+        let expected = quote! {
+            fn get_default<T: Default>(db: &impl Db) -> Result<T, QueryError> {
+                Ok(T::default())
+            }
+
+            struct GetDefault<T: Default> {
+                _phantom_t: ::std::marker::PhantomData<T>
+            }
+
+            impl<T: Default> GetDefault<T> {
+                #[doc = r" Create a new query instance."]
+                fn new() -> Self {
+                    Self { _phantom_t: ::std::marker::PhantomData }
+                }
+            }
+
+            impl<T: Default> ::std::default::Default for GetDefault<T> {
+                fn default() -> Self {
+                    Self::new()
+                }
+            }
+
+            impl<T: Default> ::std::clone::Clone for GetDefault<T> {
+                fn clone(&self) -> Self {
+                    Self {
+                        _phantom_t: ::std::marker::PhantomData
+                    }
+                }
+            }
+
+            impl<T: Default> ::std::hash::Hash for GetDefault<T> {
+                fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                }
+            }
+
+            impl<T: Default> ::std::cmp::PartialEq for GetDefault<T> {
+                fn eq(&self, other: &Self) -> bool {
+                    true
+                }
+            }
+
+            impl<T: Default> ::std::cmp::Eq for GetDefault<T> {}
+
+            impl<T: Default> ::std::fmt::Debug for GetDefault<T> {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.debug_struct("GetDefault")
+                        .finish()
+                }
+            }
+
+            impl<T: Default> ::query_flow::Query for GetDefault<T> {
+                type Output = T;
+
+                fn query(self, db: &impl ::query_flow::Db) -> ::std::result::Result<::std::sync::Arc<Self::Output>, ::query_flow::QueryError> {
+                    get_default(db).map(::std::sync::Arc::new)
                 }
 
                 fn output_eq(old: &Self::Output, new: &Self::Output) -> bool {

@@ -95,3 +95,37 @@ pub trait Query: CacheKey + Clone + Send + Sync + 'static {
     /// Use `output_eq = custom_fn` for types without `PartialEq`.
     fn output_eq(old: &Self::Output, new: &Self::Output) -> bool;
 }
+
+/// Convenience trait for query output types.
+///
+/// This trait combines the bounds needed for a type to be used as a query output:
+/// `PartialEq + Send + Sync + 'static`.
+///
+/// - `PartialEq` is required for the default `output_eq` comparison (early cutoff optimization)
+/// - `Send + Sync + 'static` allows the output to be cached and shared across threads
+///
+/// # When to Use
+///
+/// Use `QueryOutput` for generic type parameters that appear only in query output:
+///
+/// ```ignore
+/// #[query]
+/// fn parse<T: QueryOutput + FromStr>(db: &impl Db, text: String) -> Result<T, QueryError>
+/// where
+///     T::Err: Display,
+/// {
+///     text.parse().map_err(|e| anyhow!("{}", e).into())
+/// }
+/// ```
+///
+/// # When Not to Use
+///
+/// If you're using `#[query(output_eq = none)]` or a custom `output_eq` function,
+/// you don't need `PartialEq`. In that case, use raw bounds instead:
+///
+/// ```ignore
+/// #[query(output_eq = none)]
+/// fn create<T: Send + Sync + 'static>(db: &impl Db) -> Result<T, QueryError> { ... }
+/// ```
+pub trait QueryOutput: PartialEq + Send + Sync + 'static {}
+impl<T: PartialEq + Send + Sync + 'static> QueryOutput for T {}

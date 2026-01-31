@@ -34,6 +34,7 @@ where
 }
 
 #[test]
+#[allow(clippy::approx_constant)]
 fn test_generic_query_different_types() {
     let runtime = QueryRuntime::new();
 
@@ -118,10 +119,7 @@ fn test_generic_query_caching_with_type_in_field() {
 /// A generic query with multiple type parameters.
 /// T is used in field (Cachable), U is only in output (QueryOutput).
 #[query]
-fn convert<T: Cachable, U: QueryOutput + From<T>>(
-    db: &impl Db,
-    input: T,
-) -> Result<U, QueryError> {
+fn convert<T: Cachable, U: QueryOutput + From<T>>(db: &impl Db, input: T) -> Result<U, QueryError> {
     let _ = db;
     Ok(U::from(input))
 }

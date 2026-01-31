@@ -9,6 +9,7 @@ readme.workspace = true
 keywords = ["reactive", "incremental", "dependency-tracking"]
 description = "A lock-free, dependency-tracking primitive for incremental computation."
 categories = ["data-structures"]
+publish = false
 
 [features]
 default = ["serde"]

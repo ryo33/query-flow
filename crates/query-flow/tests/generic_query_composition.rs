@@ -61,8 +61,8 @@ fn test_add_different_query_types() {
 
     // Add a constant and a doubled value
     let result = runtime.query(AddQueries::new(
-        Constant::new(5),  // 5
-        Double::new(10),   // 20
+        Constant::new(5), // 5
+        Double::new(10),  // 20
     ));
     assert_eq!(*result.unwrap(), 25);
 }
@@ -294,10 +294,7 @@ fn test_composed_query_propagates_error() {
     let runtime = QueryRuntime::new();
 
     // One of the inner queries fails
-    let result = runtime.query(AddQueries::new(
-        Constant::new(10),
-        FailingQuery::new(true),
-    ));
+    let result = runtime.query(AddQueries::new(Constant::new(10), FailingQuery::new(true)));
 
     assert!(result.is_err());
 }
@@ -306,10 +303,7 @@ fn test_composed_query_propagates_error() {
 fn test_composed_query_succeeds_when_all_succeed() {
     let runtime = QueryRuntime::new();
 
-    let result = runtime.query(AddQueries::new(
-        Constant::new(10),
-        FailingQuery::new(false),
-    ));
+    let result = runtime.query(AddQueries::new(Constant::new(10), FailingQuery::new(false)));
 
     assert_eq!(*result.unwrap(), 52); // 10 + 42
 }

@@ -21,6 +21,20 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 type Shard<K, V> = RwLock<HashMap<K, V, ahash::RandomState>>;
 
+/// Default shard count: four per available core, computed once.
+///
+/// `available_parallelism` inspects cgroup limits on Linux and costs several
+/// syscalls, so it must not run on every map construction.
+fn default_shard_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            * 4
+    })
+}
+
 /// A sharded hash map guarded by per-shard read/write locks.
 ///
 /// See the [module documentation](self) for the locking rules.
@@ -40,10 +54,7 @@ impl<K, V> Default for ShardedMap<K, V> {
 impl<K, V> ShardedMap<K, V> {
     /// Create a map with a shard count derived from the available parallelism.
     pub fn new() -> Self {
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        Self::with_shards(parallelism * 4)
+        Self::with_shards(default_shard_count())
     }
 
     /// Create a map with at least `shards` shards (rounded up to a power of two,

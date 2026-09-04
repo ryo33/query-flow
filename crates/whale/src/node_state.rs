@@ -3,23 +3,26 @@
 //! [`NodeState`] is what the runtime actually stores. The hot fields that
 //! validity checks read (`verified_at`, `changed_at`, `durability`, `level`)
 //! are atomics, so readers never take a lock. The structural fields (`data`,
-//! `dependencies`, `dependents`) live behind a small mutex that writers hold
-//! for the duration of one update, which also serializes writes to the
+//! `dependencies`, `dependents`) live behind a read/write lock; writers hold
+//! it for the duration of one update, which also serializes writes to the
 //! atomics so a locked reader sees a consistent node.
 //!
 //! The public, plain-data [`Node`] is produced on demand by [`NodeState::snapshot`].
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::node::{Dependencies, Dependents, Node};
 use crate::revision::{Durability, RevisionCounter};
 
-/// Structural fields, updated as a unit under [`NodeState::lock`].
+/// Structural fields, updated as a unit under [`NodeState::write`].
 pub(crate) struct NodeInner<K, T> {
     pub data: T,
     pub dependencies: Dependencies<K>,
     pub dependents: Dependents<K>,
+    /// Set when the node is removed from the map. A writer that obtained the
+    /// node before the removal must not update it; it retries through the map.
+    pub detached: bool,
 }
 
 /// Concurrently accessible node.
@@ -29,7 +32,7 @@ pub(crate) struct NodeState<K, T, const N: usize> {
     changed_at: AtomicU64,
     durability: AtomicUsize,
     level: AtomicU32,
-    inner: Mutex<NodeInner<K, T>>,
+    inner: RwLock<NodeInner<K, T>>,
 }
 
 impl<K, T, const N: usize> NodeState<K, T, N> {
@@ -48,10 +51,11 @@ impl<K, T, const N: usize> NodeState<K, T, N> {
             changed_at: AtomicU64::new(changed_at),
             durability: AtomicUsize::new(durability.value()),
             level: AtomicU32::new(level),
-            inner: Mutex::new(NodeInner {
+            inner: RwLock::new(NodeInner {
                 data,
                 dependencies,
                 dependents: Dependents::default(),
+                detached: false,
             }),
         }
     }
@@ -76,36 +80,47 @@ impl<K, T, const N: usize> NodeState<K, T, N> {
         self.level.load(Ordering::Acquire)
     }
 
-    /// Lock the structural fields. Writers of the atomic fields must hold this
-    /// lock too, so that [`Self::snapshot`] observes a consistent node.
+    /// Lock the structural fields for reading. Excludes writers, so the
+    /// atomic fields are stable for the duration of the guard.
     ///
     /// A poisoned lock is recovered rather than propagated: a panic inside a
     /// user callback must not take the whole runtime down with it.
     #[inline]
-    pub fn lock(&self) -> MutexGuard<'_, NodeInner<K, T>> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    pub fn read(&self) -> RwLockReadGuard<'_, NodeInner<K, T>> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Set durability and level. Caller must hold [`Self::lock`].
+    /// Lock the structural fields for writing. Writers of the atomic fields
+    /// must hold this lock, so that readers observe a consistent node.
+    #[inline]
+    pub fn write(&self) -> RwLockWriteGuard<'_, NodeInner<K, T>> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Set durability and level. Caller must hold [`Self::write`].
     #[inline]
     pub fn set_meta(&self, durability: Durability<N>, level: u32) {
         self.durability.store(durability.value(), Ordering::Release);
         self.level.store(level, Ordering::Release);
     }
 
-    /// Set `changed_at`. Caller must hold [`Self::lock`].
+    /// Set `changed_at`. Caller must hold [`Self::write`].
     #[inline]
     pub fn set_changed_at(&self, rev: RevisionCounter) {
         self.changed_at.store(rev, Ordering::Release);
     }
 
-    /// Set `verified_at`. Caller must hold [`Self::lock`].
+    /// Set `verified_at`. Caller must hold [`Self::write`].
     #[inline]
     pub fn set_verified_at(&self, rev: RevisionCounter) {
         self.verified_at.store(rev, Ordering::Release);
     }
 
-    /// Raise `verified_at` to `rev` if it is higher (monotonic). Caller must hold [`Self::lock`].
+    /// Raise `verified_at` to `rev` if it is higher (monotonic).
+    ///
+    /// Caller must hold [`Self::read`] or [`Self::write`]: `fetch_max` commutes
+    /// with itself, so concurrent readers may all do this, but durability must
+    /// not change underneath.
     #[inline]
     pub fn raise_verified_at(&self, rev: RevisionCounter) {
         self.verified_at.fetch_max(rev, Ordering::AcqRel);
@@ -119,7 +134,11 @@ where
 {
     /// Produce a consistent plain-data copy of this node.
     pub fn snapshot(&self) -> Node<K, T, N> {
-        let inner = self.lock();
+        self.snapshot_with(&self.read())
+    }
+
+    /// Produce a plain-data copy using an already held guard.
+    pub fn snapshot_with(&self, inner: &NodeInner<K, T>) -> Node<K, T, N> {
         Node {
             id: self.id.clone(),
             data: inner.data.clone(),
@@ -134,7 +153,7 @@ where
 
     /// Clone only the user data together with `changed_at`.
     pub fn data_and_changed_at(&self) -> (T, RevisionCounter) {
-        let inner = self.lock();
+        let inner = self.read();
         (inner.data.clone(), self.changed_at())
     }
 }

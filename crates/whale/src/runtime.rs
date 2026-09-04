@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::{
     map::ShardedMap,
     node::{Dep, Dependencies, Node},
-    node_state::NodeState,
+    node_state::{NodeInner, NodeState},
     revision::{AtomicRevision, Durability, Revision, RevisionCounter},
 };
 
@@ -107,6 +107,14 @@ struct ResolvedDeps<K, const N: usize> {
     level: u32,
 }
 
+/// The entry handed to [`Runtime::upsert`]'s closure.
+enum Entry<'a, K, T, const N: usize> {
+    /// The node exists; its structural fields are write-locked.
+    Occupied(&'a NodeState<K, T, N>, &'a mut NodeInner<K, T>),
+    /// No node exists; the closure gets the key back to build one.
+    Vacant(K),
+}
+
 impl<K, T, const N: usize> Runtime<K, T, N>
 where
     K: Clone + PartialEq + Eq + std::hash::Hash + std::fmt::Debug,
@@ -152,17 +160,21 @@ where
     /// 2. All dependencies have not changed since we last observed them
     ///    (`dep_node.changed_at <= dep.observed_changed_at`)
     pub fn is_valid_at(&self, qid: &K, at_rev: &Revision<N>) -> bool {
-        let Some(node) = self.nodes.get(qid) else {
-            return false;
+        // Fast path (no Arc clone, no node lock): already verified at this revision.
+        let dependencies = self.nodes.with(qid, |node| {
+            if node.verified_at() >= at_rev.get(node.durability()) {
+                None
+            } else {
+                Some(node.read().dependencies.clone())
+            }
+        });
+        let dependencies = match dependencies {
+            None => return false, // node does not exist
+            Some(None) => return true,
+            Some(Some(dependencies)) => dependencies,
         };
 
-        // Check if already verified at this revision
-        if node.verified_at() >= at_rev.get(node.durability()) {
-            return true;
-        }
-
         // Check each dependency (shallow check - only direct deps' changed_at)
-        let dependencies = node.lock().dependencies.clone();
         let deps_valid = dependencies.iter().all(|dep| {
             self.nodes
                 .with(&dep.query_id, |dep_node| {
@@ -186,7 +198,7 @@ where
     /// Used by query-flow to verify dependencies before deciding to recompute.
     pub fn get_dependency_ids(&self, qid: &K) -> Option<Vec<K>> {
         self.nodes.with(qid, |node| {
-            node.lock()
+            node.read()
                 .dependencies
                 .iter()
                 .map(|d| d.query_id.clone())
@@ -210,7 +222,14 @@ where
     /// Uses `max` to ensure monotonicity - `verified_at` only increases.
     pub fn mark_verified(&self, qid: &K, at_rev: &Revision<N>) {
         self.nodes.with(qid, |node| {
-            let _guard = node.lock();
+            // Lock-free fast path: already verified at (or past) this revision.
+            // This is the steady state on cache hits, so it must not write.
+            if node.verified_at() >= at_rev.get(node.durability()) {
+                return;
+            }
+            // A read guard is enough: it excludes writers (who may change the
+            // durability), and fetch_max commutes with other markers.
+            let _guard = node.read();
             node.raise_verified_at(at_rev.get(node.durability()));
         });
     }
@@ -263,7 +282,7 @@ where
     fn update_graph_edges(&self, qid: &K, deps: &Dependencies<K>) {
         for dep in deps.iter() {
             self.nodes.with(&dep.query_id, |dep_node| {
-                dep_node.lock().dependents.insert(qid);
+                dep_node.write().dependents.insert(qid);
             });
         }
     }
@@ -278,7 +297,7 @@ where
             }
             // This dependency was removed, clean up the reverse edge
             self.nodes.with(&old_dep.query_id, |dep_node| {
-                dep_node.lock().dependents.remove(qid);
+                dep_node.write().dependents.remove(qid);
             });
         }
     }
@@ -323,27 +342,26 @@ where
         let new_rev = self.increment_revision(effective_dur);
 
         // Insert or update in place (keeping the existing dependents list).
-        let old_deps = self.nodes.compute(qid.clone(), |slot| match slot {
-            Some(node) => {
-                let mut inner = node.lock();
+        let old_deps = self.upsert(qid.clone(), |entry| match entry {
+            Entry::Occupied(node, inner) => {
                 inner.data = data;
                 let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
                 node.set_meta(effective_dur, new_level);
                 node.set_verified_at(new_rev);
                 node.set_changed_at(new_rev);
-                Some(old)
+                (None, Some(old))
             }
-            None => {
-                *slot = Some(Arc::new(NodeState::new(
-                    qid.clone(),
+            Entry::Vacant(qid) => {
+                let node = NodeState::new(
+                    qid,
                     data,
                     effective_dur,
                     new_rev,
                     new_rev,
                     new_level,
                     new_deps.clone(),
-                )));
-                None
+                );
+                (Some(Arc::new(node)), None)
             }
         });
 
@@ -378,7 +396,10 @@ where
 
         // Update node: verified_at changes, changed_at stays the same!
         let old_deps = {
-            let mut inner = node.lock();
+            let mut inner = node.write();
+            if inner.detached {
+                return Ok(()); // Removed concurrently; nothing to confirm.
+            }
             let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
             node.set_meta(effective_dur, resolved.level);
             node.raise_verified_at(current_rev);
@@ -408,17 +429,20 @@ where
         let effective_dur = resolved.effective_durability;
         let new_deps = Dependencies::new(resolved.records);
 
-        // Increment revision at the effective durability level
-        let new_rev = self.increment_revision(effective_dur);
-
         let old_deps = {
-            let mut inner = node.lock();
+            let mut inner = node.write();
+            if inner.detached {
+                return Ok(0); // Removed concurrently; nothing to confirm.
+            }
+            // Increment revision at the effective durability level
+            let new_rev = self.increment_revision(effective_dur);
             let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
             node.set_meta(effective_dur, resolved.level);
             node.set_verified_at(new_rev);
             node.set_changed_at(new_rev); // Both updated!
-            old
+            (old, new_rev)
         };
+        let (old_deps, new_rev) = old_deps;
 
         self.replace_edges(qid, Some(&old_deps), &new_deps);
 
@@ -429,7 +453,65 @@ where
     ///
     /// Returns the removed node if it existed.
     pub fn remove(&self, query_id: &K) -> Option<Node<K, T, N>> {
-        self.nodes.remove(query_id).map(|node| node.snapshot())
+        self.nodes.compute(query_id.clone(), |slot| {
+            slot.take().map(|node| Self::detach(&node))
+        })
+    }
+
+    /// Mark a node that has just been taken out of the map as detached and
+    /// return its final state. Must run under the shard's write lock (i.e.
+    /// inside [`ShardedMap::compute`]) so that no writer can slip in between
+    /// the map removal and the flag.
+    fn detach(node: &NodeState<K, T, N>) -> Node<K, T, N> {
+        let mut inner = node.write();
+        inner.detached = true;
+        node.snapshot_with(&inner)
+    }
+
+    /// Apply `f` to the entry for `qid`: either the existing node (under its
+    /// write lock) or a vacant slot, in which case `f` returns the node to
+    /// insert. `f` runs exactly once.
+    ///
+    /// An existing node is updated without taking the shard's write lock, so
+    /// writers to different keys never block each other. Only an insert (or a
+    /// race with a concurrent removal) goes through the shard's write lock.
+    fn upsert<R>(
+        &self,
+        qid: K,
+        f: impl FnOnce(Entry<'_, K, T, N>) -> (Option<Arc<NodeState<K, T, N>>>, R),
+    ) -> R {
+        let mut f = Some(f);
+
+        // Fast path: the node exists; update it in place.
+        if let Some(node) = self.nodes.get(&qid) {
+            let mut inner = node.write();
+            if !inner.detached {
+                let f = f.take().expect("closure is consumed once");
+                let (inserted, result) = f(Entry::Occupied(&node, &mut inner));
+                debug_assert!(inserted.is_none(), "occupied entry must not insert");
+                return result;
+            }
+            // Removed between the lookup and the lock; go through the map.
+        }
+
+        // Slow path: insert under the shard's write lock, unless someone
+        // inserted in the meantime, in which case update that node.
+        let key = qid.clone();
+        self.nodes.compute(key, |slot| match slot {
+            Some(node) => {
+                let mut inner = node.write();
+                let f = f.take().expect("closure is consumed once");
+                let (inserted, result) = f(Entry::Occupied(node, &mut inner));
+                debug_assert!(inserted.is_none(), "occupied entry must not insert");
+                result
+            }
+            None => {
+                let f = f.take().expect("closure is consumed once");
+                let (inserted, result) = f(Entry::Vacant(qid));
+                *slot = inserted;
+                result
+            }
+        })
     }
 
     /// Remove a node if it has no dependents.
@@ -439,9 +521,9 @@ where
         self.nodes.compute(query_id, |slot| {
             let unused = slot
                 .as_ref()
-                .is_some_and(|node| node.lock().dependents.is_empty());
+                .is_some_and(|node| node.read().dependents.is_empty());
             if unused {
-                slot.take().map(|node| node.snapshot())
+                slot.take().map(|node| Self::detach(&node))
             } else {
                 None
             }
@@ -479,7 +561,7 @@ where
             // Push dependencies
             let dependencies = self
                 .nodes
-                .with(&qid, |node| node.lock().dependencies.clone());
+                .with(&qid, |node| node.read().dependencies.clone());
             if let Some(dependencies) = dependencies {
                 for dep in dependencies.iter() {
                     stack.push((dep.query_id.clone(), false));
@@ -529,9 +611,8 @@ where
         let new_deps = Dependencies::new(resolved.records);
 
         // Atomic compare-and-update
-        let (changed, revision, old_deps) = self.nodes.compute(qid.clone(), |slot| match slot {
-            Some(node) => {
-                let mut inner = node.lock();
+        let (changed, revision, old_deps) = self.upsert(qid.clone(), |entry| match entry {
+            Entry::Occupied(node, inner) => {
                 let changed = compare(Some(&inner.data), &new_data);
                 inner.data = new_data;
                 let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
@@ -545,25 +626,25 @@ where
                     node.raise_verified_at(self.revision.get(effective_dur));
                     node.changed_at()
                 };
-                (changed, revision, Some(old))
+                (None, (changed, revision, Some(old)))
             }
-            None => {
+            Entry::Vacant(qid) => {
                 let changed = compare(None, &new_data);
                 let rev = if changed {
                     self.increment_revision(effective_dur)
                 } else {
                     self.revision.get(effective_dur)
                 };
-                *slot = Some(Arc::new(NodeState::new(
-                    qid.clone(),
+                let node = NodeState::new(
+                    qid,
                     new_data,
                     effective_dur,
                     rev,
                     rev,
                     new_level,
                     new_deps.clone(),
-                )));
-                (changed, rev, None)
+                );
+                (Some(Arc::new(node)), (changed, rev, None))
             }
         });
 
@@ -1055,6 +1136,52 @@ mod concurrency_tests {
         };
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_remove_and_register_never_lose_the_final_write() {
+        let rt: Arc<TestRuntime> = Arc::new(Runtime::new());
+        rt.register(1, 0, Durability::volatile(), vec![]).unwrap();
+
+        let remover = {
+            let rt = rt.clone();
+            thread::spawn(move || {
+                for _ in 0..2000 {
+                    rt.remove(&1);
+                    rt.remove_if_unused(1);
+                }
+            })
+        };
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let rt = rt.clone();
+                thread::spawn(move || {
+                    for i in 0..2000 {
+                        rt.register(1, t * 10_000 + i, Durability::volatile(), vec![])
+                            .unwrap();
+                        rt.update_with_compare(
+                            1,
+                            i,
+                            |a, b| a != Some(b),
+                            Durability::volatile(),
+                            vec![],
+                        )
+                        .unwrap();
+                        let _ = rt.confirm_unchanged(&1, vec![]);
+                        let _ = rt.confirm_changed(&1, vec![]);
+                    }
+                })
+            })
+            .collect();
+        remover.join().unwrap();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        // Whatever interleaving happened, a write after all removals must stick.
+        rt.register(1, 42, Durability::volatile(), vec![]).unwrap();
+        assert_eq!(rt.get_data(&1), Some((42, rt.get(&1).unwrap().changed_at)));
+        assert!(rt.is_valid(&1));
     }
 
     #[test]

@@ -5,14 +5,7 @@
 //! `std::sync::RwLock<HashMap>`, with the shard chosen from the key's hash.
 //! There is no unsafe code and no dependency beyond `std` and `ahash`.
 //!
-//! # Locking rules
-//!
-//! - Locks are held only for the duration of a single method call; no guard
-//!   escapes the map's API. Values are returned by clone, so `V` is expected
-//!   to be cheap to clone (typically an `Arc`).
-//! - [`ShardedMap::compute`] and [`ShardedMap::get_or_insert_with`] run their
-//!   closure while holding the shard's write lock. The closure must not call
-//!   back into the same map (it would deadlock on a single-shard collision).
+//! See [`ShardedMap`] for the locking rules.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -37,7 +30,14 @@ fn default_shard_count() -> usize {
 
 /// A sharded hash map guarded by per-shard read/write locks.
 ///
-/// See the [module documentation](self) for the locking rules.
+/// # Locking rules
+///
+/// - Locks are held only for the duration of a single method call; no guard
+///   escapes the map's API. Values are returned by clone, so `V` is expected
+///   to be cheap to clone (typically an `Arc`).
+/// - [`ShardedMap::with`], [`ShardedMap::for_each`], [`ShardedMap::compute`]
+///   and [`ShardedMap::get_or_insert_with`] run their closure while holding a
+///   shard lock. The closure must not call back into the same map.
 pub struct ShardedMap<K, V> {
     shards: Box<[Shard<K, V>]>,
     hasher: ahash::RandomState,

@@ -2,13 +2,26 @@
 //!
 //! The Runtime manages the dependency graph and provides the core operations
 //! for registering queries, checking validity, and handling early cutoff.
+//!
+//! # Concurrency model
+//!
+//! Nodes live in a [`ShardedMap`] of `Arc<NodeState>`. The fields that validity
+//! checks read (`verified_at`, `changed_at`, `durability`, `level`) are atomics,
+//! so `is_valid`, `is_verified_at` and dependency lookups never block on a
+//! writer. Structural updates (data, dependencies, reverse edges) take a
+//! per-node mutex and run exactly once; no operation retries.
+//!
+//! Lock order is always shard lock, then node lock, and no lock is held while
+//! calling into another shard. The only user callback that runs under a lock
+//! is the `compare` function of [`Runtime::update_with_compare`]; it must not
+//! call back into the runtime.
 
 use std::sync::Arc;
 
-use papaya::{Compute, HashMap, Operation};
-
 use crate::{
+    map::ShardedMap,
     node::{Dep, Dependencies, Node},
+    node_state::{NodeInner, NodeState},
     revision::{AtomicRevision, Durability, Revision, RevisionCounter},
 };
 
@@ -21,7 +34,7 @@ use crate::{
 /// - `T`: User-provided metadata type
 /// - `N`: Number of durability levels (const generic)
 pub struct Runtime<K, T, const N: usize> {
-    nodes: Arc<HashMap<K, Node<K, T, N>, ahash::RandomState>>,
+    nodes: Arc<ShardedMap<K, Arc<NodeState<K, T, N>>>>,
     revision: Arc<AtomicRevision<N>>,
 }
 
@@ -50,7 +63,7 @@ impl<K, T, const N: usize> Runtime<K, T, N> {
     /// Create a new runtime.
     pub fn new() -> Self {
         Self {
-            nodes: Arc::new(HashMap::with_hasher(ahash::RandomState::new())),
+            nodes: Arc::new(ShardedMap::new()),
             revision: Arc::new(AtomicRevision::new()),
         }
     }
@@ -70,9 +83,9 @@ pub struct RegisterResult<const N: usize> {
 /// Result of an update_with_compare operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateCompareResult<const N: usize> {
-    /// Whether the value was considered changed by the compare function.
+    /// Whether the value was considered changed.
     pub changed: bool,
-    /// The revision counter (new if changed, old if unchanged).
+    /// The revision counter (new if changed, current if unchanged).
     pub revision: RevisionCounter,
     /// The effective durability.
     pub effective_durability: Durability<N>,
@@ -81,10 +94,25 @@ pub struct UpdateCompareResult<const N: usize> {
 /// Result of a get_or_insert operation.
 #[derive(Debug, Clone)]
 pub enum GetOrInsertResult<K, T, const N: usize> {
-    /// A new node was inserted.
+    /// Node was inserted (didn't exist before).
     Inserted(Node<K, T, N>),
-    /// An existing node was found.
+    /// Node already existed (returned existing node).
     Existing(Node<K, T, N>),
+}
+
+/// Dependency information resolved in a single pass over the dependency nodes.
+struct ResolvedDeps<K, const N: usize> {
+    records: Vec<Dep<K>>,
+    effective_durability: Durability<N>,
+    level: u32,
+}
+
+/// The entry handed to [`Runtime::upsert`]'s closure.
+enum Entry<'a, K, T, const N: usize> {
+    /// The node exists; its structural fields are write-locked.
+    Occupied(&'a NodeState<K, T, N>, &'a mut NodeInner<K, T>),
+    /// No node exists; the closure gets the key back to build one.
+    Vacant(K),
 }
 
 impl<K, T, const N: usize> Runtime<K, T, N>
@@ -93,13 +121,24 @@ where
     T: Clone,
 {
     /// Get a node by query ID.
+    ///
+    /// This copies the whole node, including its dependency and dependent
+    /// lists. When only the data and `changed_at` are needed, prefer
+    /// [`Self::get_data`].
     pub fn get(&self, query_id: &K) -> Option<Node<K, T, N>> {
-        self.nodes.pin().get(query_id).cloned()
+        self.nodes.with(query_id, |node| node.snapshot())
+    }
+
+    /// Get a node's data together with its `changed_at`.
+    ///
+    /// Cheaper than [`Self::get`]: it does not copy the query ID or the edge lists.
+    pub fn get_data(&self, query_id: &K) -> Option<(T, RevisionCounter)> {
+        self.nodes.with(query_id, |node| node.data_and_changed_at())
     }
 
     /// Iterate over all query IDs.
     pub fn keys(&self) -> Vec<K> {
-        self.nodes.pin().keys().cloned().collect()
+        self.nodes.keys()
     }
 
     /// Get current revision snapshot.
@@ -121,26 +160,29 @@ where
     /// 2. All dependencies have not changed since we last observed them
     ///    (`dep_node.changed_at <= dep.observed_changed_at`)
     pub fn is_valid_at(&self, qid: &K, at_rev: &Revision<N>) -> bool {
-        let Some(node) = self.get(qid) else {
-            return false;
+        // Fast path (no Arc clone, no node lock): already verified at this revision.
+        let dependencies = self.nodes.with(qid, |node| {
+            if node.verified_at() >= at_rev.get(node.durability()) {
+                None
+            } else {
+                Some(node.read().dependencies.clone())
+            }
+        });
+        let dependencies = match dependencies {
+            None => return false, // node does not exist
+            Some(None) => return true,
+            Some(Some(dependencies)) => dependencies,
         };
 
-        let d = node.durability;
-
-        // Check if already verified at this revision
-        if node.verified_at >= at_rev.get(d) {
-            return true;
-        }
-
         // Check each dependency (shallow check - only direct deps' changed_at)
-        let deps_valid = node.dependencies.iter().all(|dep| {
-            match self.get(&dep.query_id) {
-                None => false, // dependency removed
-                Some(dep_node) => {
+        let deps_valid = dependencies.iter().all(|dep| {
+            self.nodes
+                .with(&dep.query_id, |dep_node| {
                     // Using <= (not <): equal means "no change since observation"
-                    dep_node.changed_at <= dep.observed_changed_at
-                }
-            }
+                    dep_node.changed_at() <= dep.observed_changed_at
+                })
+                // dependency removed
+                .unwrap_or(false)
         });
         deps_valid
     }
@@ -155,8 +197,9 @@ where
     /// Returns None if the node doesn't exist.
     /// Used by query-flow to verify dependencies before deciding to recompute.
     pub fn get_dependency_ids(&self, qid: &K) -> Option<Vec<K>> {
-        self.get(qid).map(|node| {
-            node.dependencies
+        self.nodes.with(qid, |node| {
+            node.read()
+                .dependencies
                 .iter()
                 .map(|d| d.query_id.clone())
                 .collect()
@@ -167,116 +210,79 @@ where
     ///
     /// This is a fast check that only looks at verified_at, not dependencies.
     pub fn is_verified_at(&self, qid: &K, at_rev: &Revision<N>) -> bool {
-        let Some(node) = self.get(qid) else {
-            return false;
-        };
-        let d = node.durability;
-        node.verified_at >= at_rev.get(d)
+        self.nodes
+            .with(qid, |node| {
+                node.verified_at() >= at_rev.get(node.durability())
+            })
+            .unwrap_or(false)
     }
 
     /// Mark a node as verified at given revision (idempotent update).
     ///
     /// Uses `max` to ensure monotonicity - `verified_at` only increases.
     pub fn mark_verified(&self, qid: &K, at_rev: &Revision<N>) {
-        let pinned = self.nodes.pin();
-        let _ = pinned.compute(qid.clone(), |node| {
-            let Some((_, node)) = node else {
-                return Operation::Abort(());
-            };
-
-            let d = node.durability;
-            let new_verified_at = node.verified_at.max(at_rev.get(d));
-
-            if new_verified_at == node.verified_at {
-                return Operation::Abort(()); // No change needed
+        self.nodes.with(qid, |node| {
+            // Lock-free fast path: already verified at (or past) this revision.
+            // This is the steady state on cache hits, so it must not write.
+            if node.verified_at() >= at_rev.get(node.durability()) {
+                return;
             }
-
-            let mut new_node = node.clone();
-            new_node.verified_at = new_verified_at;
-            Operation::Insert(new_node)
+            // A read guard is enough: it excludes writers (who may change the
+            // durability), and fetch_max commutes with other markers.
+            let _guard = node.read();
+            node.raise_verified_at(at_rev.get(node.durability()));
         });
     }
 
-    /// Build dependency records by capturing current `changed_at` values.
+    /// Resolve dependencies in one pass: capture each dependency's current
+    /// `changed_at`, and compute the effective durability
+    /// (`min(requested, deps.durability)`) and topological level
+    /// (`max(deps.level) + 1`).
     ///
     /// Returns `Err` with the list of missing query IDs if any dependency doesn't exist.
-    fn build_dep_records(&self, dep_ids: &[K]) -> Result<Vec<Dep<K>>, Vec<K>> {
-        let mut deps = Vec::with_capacity(dep_ids.len());
+    fn resolve_deps(
+        &self,
+        requested: Durability<N>,
+        dep_ids: &[K],
+    ) -> Result<ResolvedDeps<K, N>, Vec<K>> {
+        let mut records = Vec::with_capacity(dep_ids.len());
         let mut missing = Vec::new();
+        let mut min_durability = N - 1;
+        let mut max_level = 0;
 
         for dep_id in dep_ids {
-            match self.get(dep_id) {
-                Some(dep_node) => {
-                    deps.push(Dep {
-                        query_id: dep_id.clone(),
-                        observed_changed_at: dep_node.changed_at,
-                    });
-                }
-                None => {
-                    missing.push(dep_id.clone());
-                }
+            let found = self.nodes.with(dep_id, |dep_node| {
+                records.push(Dep {
+                    query_id: dep_id.clone(),
+                    observed_changed_at: dep_node.changed_at(),
+                });
+                min_durability = min_durability.min(dep_node.durability().value());
+                max_level = max_level.max(dep_node.level());
+            });
+            if found.is_none() {
+                missing.push(dep_id.clone());
             }
         }
 
-        if missing.is_empty() {
-            Ok(deps)
-        } else {
-            Err(missing)
+        if !missing.is_empty() {
+            return Err(missing);
         }
-    }
 
-    /// Calculate effective durability (minimum of requested and all dependencies).
-    ///
-    /// Enforces the durability invariant: a node's durability must not exceed
-    /// the minimum durability of its dependencies.
-    fn calculate_effective_durability(
-        &self,
-        requested: Durability<N>,
-        deps: &[Dep<K>],
-    ) -> Durability<N> {
-        let min_dep = deps
-            .iter()
-            .filter_map(|dep| self.get(&dep.query_id))
-            .map(|n| n.durability.value())
-            .min()
-            .unwrap_or(N - 1);
-
-        let effective = requested.value().min(min_dep);
-        Durability::new(effective).unwrap_or(Durability::volatile())
-    }
-
-    /// Calculate topological level from dependencies.
-    ///
-    /// Enforces the level invariant: `node.level > all(deps.level)`.
-    fn calculate_level(&self, deps: &[Dep<K>]) -> u32 {
-        let max_dep_level = deps
-            .iter()
-            .filter_map(|dep| self.get(&dep.query_id))
-            .map(|n| n.level)
-            .max()
-            .unwrap_or(0);
-
-        max_dep_level + 1
+        let effective = requested.value().min(min_durability);
+        Ok(ResolvedDeps {
+            records,
+            effective_durability: Durability::new(effective).unwrap_or(Durability::volatile()),
+            level: max_level + 1,
+        })
     }
 
     /// Update reverse edges: add `qid` to the dependents list of all its dependencies.
     ///
     /// This maintains bidirectional consistency of the graph structure.
-    fn update_graph_edges(&self, qid: &K, deps: &[Dep<K>]) {
-        let pinned = self.nodes.pin();
-        for dep in deps {
-            let _ = pinned.compute(dep.query_id.clone(), |node| {
-                let Some((_, node)) = node else {
-                    return Operation::Abort(());
-                };
-
-                if node.dependents.contains(qid) {
-                    return Operation::Abort(()); // Already added
-                }
-
-                let mut new_node = node.clone();
-                new_node.dependents = node.dependents.added(qid.clone());
-                Operation::Insert(new_node)
+    fn update_graph_edges(&self, qid: &K, deps: &Dependencies<K>) {
+        for dep in deps.iter() {
+            self.nodes.with(&dep.query_id, |dep_node| {
+                dep_node.write().dependents.insert(qid);
             });
         }
     }
@@ -284,28 +290,29 @@ where
     /// Remove `qid` from the dependents list of old dependencies that are no longer in new deps.
     ///
     /// This cleans up stale reverse edges when a node's dependencies change.
-    fn cleanup_stale_edges(&self, qid: &K, old_deps: &Dependencies<K>, new_dep_ids: &[K]) {
-        let new_set: ahash::HashSet<&K> = new_dep_ids.iter().collect();
-        let pinned = self.nodes.pin();
-
+    fn cleanup_stale_edges(&self, qid: &K, old_deps: &Dependencies<K>, new_deps: &Dependencies<K>) {
         for old_dep in old_deps.iter() {
-            if !new_set.contains(&old_dep.query_id) {
-                // This dependency was removed, clean up the reverse edge
-                let _ = pinned.compute(old_dep.query_id.clone(), |node| {
-                    let Some((_, node)) = node else {
-                        return Operation::Abort(());
-                    };
-
-                    if !node.dependents.contains(qid) {
-                        return Operation::Abort(()); // Already removed
-                    }
-
-                    let mut new_node = node.clone();
-                    new_node.dependents = node.dependents.removed(qid);
-                    Operation::Insert(new_node)
-                });
+            if new_deps.iter().any(|d| d.query_id == old_dep.query_id) {
+                continue;
             }
+            // This dependency was removed, clean up the reverse edge
+            self.nodes.with(&old_dep.query_id, |dep_node| {
+                dep_node.write().dependents.remove(qid);
+            });
         }
+    }
+
+    /// Replace `qid`'s old dependency edges with `new_deps`.
+    fn replace_edges(
+        &self,
+        qid: &K,
+        old_deps: Option<&Dependencies<K>>,
+        new_deps: &Dependencies<K>,
+    ) {
+        if let Some(old_deps) = old_deps {
+            self.cleanup_stale_edges(qid, old_deps, new_deps);
+        }
+        self.update_graph_edges(qid, new_deps);
     }
 
     /// Register a new node or update an existing one.
@@ -326,47 +333,39 @@ where
         requested_durability: Durability<N>,
         dep_ids: Vec<K>,
     ) -> Result<RegisterResult<N>, Vec<K>> {
-        // Build dependency records with current changed_at snapshots
-        let dep_records = self.build_dep_records(&dep_ids)?;
-
-        // Calculate effective durability (min of requested and all deps)
-        let effective_dur = self.calculate_effective_durability(requested_durability, &dep_records);
-
-        // Calculate topological level
-        let new_level = self.calculate_level(&dep_records);
+        let resolved = self.resolve_deps(requested_durability, &dep_ids)?;
+        let effective_dur = resolved.effective_durability;
+        let new_level = resolved.level;
+        let new_deps = Dependencies::new(resolved.records);
 
         // Increment revision
         let new_rev = self.increment_revision(effective_dur);
 
-        // Get old node state for edge cleanup
-        let old_node = self.get(&qid);
-        let old_dependents = old_node
-            .as_ref()
-            .map(|n| n.dependents.clone())
-            .unwrap_or_default();
+        // Insert or update in place (keeping the existing dependents list).
+        let old_deps = self.upsert(qid.clone(), |entry| match entry {
+            Entry::Occupied(node, inner) => {
+                inner.data = data;
+                let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
+                node.set_meta(effective_dur, new_level);
+                node.set_verified_at(new_rev);
+                node.set_changed_at(new_rev);
+                (None, Some(old))
+            }
+            Entry::Vacant(qid) => {
+                let node = NodeState::new(
+                    qid,
+                    data,
+                    effective_dur,
+                    new_rev,
+                    new_rev,
+                    new_level,
+                    new_deps.clone(),
+                );
+                (Some(Arc::new(node)), None)
+            }
+        });
 
-        // Create new node
-        let new_node = Node {
-            id: qid.clone(),
-            data,
-            durability: effective_dur,
-            verified_at: new_rev,
-            changed_at: new_rev,
-            level: new_level,
-            dependencies: Dependencies::new(dep_records.clone()),
-            dependents: old_dependents,
-        };
-
-        // Insert node
-        self.nodes.pin().insert(qid.clone(), new_node);
-
-        // Clean up stale edges from old dependencies
-        if let Some(old) = old_node {
-            self.cleanup_stale_edges(&qid, &old.dependencies, &dep_ids);
-        }
-
-        // Update reverse edges
-        self.update_graph_edges(&qid, &dep_records);
+        self.replace_edges(&qid, old_deps.as_ref(), &new_deps);
 
         Ok(RegisterResult {
             new_rev,
@@ -386,34 +385,28 @@ where
     ///
     /// Returns `Err` with missing dependency IDs if any dependency doesn't exist.
     pub fn confirm_unchanged(&self, qid: &K, new_dep_ids: Vec<K>) -> Result<(), Vec<K>> {
-        let Some(node) = self.get(qid) else {
+        let Some(node) = self.nodes.get(qid) else {
             return Ok(());
         };
 
-        let new_deps = self.build_dep_records(&new_dep_ids)?;
-
-        // Recalculate effective durability based on new dependencies
-        let effective_dur = self.calculate_effective_durability(node.durability, &new_deps);
-        let new_level = self.calculate_level(&new_deps);
+        let resolved = self.resolve_deps(node.durability(), &new_dep_ids)?;
+        let effective_dur = resolved.effective_durability;
+        let new_deps = Dependencies::new(resolved.records);
         let current_rev = self.revision.get(effective_dur);
 
         // Update node: verified_at changes, changed_at stays the same!
-        let new_node = Node {
-            id: node.id.clone(),
-            data: node.data.clone(),
-            durability: effective_dur,
-            verified_at: current_rev,
-            changed_at: node.changed_at, // Key: unchanged!
-            level: new_level,
-            dependencies: Dependencies::new(new_deps.clone()),
-            dependents: node.dependents.clone(),
+        let old_deps = {
+            let mut inner = node.write();
+            if inner.detached {
+                return Ok(()); // Removed concurrently; nothing to confirm.
+            }
+            let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
+            node.set_meta(effective_dur, resolved.level);
+            node.raise_verified_at(current_rev);
+            old
         };
 
-        self.nodes.pin().insert(qid.clone(), new_node);
-
-        // Clean up stale edges and add new ones
-        self.cleanup_stale_edges(qid, &node.dependencies, &new_dep_ids);
-        self.update_graph_edges(qid, &new_deps);
+        self.replace_edges(qid, Some(&old_deps), &new_deps);
 
         Ok(())
     }
@@ -428,35 +421,30 @@ where
     ///
     /// Returns the new revision counter, or `Err` with missing dependency IDs.
     pub fn confirm_changed(&self, qid: &K, new_dep_ids: Vec<K>) -> Result<RevisionCounter, Vec<K>> {
-        let Some(node) = self.get(qid) else {
+        let Some(node) = self.nodes.get(qid) else {
             return Ok(0);
         };
 
-        let new_deps = self.build_dep_records(&new_dep_ids)?;
+        let resolved = self.resolve_deps(node.durability(), &new_dep_ids)?;
+        let effective_dur = resolved.effective_durability;
+        let new_deps = Dependencies::new(resolved.records);
 
-        // Recalculate effective durability and level based on new dependencies
-        let effective_dur = self.calculate_effective_durability(node.durability, &new_deps);
-        let new_level = self.calculate_level(&new_deps);
-
-        // Increment revision at the effective durability level
-        let new_rev = self.increment_revision(effective_dur);
-
-        let new_node = Node {
-            id: node.id.clone(),
-            data: node.data.clone(),
-            durability: effective_dur,
-            verified_at: new_rev,
-            changed_at: new_rev, // Both updated!
-            level: new_level,
-            dependencies: Dependencies::new(new_deps.clone()),
-            dependents: node.dependents.clone(),
+        let old_deps = {
+            let mut inner = node.write();
+            if inner.detached {
+                return Ok(0); // Removed concurrently; nothing to confirm.
+            }
+            // Increment revision at the effective durability level
+            let new_rev = self.increment_revision(effective_dur);
+            let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
+            node.set_meta(effective_dur, resolved.level);
+            node.set_verified_at(new_rev);
+            node.set_changed_at(new_rev); // Both updated!
+            (old, new_rev)
         };
+        let (old_deps, new_rev) = old_deps;
 
-        self.nodes.pin().insert(qid.clone(), new_node);
-
-        // Clean up stale edges and add new ones
-        self.cleanup_stale_edges(qid, &node.dependencies, &new_dep_ids);
-        self.update_graph_edges(qid, &new_deps);
+        self.replace_edges(qid, Some(&old_deps), &new_deps);
 
         Ok(new_rev)
     }
@@ -465,28 +453,81 @@ where
     ///
     /// Returns the removed node if it existed.
     pub fn remove(&self, query_id: &K) -> Option<Node<K, T, N>> {
-        self.nodes.pin().remove(query_id).cloned()
+        self.nodes.compute(query_id.clone(), |slot| {
+            slot.take().map(|node| Self::detach(&node))
+        })
+    }
+
+    /// Mark a node that has just been taken out of the map as detached and
+    /// return its final state. Must run under the shard's write lock (i.e.
+    /// inside [`ShardedMap::compute`]) so that no writer can slip in between
+    /// the map removal and the flag.
+    fn detach(node: &NodeState<K, T, N>) -> Node<K, T, N> {
+        let mut inner = node.write();
+        inner.detached = true;
+        node.snapshot_with(&inner)
+    }
+
+    /// Apply `f` to the entry for `qid`: either the existing node (under its
+    /// write lock) or a vacant slot, in which case `f` returns the node to
+    /// insert. `f` runs exactly once.
+    ///
+    /// An existing node is updated without taking the shard's write lock, so
+    /// writers to different keys never block each other. Only an insert (or a
+    /// race with a concurrent removal) goes through the shard's write lock.
+    fn upsert<R>(
+        &self,
+        qid: K,
+        f: impl FnOnce(Entry<'_, K, T, N>) -> (Option<Arc<NodeState<K, T, N>>>, R),
+    ) -> R {
+        let mut f = Some(f);
+
+        // Fast path: the node exists; update it in place.
+        if let Some(node) = self.nodes.get(&qid) {
+            let mut inner = node.write();
+            if !inner.detached {
+                let f = f.take().expect("closure is consumed once");
+                let (inserted, result) = f(Entry::Occupied(&node, &mut inner));
+                debug_assert!(inserted.is_none(), "occupied entry must not insert");
+                return result;
+            }
+            // Removed between the lookup and the lock; go through the map.
+        }
+
+        // Slow path: insert under the shard's write lock, unless someone
+        // inserted in the meantime, in which case update that node.
+        let key = qid.clone();
+        self.nodes.compute(key, |slot| match slot {
+            Some(node) => {
+                let mut inner = node.write();
+                let f = f.take().expect("closure is consumed once");
+                let (inserted, result) = f(Entry::Occupied(node, &mut inner));
+                debug_assert!(inserted.is_none(), "occupied entry must not insert");
+                result
+            }
+            None => {
+                let f = f.take().expect("closure is consumed once");
+                let (inserted, result) = f(Entry::Vacant(qid));
+                *slot = inserted;
+                result
+            }
+        })
     }
 
     /// Remove a node if it has no dependents.
     ///
     /// Useful for garbage collection.
     pub fn remove_if_unused(&self, query_id: K) -> Option<Node<K, T, N>> {
-        let pinned = self.nodes.pin();
-        let result = pinned.compute(query_id, |node| {
-            let Some((_, node)) = node else {
-                return Operation::Abort(());
-            };
-            if node.dependents.is_empty() {
-                Operation::Remove
+        self.nodes.compute(query_id, |slot| {
+            let unused = slot
+                .as_ref()
+                .is_some_and(|node| node.read().dependents.is_empty());
+            if unused {
+                slot.take().map(|node| Self::detach(&node))
             } else {
-                Operation::Abort(())
+                None
             }
-        });
-        match result {
-            Compute::Removed(_, node) => Some(node.clone()),
-            _ => None,
-        }
+        })
     }
 
     /// Detect a cycle in the dependency graph starting from the given query.
@@ -518,8 +559,11 @@ where
             stack.push((qid.clone(), true));
 
             // Push dependencies
-            if let Some(node) = self.get(&qid) {
-                for dep in node.dependencies.iter() {
+            let dependencies = self
+                .nodes
+                .with(&qid, |node| node.read().dependencies.clone());
+            if let Some(dependencies) = dependencies {
+                for dep in dependencies.iter() {
                     stack.push((dep.query_id.clone(), false));
                 }
             }
@@ -533,6 +577,9 @@ where
     /// This is the primary API for updating cached values with early cutoff optimization.
     /// The compare function receives the old data (if any) and new data, and returns
     /// true if the value should be considered changed.
+    ///
+    /// The whole read-compare-write runs once, under the node's lock, so
+    /// `compare` is called exactly once. It must not call back into the runtime.
     ///
     /// Uses last-writer-wins semantics for concurrent updates.
     ///
@@ -555,54 +602,51 @@ where
         dep_ids: Vec<K>,
     ) -> Result<UpdateCompareResult<N>, Vec<K>>
     where
-        F: Fn(Option<&T>, &T) -> bool,
+        F: FnOnce(Option<&T>, &T) -> bool,
     {
         // Build dependency records first (outside the atomic operation)
-        let dep_records = self.build_dep_records(&dep_ids)?;
-        let effective_dur = self.calculate_effective_durability(durability, &dep_records);
-        let new_level = self.calculate_level(&dep_records);
-
-        // Use a cell to capture the result from inside the closure
-        let changed_cell = std::cell::Cell::new(false);
+        let resolved = self.resolve_deps(durability, &dep_ids)?;
+        let effective_dur = resolved.effective_durability;
+        let new_level = resolved.level;
+        let new_deps = Dependencies::new(resolved.records);
 
         // Atomic compare-and-update
-        let pinned = self.nodes.pin();
-        let final_result = pinned.compute(qid.clone(), |existing| {
-            let old_data = existing.as_ref().map(|(_, n)| &n.data);
-
-            // Compare inside the atomic section
-            let changed = compare(old_data, &new_data);
-            changed_cell.set(changed);
-
-            let old_dependents = existing
-                .as_ref()
-                .map(|(_, n)| n.dependents.clone())
-                .unwrap_or_default();
-            let old_changed_at = existing.as_ref().map(|(_, n)| n.changed_at);
-
-            // Calculate revision values based on changed
-            let (new_changed_at, new_verified_at) = if changed {
-                let rev = self.increment_revision(effective_dur);
-                (rev, rev)
-            } else {
-                let verified = self.revision.get(effective_dur);
-                (old_changed_at.unwrap_or(verified), verified)
-            };
-
-            let node = Node {
-                id: qid.clone(),
-                data: new_data.clone(),
-                durability: effective_dur,
-                verified_at: new_verified_at,
-                changed_at: new_changed_at,
-                level: new_level,
-                dependencies: Dependencies::new(dep_records.clone()),
-                dependents: old_dependents,
-            };
-            Operation::<_, ()>::Insert(node)
+        let (changed, revision, old_deps) = self.upsert(qid.clone(), |entry| match entry {
+            Entry::Occupied(node, inner) => {
+                let changed = compare(Some(&inner.data), &new_data);
+                inner.data = new_data;
+                let old = std::mem::replace(&mut inner.dependencies, new_deps.clone());
+                node.set_meta(effective_dur, new_level);
+                let revision = if changed {
+                    let rev = self.increment_revision(effective_dur);
+                    node.set_verified_at(rev);
+                    node.set_changed_at(rev);
+                    rev
+                } else {
+                    node.raise_verified_at(self.revision.get(effective_dur));
+                    node.changed_at()
+                };
+                (None, (changed, revision, Some(old)))
+            }
+            Entry::Vacant(qid) => {
+                let changed = compare(None, &new_data);
+                let rev = if changed {
+                    self.increment_revision(effective_dur)
+                } else {
+                    self.revision.get(effective_dur)
+                };
+                let node = NodeState::new(
+                    qid,
+                    new_data,
+                    effective_dur,
+                    rev,
+                    rev,
+                    new_level,
+                    new_deps.clone(),
+                );
+                (Some(Arc::new(node)), (changed, rev, None))
+            }
         });
-
-        let changed = changed_cell.get();
 
         // Graph edge updates (dependents lists on dependency nodes).
         // These run outside the atomic section for the following reasons:
@@ -610,33 +654,13 @@ where
         // - Edge updates are idempotent: re-adding to dependents list is a no-op
         // - This provides eventual consistency for graph traversal
         // - Validity checks use changedAt/verifiedAt, not edge traversal
-        if let Compute::Updated {
-            old: (_, old_node), ..
-        } = &final_result
-        {
-            self.cleanup_stale_edges(&qid, &old_node.dependencies, &dep_ids);
-        }
-        self.update_graph_edges(&qid, &dep_records);
+        self.replace_edges(&qid, old_deps.as_ref(), &new_deps);
 
-        // Extract the result
-        match final_result {
-            Compute::Inserted(_, node) | Compute::Updated { new: (_, node), .. } => {
-                Ok(UpdateCompareResult {
-                    changed,
-                    revision: node.changed_at,
-                    effective_durability: node.durability,
-                })
-            }
-            _ => {
-                // Shouldn't happen with Insert operation
-                let verified = self.revision.get(effective_dur);
-                Ok(UpdateCompareResult {
-                    changed,
-                    revision: verified,
-                    effective_durability: effective_dur,
-                })
-            }
-        }
+        Ok(UpdateCompareResult {
+            changed,
+            revision,
+            effective_durability: effective_dur,
+        })
     }
 
     /// Atomically get an existing node or insert a new one.
@@ -661,67 +685,47 @@ where
         durability: Durability<N>,
         dep_ids: Vec<K>,
     ) -> Result<GetOrInsertResult<K, T, N>, Vec<K>> {
-        let pinned = self.nodes.pin();
-
         // Fast-path: check if node already exists before doing expensive work.
-        // This is an optimization only - correctness is ensured by the atomic
-        // compute() below, which re-checks existence inside the critical section.
-        if let Some(existing) = pinned.get(&qid) {
-            return Ok(GetOrInsertResult::Existing(existing.clone()));
+        if let Some(existing) = self.get(&qid) {
+            return Ok(GetOrInsertResult::Existing(existing));
         }
 
         // Build dependency records (only needed for insert)
-        let dep_records = self.build_dep_records(&dep_ids)?;
-        let effective_dur = self.calculate_effective_durability(durability, &dep_records);
-        let new_level = self.calculate_level(&dep_records);
+        let resolved = self.resolve_deps(durability, &dep_ids)?;
+        let effective_dur = resolved.effective_durability;
+        let new_level = resolved.level;
+        let new_deps = Dependencies::new(resolved.records);
 
-        // Use a cell to capture the revision from inside the closure
-        let rev_cell = std::cell::Cell::new(0);
-
-        // Atomic insert-if-absent
-        // Note: increment_revision is called inside the closure to avoid wasting
-        // revision numbers when another thread wins the race
-        let result = pinned.compute(qid.clone(), |existing| {
-            if let Some((_, node)) = existing {
-                // Already exists - abort insert, no revision increment
-                return Operation::Abort(node.clone());
-            }
-
-            // Only increment revision when actually inserting
+        // Atomic insert-if-absent. The revision is only incremented when the
+        // insert actually happens, so a losing thread wastes no revision numbers.
+        let (node, inserted) = self.nodes.get_or_insert_with(qid.clone(), || {
             let new_rev = self.increment_revision(effective_dur);
-            rev_cell.set(new_rev);
-
-            // Insert new node
-            let node = Node {
-                id: qid.clone(),
-                data: data.clone(),
-                durability: effective_dur,
-                verified_at: new_rev,
-                changed_at: new_rev,
-                level: new_level,
-                dependencies: Dependencies::new(dep_records.clone()),
-                dependents: Default::default(),
-            };
-            Operation::Insert(node)
+            Arc::new(NodeState::new(
+                qid.clone(),
+                data,
+                effective_dur,
+                new_rev,
+                new_rev,
+                new_level,
+                new_deps.clone(),
+            ))
         });
 
-        match result {
-            Compute::Inserted(_, node) => {
-                // Update graph edges for the new node
-                self.update_graph_edges(&qid, &dep_records);
-                Ok(GetOrInsertResult::Inserted(node.clone()))
-            }
-            Compute::Aborted(existing) => Ok(GetOrInsertResult::Existing(existing)),
-            _ => {
-                // Shouldn't happen, but handle gracefully
-                if let Some(node) = pinned.get(&qid) {
-                    Ok(GetOrInsertResult::Existing(node.clone()))
-                } else {
-                    // Very unlikely - try again with regular get
-                    Ok(GetOrInsertResult::Existing(self.get(&qid).unwrap()))
-                }
-            }
+        if inserted {
+            self.update_graph_edges(&qid, &new_deps);
+            Ok(GetOrInsertResult::Inserted(node.snapshot()))
+        } else {
+            Ok(GetOrInsertResult::Existing(node.snapshot()))
         }
+    }
+}
+
+impl<K, T, const N: usize> std::fmt::Debug for Runtime<K, T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("nodes", &self.nodes.len())
+            .field("revision", &self.revision.snapshot())
+            .finish()
     }
 }
 
@@ -987,5 +991,221 @@ mod tests {
         assert_eq!(rev.get(Durability::new(0).unwrap()), 2);
         assert_eq!(rev.get(Durability::new(1).unwrap()), 1);
         assert_eq!(rev.get(Durability::new(2).unwrap()), 1);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    type TestRuntime = Runtime<u64, u64, 3>;
+
+    #[test]
+    fn compare_runs_exactly_once_under_contention() {
+        let rt: Arc<TestRuntime> = Arc::new(Runtime::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let threads = 8;
+        let per_thread = 200;
+
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let rt = rt.clone();
+                let calls = calls.clone();
+                thread::spawn(move || {
+                    for i in 0..per_thread {
+                        rt.update_with_compare(
+                            1,
+                            t * 1000 + i,
+                            |old, new| {
+                                calls.fetch_add(1, Ordering::Relaxed);
+                                old != Some(new)
+                            },
+                            Durability::volatile(),
+                            vec![],
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            threads as usize * per_thread as usize
+        );
+    }
+
+    #[test]
+    fn get_or_insert_increments_revision_once() {
+        let rt: Arc<TestRuntime> = Arc::new(Runtime::new());
+        let inserted = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let rt = rt.clone();
+                let inserted = inserted.clone();
+                thread::spawn(move || {
+                    match rt
+                        .get_or_insert(7, t, Durability::volatile(), vec![])
+                        .unwrap()
+                    {
+                        GetOrInsertResult::Inserted(_) => {
+                            inserted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        GetOrInsertResult::Existing(_) => {}
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(inserted.load(Ordering::Relaxed), 1);
+        // Exactly one revision was consumed: losers must not bump the counter.
+        assert_eq!(rt.current_revision().get(Durability::volatile()), 1);
+    }
+
+    #[test]
+    fn concurrent_registers_keep_reverse_edges_consistent() {
+        let rt: Arc<TestRuntime> = Arc::new(Runtime::new());
+        rt.register(0, 0, Durability::stable(), vec![]).unwrap();
+
+        // Many nodes concurrently depend on node 0, then re-register with no deps.
+        let handles: Vec<_> = (1..=16u64)
+            .map(|id| {
+                let rt = rt.clone();
+                thread::spawn(move || {
+                    for round in 0..50 {
+                        rt.register(id, round, Durability::volatile(), vec![0])
+                            .unwrap();
+                        assert!(rt.is_valid(&id));
+                        rt.register(id, round, Durability::volatile(), vec![])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every node ended with no deps, so node 0 must have no dependents left.
+        let root = rt.get(&0).unwrap();
+        assert!(root.dependents.is_empty(), "{:?}", root.dependents);
+        assert!(rt.remove_if_unused(0).is_some());
+    }
+
+    #[test]
+    fn readers_do_not_block_and_see_monotonic_revisions() {
+        let rt: Arc<TestRuntime> = Arc::new(Runtime::new());
+        rt.register(1, 0, Durability::volatile(), vec![]).unwrap();
+
+        let writer = {
+            let rt = rt.clone();
+            thread::spawn(move || {
+                for i in 1..=500 {
+                    rt.confirm_changed(&1, vec![]).unwrap();
+                    let rev = rt.current_revision();
+                    rt.mark_verified(&1, &rev);
+                    rt.register(1, i, Durability::volatile(), vec![]).unwrap();
+                }
+            })
+        };
+        let reader = {
+            let rt = rt.clone();
+            thread::spawn(move || {
+                let mut last_changed = 0;
+                let mut last_verified = 0;
+                for _ in 0..2000 {
+                    let node = rt.get(&1).unwrap();
+                    assert!(node.changed_at >= last_changed);
+                    assert!(node.verified_at >= last_verified);
+                    assert!(node.verified_at >= node.changed_at);
+                    last_changed = node.changed_at;
+                    last_verified = node.verified_at;
+                    let _ = rt.is_valid(&1);
+                    let _ = rt.get_data(&1);
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_remove_and_register_never_lose_the_final_write() {
+        let rt: Arc<TestRuntime> = Arc::new(Runtime::new());
+        rt.register(1, 0, Durability::volatile(), vec![]).unwrap();
+
+        let remover = {
+            let rt = rt.clone();
+            thread::spawn(move || {
+                for _ in 0..2000 {
+                    rt.remove(&1);
+                    rt.remove_if_unused(1);
+                }
+            })
+        };
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let rt = rt.clone();
+                thread::spawn(move || {
+                    for i in 0..2000 {
+                        rt.register(1, t * 10_000 + i, Durability::volatile(), vec![])
+                            .unwrap();
+                        rt.update_with_compare(
+                            1,
+                            i,
+                            |a, b| a != Some(b),
+                            Durability::volatile(),
+                            vec![],
+                        )
+                        .unwrap();
+                        let _ = rt.confirm_unchanged(&1, vec![]);
+                        let _ = rt.confirm_changed(&1, vec![]);
+                    }
+                })
+            })
+            .collect();
+        remover.join().unwrap();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        // Whatever interleaving happened, a write after all removals must stick.
+        rt.register(1, 42, Durability::volatile(), vec![]).unwrap();
+        assert_eq!(rt.get_data(&1), Some((42, rt.get(&1).unwrap().changed_at)));
+        assert!(rt.is_valid(&1));
+    }
+
+    #[test]
+    fn get_data_matches_get() {
+        let rt: TestRuntime = Runtime::new();
+        rt.register(1, 42, Durability::volatile(), vec![]).unwrap();
+        let node = rt.get(&1).unwrap();
+        assert_eq!(rt.get_data(&1), Some((42, node.changed_at)));
+        assert_eq!(rt.get_data(&2), None);
+    }
+
+    #[test]
+    fn remove_snapshot_is_detached() {
+        let rt: TestRuntime = Runtime::new();
+        rt.register(1, 1, Durability::volatile(), vec![]).unwrap();
+        rt.register(2, 2, Durability::volatile(), vec![1]).unwrap();
+
+        let removed = rt.remove(&1).unwrap();
+        assert!(removed.dependents.contains(&2));
+        assert!(rt.get(&1).is_none());
+        // Once the revision moves on, a dependent of a removed node is invalid.
+        rt.increment_revision(Durability::volatile());
+        assert!(!rt.is_valid(&2));
+        // Confirming with a missing dependency reports it.
+        assert_eq!(rt.confirm_unchanged(&2, vec![1]), Err(vec![1]));
     }
 }

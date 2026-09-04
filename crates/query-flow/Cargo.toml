@@ -13,7 +13,6 @@ categories = []
 [dependencies]
 whale.workspace = true
 ahash.workspace = true
-papaya.workspace = true
 anyhow.workspace = true
 query-flow-macros.workspace = true
 serde.workspace = true

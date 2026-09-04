@@ -189,6 +189,26 @@ where
         let dependents: Vec<_> = self.0.iter().filter(|q| *q != qid).cloned().collect();
         Dependents(Arc::new(dependents))
     }
+
+    /// Add the query ID in place, unless it is already present.
+    ///
+    /// Mutates the list directly when this is the only reference to it, and
+    /// copies it first otherwise (copy-on-write), so snapshots handed out
+    /// earlier are never affected.
+    pub fn insert(&mut self, qid: &K) {
+        if self.0.contains(qid) {
+            return;
+        }
+        Arc::make_mut(&mut self.0).push(qid.clone());
+    }
+
+    /// Remove the query ID in place, if present (copy-on-write, see [`Self::insert`]).
+    pub fn remove(&mut self, qid: &K) {
+        if !self.0.contains(qid) {
+            return;
+        }
+        Arc::make_mut(&mut self.0).retain(|q| q != qid);
+    }
 }
 
 impl<K> FromIterator<K> for Dependents<K> {
@@ -246,6 +266,25 @@ mod tests {
 
         let deps = deps.added("b");
         assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_dependents_in_place_is_copy_on_write() {
+        let mut deps: Dependents<&str> = Dependents::default();
+        deps.insert(&"a");
+        deps.insert(&"a");
+        assert_eq!(deps.len(), 1);
+
+        // A snapshot must not observe later in-place edits
+        let snapshot = deps.clone();
+        deps.insert(&"b");
+        deps.remove(&"a");
+        assert_eq!(snapshot.iter().copied().collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(deps.iter().copied().collect::<Vec<_>>(), vec!["b"]);
+
+        // Removing something absent is a no-op
+        deps.remove(&"zzz");
+        assert_eq!(deps.len(), 1);
     }
 
     #[test]

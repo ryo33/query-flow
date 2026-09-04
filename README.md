@@ -16,7 +16,7 @@ An ergonomic, runtime-agnostic framework for incremental computation.
 - **Runtime-agnostic**: Sync query logic with suspense pattern — works with any event loop or async runtime
 - **Automatic caching**: Query results are cached and invalidated based on dependencies
 - **Type-safe**: Per-query-type caching with compile-time guarantees
-- **Lock-free API**: Concurrent access from multiple threads via [whale](#whale)
+- **Thread-safe**: Concurrent access from multiple threads via [whale](#whale), with no unsafe code and a minimal dependency tree
 
 ## Quick Start
 
@@ -379,11 +379,11 @@ runtime.has_pending_assets();
 | [`query-flow`](https://crates.io/crates/query-flow) | High-level query framework with automatic caching and dependency tracking |
 | [`query-flow-macros`](https://crates.io/crates/query-flow-macros) | Procedural macros for defining queries |
 | [`query-flow-inspector`](https://crates.io/crates/query-flow-inspector) | Debugging and inspection tools |
-| [`whale`](https://crates.io/crates/whale) | Low-level lock-free dependency-tracking primitive |
+| [`whale`](https://crates.io/crates/whale) | Low-level dependency-tracking primitive |
 
 ## Whale
 
-Whale is the low-level primitive that powers query-flow. It provides lock-free dependency tracking without opinions about what queries are or how to store their results.
+Whale is the low-level primitive that powers query-flow. It provides thread-safe dependency tracking without opinions about what queries are or how to store their results.
 
 ### When to Use Whale Directly
 
@@ -405,22 +405,24 @@ Whale is designed to be a minimal primitive for building high-level incremental 
 
 ### Whale Architecture
 
-Whale is built around a lock-free dependency graph where nodes represent computations and edges represent their dependencies.
+Whale is built around a concurrent dependency graph where nodes represent computations and edges represent their dependencies.
 
 **Core Components:**
 
-- **Runtime**: The central coordinator that manages the dependency graph. Lock-free and safe to clone across threads.
+- **Runtime**: The central coordinator that manages the dependency graph. Thread-safe and cheap to clone.
 - **Node**: A vertex representing a computation with version, dependencies, dependents, and invalidation state.
 - **Pointer**: A reference to a specific version of a computation (query ID + version).
 - **RevisionPointer**: An extended pointer including invalidation state for precise state tracking.
 
-**Lock-free Design:**
+**Concurrency Design:**
 
-The system uses atomic operations and immutable data structures:
+Whale is built on `std` only (plus `ahash`) and contains no unsafe code:
 
-- Nodes are updated through atomic compare-and-swap operations
-- Dependencies and dependents are stored in immutable collections
-- Version numbers are managed through atomic counters
+- Nodes live in a sharded map (`ShardedMap`) guarded by per-shard read/write locks
+- The fields validity checks read (`verified_at`, `changed_at`, durability, level) are atomics, so readers never block on writers
+- Structural updates (data, dependencies, reverse edges) take a per-node mutex and run exactly once; nothing is retried
+- Revision counters are atomic
+- No lock is ever held while calling into user code, except the `compare` callback of `update_with_compare`, which must not re-enter the runtime
 
 This allows multiple threads to concurrently query states, propagate invalidations, and modify the dependency graph.
 

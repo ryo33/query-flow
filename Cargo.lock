@@ -582,17 +582,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "papaya"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f92dd0b07c53a0a0c764db2ace8c541dc47320dad97c2200c2a637ab9dd2328f"
-dependencies = [
- "equivalent",
- "seize",
- "serde",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,7 +665,6 @@ dependencies = [
  "criterion 0.8.1",
  "dyn-hash",
  "indexmap",
- "papaya",
  "query-flow-macros",
  "serde",
  "tokio",
@@ -844,16 +832,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "seize"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "serde"
@@ -1116,10 +1094,9 @@ dependencies = [
 
 [[package]]
 name = "whale"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ahash",
- "papaya",
  "serde",
  "tokio",
 ]

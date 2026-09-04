@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::hash::Hasher;
 use std::sync::Arc;
 
-use papaya::HashMap;
+use whale::ShardedMap;
 
 use crate::asset::{AssetKey, AssetLocator, DurabilityLevel};
 use crate::key::{AssetCacheKey, FullCacheKey};
@@ -136,7 +136,7 @@ fn erased_locate_with_locator_ctx<K: AssetKey, L: AssetLocator<K>, T: crate::Tra
 /// Thread-safe storage for asset locators.
 pub(crate) struct LocatorStorage<T: crate::Tracer> {
     /// Map from AssetKey TypeId to type-erased locator
-    locators: HashMap<TypeId, ErasedLocator<T>, ahash::RandomState>,
+    locators: ShardedMap<TypeId, Arc<ErasedLocator<T>>>,
 }
 
 impl<T: crate::Tracer> Default for LocatorStorage<T> {
@@ -149,14 +149,16 @@ impl<T: crate::Tracer> LocatorStorage<T> {
     /// Create a new empty locator storage.
     pub fn new() -> Self {
         Self {
-            locators: HashMap::with_hasher(ahash::RandomState::new()),
+            locators: ShardedMap::new(),
         }
     }
 
     /// Register a locator for a specific asset key type.
     pub fn insert<K: AssetKey, L: AssetLocator<K>>(&self, locator: L) {
-        let pinned = self.locators.pin();
-        pinned.insert(TypeId::of::<K>(), ErasedLocator::new::<K, L>(locator));
+        self.locators.insert(
+            TypeId::of::<K>(),
+            Arc::new(ErasedLocator::new::<K, L>(locator)),
+        );
     }
 
     /// Attempt to locate an asset using the registered locator (with LocatorContext).
@@ -170,8 +172,8 @@ impl<T: crate::Tracer> LocatorStorage<T> {
         locator_ctx: &crate::runtime::LocatorContext<'_, T>,
         key: &dyn Any,
     ) -> Option<Result<ErasedLocateResult, crate::QueryError>> {
-        let pinned = self.locators.pin();
-        pinned
+        // Clone the locator out so no map lock is held while user code runs.
+        self.locators
             .get(&key_type)
             .and_then(|locator| locator.locate_with_locator_ctx(locator_ctx, key))
     }
@@ -180,7 +182,7 @@ impl<T: crate::Tracer> LocatorStorage<T> {
 /// Thread-safe storage for pending asset requests.
 pub(crate) struct PendingStorage {
     /// Map from AssetCacheKey to type-erased key
-    pending: HashMap<AssetCacheKey, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+    pending: ShardedMap<AssetCacheKey, Arc<dyn Any + Send + Sync>>,
 }
 
 impl Default for PendingStorage {
@@ -193,52 +195,51 @@ impl PendingStorage {
     /// Create a new empty pending storage.
     pub fn new() -> Self {
         Self {
-            pending: HashMap::with_hasher(ahash::RandomState::new()),
+            pending: ShardedMap::new(),
         }
     }
 
     /// Add a pending asset request.
     pub fn insert<K: AssetKey>(&self, asset_key: AssetCacheKey, key: K) {
-        let pinned = self.pending.pin();
-        pinned.insert(asset_key, Arc::new(key) as Arc<dyn Any + Send + Sync>);
+        self.pending
+            .insert(asset_key, Arc::new(key) as Arc<dyn Any + Send + Sync>);
     }
 
     /// Remove a pending asset request.
     pub fn remove(&self, key: &AssetCacheKey) -> bool {
-        let pinned = self.pending.pin();
-        pinned.remove(key).is_some()
+        self.pending.remove(key).is_some()
     }
 
     /// Check if there are any pending assets.
     pub fn is_empty(&self) -> bool {
-        let pinned = self.pending.pin();
-        pinned.is_empty()
+        self.pending.is_empty()
     }
 
     /// Get all pending assets of a specific type.
     pub fn get_of_type<K: AssetKey>(&self) -> Vec<K> {
-        let pinned = self.pending.pin();
         let key_type = TypeId::of::<K>();
-        pinned
-            .iter()
-            .filter(|(k, _)| k.asset_key_type() == key_type)
-            .filter_map(|(_, v)| v.downcast_ref::<K>().cloned())
-            .collect()
+        let mut keys = Vec::new();
+        self.pending.for_each(|k, v| {
+            if k.asset_key_type() == key_type {
+                if let Some(key) = v.downcast_ref::<K>() {
+                    keys.push(key.clone());
+                }
+            }
+        });
+        keys
     }
 
     /// Get all pending assets as PendingAsset.
     pub fn get_all(&self) -> Vec<crate::asset::PendingAsset> {
-        let pinned = self.pending.pin();
-        pinned
-            .iter()
-            .map(|(k, v)| {
-                crate::asset::PendingAsset::new_from_parts(
-                    k.asset_key_type(),
-                    &k.debug_repr(),
-                    v.clone(),
-                )
-            })
-            .collect()
+        let mut assets = Vec::new();
+        self.pending.for_each(|k, v| {
+            assets.push(crate::asset::PendingAsset::new_from_parts(
+                k.asset_key_type(),
+                &k.debug_repr(),
+                v.clone(),
+            ));
+        });
+        assets
     }
 }
 
@@ -247,13 +248,14 @@ impl PendingStorage {
 /// Used by `list_queries` to enumerate all registered queries of a specific type.
 pub(crate) struct QueryRegistry {
     /// Map from Query TypeId to per-type registry
-    entries: HashMap<TypeId, QueryTypeRegistry, ahash::RandomState>,
+    entries: ShardedMap<TypeId, Arc<QueryTypeRegistry>>,
 }
 
 /// Per-type registry for queries.
+#[derive(Default)]
 struct QueryTypeRegistry {
     /// Map from key_hash to type-erased query instance
-    queries: HashMap<u64, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+    queries: ShardedMap<u64, Arc<dyn Any + Send + Sync>>,
 }
 
 impl Default for QueryRegistry {
@@ -266,7 +268,7 @@ impl QueryRegistry {
     /// Create a new empty query registry.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::with_hasher(ahash::RandomState::new()),
+            entries: ShardedMap::new(),
         }
     }
 
@@ -278,47 +280,30 @@ impl QueryRegistry {
         query.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
-        let entries_pinned = self.entries.pin();
-
         // Get or create the per-type registry
-        if let Some(type_registry) = entries_pinned.get(&type_id) {
-            let queries_pinned = type_registry.queries.pin();
-            if queries_pinned.contains_key(&key_hash) {
+        let (type_registry, _) = self.entries.get_or_insert_with(type_id, Default::default);
+        type_registry.queries.compute(key_hash, |slot| {
+            if slot.is_some() {
                 return false; // Already registered
             }
-            queries_pinned.insert(
-                key_hash,
-                Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>,
-            );
+            *slot = Some(Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>);
             true
-        } else {
-            // Create new per-type registry
-            let type_registry = QueryTypeRegistry {
-                queries: HashMap::with_hasher(ahash::RandomState::new()),
-            };
-            type_registry.queries.pin().insert(
-                key_hash,
-                Arc::new(query.clone()) as Arc<dyn Any + Send + Sync>,
-            );
-            entries_pinned.insert(type_id, type_registry);
-            true
-        }
+        })
     }
 
     /// Get all query instances of type Q.
     pub fn get_all<Q: Query>(&self) -> Vec<Q> {
         let type_id = TypeId::of::<Q>();
-        let entries_pinned = self.entries.pin();
-
-        if let Some(type_registry) = entries_pinned.get(&type_id) {
-            let queries_pinned = type_registry.queries.pin();
-            queries_pinned
-                .iter()
-                .filter_map(|(_, arc)| arc.downcast_ref::<Q>().cloned())
-                .collect()
-        } else {
-            Vec::new()
-        }
+        let Some(type_registry) = self.entries.get(&type_id) else {
+            return Vec::new();
+        };
+        let mut queries = Vec::new();
+        type_registry.queries.for_each(|_, arc| {
+            if let Some(query) = arc.downcast_ref::<Q>() {
+                queries.push(query.clone());
+            }
+        });
+        queries
     }
 
     /// Remove a query from the registry. Returns `true` if it was present.
@@ -328,14 +313,9 @@ impl QueryRegistry {
         query.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
-        let entries_pinned = self.entries.pin();
-
-        if let Some(type_registry) = entries_pinned.get(&type_id) {
-            let queries_pinned = type_registry.queries.pin();
-            queries_pinned.remove(&key_hash).is_some()
-        } else {
-            false
-        }
+        self.entries
+            .get(&type_id)
+            .is_some_and(|type_registry| type_registry.queries.remove(&key_hash).is_some())
     }
 }
 
@@ -344,13 +324,14 @@ impl QueryRegistry {
 /// Used by `list_asset_keys` to enumerate all registered asset keys of a specific type.
 pub(crate) struct AssetKeyRegistry {
     /// Map from AssetKey TypeId to per-type registry
-    entries: HashMap<TypeId, AssetKeyTypeRegistry, ahash::RandomState>,
+    entries: ShardedMap<TypeId, Arc<AssetKeyTypeRegistry>>,
 }
 
 /// Per-type registry for asset keys.
+#[derive(Default)]
 struct AssetKeyTypeRegistry {
     /// Map from key_hash to type-erased asset key instance
-    keys: HashMap<u64, Arc<dyn Any + Send + Sync>, ahash::RandomState>,
+    keys: ShardedMap<u64, Arc<dyn Any + Send + Sync>>,
 }
 
 impl Default for AssetKeyRegistry {
@@ -363,7 +344,7 @@ impl AssetKeyRegistry {
     /// Create a new empty asset key registry.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::with_hasher(ahash::RandomState::new()),
+            entries: ShardedMap::new(),
         }
     }
 
@@ -374,45 +355,29 @@ impl AssetKeyRegistry {
         key.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
-        let entries_pinned = self.entries.pin();
-
-        if let Some(type_registry) = entries_pinned.get(&type_id) {
-            let keys_pinned = type_registry.keys.pin();
-            if keys_pinned.contains_key(&key_hash) {
+        let (type_registry, _) = self.entries.get_or_insert_with(type_id, Default::default);
+        type_registry.keys.compute(key_hash, |slot| {
+            if slot.is_some() {
                 return false; // Already registered
             }
-            keys_pinned.insert(
-                key_hash,
-                Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>,
-            );
+            *slot = Some(Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>);
             true
-        } else {
-            let type_registry = AssetKeyTypeRegistry {
-                keys: HashMap::with_hasher(ahash::RandomState::new()),
-            };
-            type_registry.keys.pin().insert(
-                key_hash,
-                Arc::new(key.clone()) as Arc<dyn Any + Send + Sync>,
-            );
-            entries_pinned.insert(type_id, type_registry);
-            true
-        }
+        })
     }
 
     /// Get all asset keys of type K.
     pub fn get_all<K: AssetKey>(&self) -> Vec<K> {
         let type_id = TypeId::of::<K>();
-        let entries_pinned = self.entries.pin();
-
-        if let Some(type_registry) = entries_pinned.get(&type_id) {
-            let keys_pinned = type_registry.keys.pin();
-            keys_pinned
-                .iter()
-                .filter_map(|(_, arc)| arc.downcast_ref::<K>().cloned())
-                .collect()
-        } else {
-            Vec::new()
-        }
+        let Some(type_registry) = self.entries.get(&type_id) else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        type_registry.keys.for_each(|_, arc| {
+            if let Some(key) = arc.downcast_ref::<K>() {
+                keys.push(key.clone());
+            }
+        });
+        keys
     }
 
     /// Remove an asset key. Returns `true` if it was present.
@@ -422,14 +387,9 @@ impl AssetKeyRegistry {
         key.dyn_hash(&mut hasher);
         let key_hash = hasher.finish();
 
-        let entries_pinned = self.entries.pin();
-
-        if let Some(type_registry) = entries_pinned.get(&type_id) {
-            let keys_pinned = type_registry.keys.pin();
-            keys_pinned.remove(&key_hash).is_some()
-        } else {
-            false
-        }
+        self.entries
+            .get(&type_id)
+            .is_some_and(|type_registry| type_registry.keys.remove(&key_hash).is_some())
     }
 }
 
@@ -520,7 +480,7 @@ impl<K: AssetKey, T: crate::Tracer + 'static> AnyVerifier for AssetVerifier<K, T
 /// deciding whether to recompute a dependent query.
 pub(crate) struct VerifierStorage {
     /// Map from FullCacheKey to verifier
-    verifiers: HashMap<FullCacheKey, Arc<dyn AnyVerifier>, ahash::RandomState>,
+    verifiers: ShardedMap<FullCacheKey, Arc<dyn AnyVerifier>>,
 }
 
 impl Default for VerifierStorage {
@@ -533,14 +493,14 @@ impl VerifierStorage {
     /// Create a new empty verifier storage.
     pub fn new() -> Self {
         Self {
-            verifiers: HashMap::with_hasher(ahash::RandomState::new()),
+            verifiers: ShardedMap::new(),
         }
     }
 
     /// Register a verifier for a query.
     pub fn insert<Q: Query, T: crate::Tracer + 'static>(&self, key: FullCacheKey, query: Q) {
-        let pinned = self.verifiers.pin();
-        pinned.insert(key, Arc::new(QueryVerifier::<Q, T>::new(query)));
+        self.verifiers
+            .insert(key, Arc::new(QueryVerifier::<Q, T>::new(query)));
     }
 
     /// Register a verifier for an asset.
@@ -549,20 +509,18 @@ impl VerifierStorage {
         key: FullCacheKey,
         asset_key: K,
     ) {
-        let pinned = self.verifiers.pin();
-        pinned.insert(key, Arc::new(AssetVerifier::<K, T>::new(asset_key)));
+        self.verifiers
+            .insert(key, Arc::new(AssetVerifier::<K, T>::new(asset_key)));
     }
 
     /// Get a verifier for a query key.
     pub fn get(&self, key: &FullCacheKey) -> Option<Arc<dyn AnyVerifier>> {
-        let pinned = self.verifiers.pin();
-        pinned.get(key).cloned()
+        self.verifiers.get(key)
     }
 
     /// Remove a verifier.
     pub fn remove(&self, key: &FullCacheKey) -> bool {
-        let pinned = self.verifiers.pin();
-        pinned.remove(key).is_some()
+        self.verifiers.remove(key).is_some()
     }
 }
 

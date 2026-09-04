@@ -292,10 +292,8 @@ impl<T: Tracer> QueryRuntime<T> {
         &self,
         key: &FullCacheKey,
     ) -> Option<(CachedValue<Arc<Q::Output>>, RevisionCounter)> {
-        let node = self.whale.get(key)?;
-        let revision = node.changed_at;
-        let entry = node.data.as_ref()?;
-        let cached = entry.to_cached_value::<Q::Output>()?;
+        let (data, revision) = self.whale.get_data(key)?;
+        let cached = data.as_ref()?.to_cached_value::<Q::Output>()?;
         Some((cached, revision))
     }
 
@@ -783,7 +781,9 @@ impl<T: Tracer> QueryRuntime<T> {
     /// ```
     pub fn changed_at<Q: Query>(&self, query: &Q) -> Option<RevisionCounter> {
         let full_key = QueryCacheKey::new(query.clone()).into();
-        self.whale.get(&full_key).map(|node| node.changed_at)
+        self.whale
+            .get_data(&full_key)
+            .map(|(_, changed_at)| changed_at)
     }
 }
 
@@ -1282,8 +1282,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let _span_guard = SpanStackGuard::push(trace_id, asset_span_id);
 
         // Check whale cache first (single atomic read)
-        if let Some(node) = self.whale.get(&full_cache_key) {
-            let changed_at = node.changed_at;
+        if let Some((cached_data, changed_at)) = self.whale.get_data(&full_cache_key) {
             // Check if valid at current revision (shallow check)
             if self.whale.is_valid(&full_cache_key) {
                 // Verify dependencies recursively (like query path does)
@@ -1309,7 +1308,7 @@ impl<T: Tracer> QueryRuntime<T> {
                         .get_dependency_ids(&full_cache_key)
                         .is_some_and(|deps| !deps.is_empty());
 
-                    match &node.data {
+                    match &cached_data {
                         Some(CachedEntry::AssetReady(arc)) => {
                             // Check consistency for cached leaf assets
                             if !has_locator_deps {
@@ -1564,8 +1563,7 @@ impl<T: Tracer> QueryRuntime<T> {
         let _span_guard = SpanStackGuard::push(trace_id, asset_span_id);
 
         // Check whale cache first (single atomic read)
-        if let Some(node) = self.whale.get(&full_cache_key) {
-            let changed_at = node.changed_at;
+        if let Some((cached_data, changed_at)) = self.whale.get_data(&full_cache_key) {
             // Check if valid at current revision (shallow check)
             if self.whale.is_valid(&full_cache_key) {
                 // Verify dependencies recursively (like query path does)
@@ -1591,7 +1589,7 @@ impl<T: Tracer> QueryRuntime<T> {
                         .get_dependency_ids(&full_cache_key)
                         .is_some_and(|deps| !deps.is_empty());
 
-                    match &node.data {
+                    match &cached_data {
                         Some(CachedEntry::AssetReady(arc)) => {
                             // Check consistency for cached leaf assets
                             if !has_locator_deps {

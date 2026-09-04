@@ -1,5 +1,6 @@
 #![deny(missing_docs)]
-//! Whale is a lock-free incremental computation dependency tracking library.
+#![forbid(unsafe_code)]
+//! Whale is a dependency tracking library for incremental computation.
 //!
 //! This crate provides primitives for building incremental computation systems,
 //! following the formally verified specification in Lean4.
@@ -41,10 +42,13 @@
 //! assert!(rt.is_valid(&"b"));
 //! ```
 
+mod map;
 mod node;
+mod node_state;
 mod revision;
 mod runtime;
 
+pub use map::ShardedMap;
 pub use node::{Dep, Dependencies, Dependents, Node};
 pub use revision::{AtomicRevision, Durability, Revision, RevisionCounter};
 pub use runtime::{GetOrInsertResult, RegisterResult, Runtime, UpdateCompareResult};

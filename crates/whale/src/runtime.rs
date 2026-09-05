@@ -302,6 +302,21 @@ where
         }
     }
 
+    /// Remove `qid` from the dependents list of every node it depended on.
+    ///
+    /// Called after `qid` has been taken out of the map, so that its former
+    /// dependencies stop counting it as a dependent and become reclaimable by
+    /// [`Runtime::remove_if_unused`]. Runs outside the shard lock that removed
+    /// the node, because the lock order forbids touching another shard while
+    /// holding one.
+    fn unlink_from_dependencies(&self, qid: &K, deps: &Dependencies<K>) {
+        for dep in deps.iter() {
+            self.nodes.with(&dep.query_id, |dep_node| {
+                dep_node.write().dependents.remove(qid);
+            });
+        }
+    }
+
     /// Replace `qid`'s old dependency edges with `new_deps`.
     fn replace_edges(
         &self,
@@ -451,11 +466,16 @@ where
 
     /// Remove a node from the runtime.
     ///
+    /// The node is also unlinked from its dependencies' reverse edges, so they
+    /// no longer count it as a dependent.
+    ///
     /// Returns the removed node if it existed.
     pub fn remove(&self, query_id: &K) -> Option<Node<K, T, N>> {
-        self.nodes.compute(query_id.clone(), |slot| {
+        let removed = self.nodes.compute(query_id.clone(), |slot| {
             slot.take().map(|node| Self::detach(&node))
-        })
+        })?;
+        self.unlink_from_dependencies(query_id, &removed.dependencies);
+        Some(removed)
     }
 
     /// Mark a node that has just been taken out of the map as detached and
@@ -516,9 +536,13 @@ where
 
     /// Remove a node if it has no dependents.
     ///
+    /// The node is also unlinked from its dependencies' reverse edges, so a
+    /// GC pass that removes a dependent first can then reclaim what it
+    /// depended on.
+    ///
     /// Useful for garbage collection.
     pub fn remove_if_unused(&self, query_id: K) -> Option<Node<K, T, N>> {
-        self.nodes.compute(query_id, |slot| {
+        let removed = self.nodes.compute(query_id.clone(), |slot| {
             let unused = slot
                 .as_ref()
                 .is_some_and(|node| node.read().dependents.is_empty());
@@ -527,7 +551,9 @@ where
             } else {
                 None
             }
-        })
+        })?;
+        self.unlink_from_dependencies(&query_id, &removed.dependencies);
+        Some(removed)
     }
 
     /// Detect a cycle in the dependency graph starting from the given query.
@@ -940,6 +966,65 @@ mod tests {
         let removed = rt.remove_if_unused("a");
         assert!(removed.is_none());
         assert!(rt.get(&"a").is_some());
+    }
+
+    #[test]
+    fn test_remove_unlinks_reverse_edges() {
+        let rt: TestRuntime = Runtime::new();
+
+        rt.register("a", (), Durability::volatile(), vec![])
+            .unwrap();
+        rt.register("b", (), Durability::volatile(), vec!["a"])
+            .unwrap();
+
+        // b depends on a, so a is pinned.
+        assert!(rt.remove_if_unused("a").is_none());
+
+        // Removing b must drop the reverse edge it holds on a.
+        assert!(rt.remove(&"b").is_some());
+        assert!(rt.get(&"a").unwrap().dependents.is_empty());
+
+        // a is now reclaimable.
+        assert!(rt.remove_if_unused("a").is_some());
+        assert!(rt.get(&"a").is_none());
+    }
+
+    #[test]
+    fn test_remove_if_unused_unlinks_reverse_edges() {
+        let rt: TestRuntime = Runtime::new();
+
+        rt.register("a", (), Durability::volatile(), vec![])
+            .unwrap();
+        rt.register("b", (), Durability::volatile(), vec!["a"])
+            .unwrap();
+
+        // GC pass in dependent-first order reclaims the whole chain.
+        assert!(rt.remove_if_unused("b").is_some());
+        assert!(rt.get(&"a").unwrap().dependents.is_empty());
+        assert!(rt.remove_if_unused("a").is_some());
+    }
+
+    #[test]
+    fn test_gc_reclaims_whole_chain() {
+        let rt: TestRuntime = Runtime::new();
+
+        rt.register("a", (), Durability::volatile(), vec![])
+            .unwrap();
+        rt.register("b", (), Durability::volatile(), vec!["a"])
+            .unwrap();
+        rt.register("c", (), Durability::volatile(), vec!["b"])
+            .unwrap();
+
+        // Repeated sweeps peel the chain from the root down until nothing is left.
+        for _ in 0..3 {
+            for key in ["a", "b", "c"] {
+                rt.remove_if_unused(key);
+            }
+        }
+
+        assert!(rt.get(&"a").is_none());
+        assert!(rt.get(&"b").is_none());
+        assert!(rt.get(&"c").is_none());
     }
 
     #[test]

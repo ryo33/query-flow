@@ -415,6 +415,10 @@ impl<T: Tracer> QueryRuntime<T> {
         let _span_guard = SpanStackGuard::push(trace_id, span_id);
         let exec_ctx = ExecutionContext::new(span_ctx);
 
+        // GC tracking hook: fires on every access, cache hits included, so
+        // external LRU/TTL trackers see the full access pattern.
+        self.tracer.on_query_key(&full_key);
+
         self.tracer.on_query_start(&span_ctx, &query_cache_key);
 
         // Check for cycles using thread-local stack

@@ -172,6 +172,34 @@ fn bench_update_cycles(c: &mut Criterion) {
     group.finish();
 }
 
+/// Mutation kinds that exercise the removal paths.
+///
+/// The other groups only ever add to and update the graph, so `remove` and
+/// `remove_if_unused` -- including the reverse-edge unlinking they do -- would
+/// otherwise go unmeasured.
+fn bench_removal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("removal");
+
+    let configs = [
+        ("remove_query", Presets::remove_query()),
+        ("remove_asset", Presets::remove_asset()),
+        ("mixed_mutations", Presets::mixed_mutations()),
+    ];
+
+    for (name, config) in configs {
+        let config = config.with_seed(42);
+        group.bench_with_input(BenchmarkId::new("kind", name), &config, |b, config| {
+            b.iter_batched(
+                || FuzzRunner::new(config.clone()),
+                |mut runner| runner.run(),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_presets(c: &mut Criterion) {
     let mut group = c.benchmark_group("presets");
 
@@ -205,6 +233,7 @@ criterion_group!(
     bench_update_pattern,
     bench_asset_count,
     bench_update_cycles,
+    bench_removal,
     bench_presets,
 );
 

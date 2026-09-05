@@ -258,6 +258,8 @@ pub trait Tracer: Send + Sync + 'static {
     ///     access_times: Mutex::new(HashMap::new()),
     /// });
     /// runtime.query(Double::new(21)).unwrap();
+    ///
+    /// assert_eq!(runtime.tracer().access_times.lock().unwrap().len(), 1);
     /// ```
     #[inline]
     fn on_query_key(&self, _full_key: &FullCacheKey) {}

@@ -134,17 +134,44 @@ impl QueryError {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use query_flow::{QueryResultExt, TypedErr};
+/// ```
+/// use std::fmt;
 ///
-/// let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
-/// match result {
-///     Ok(value) => { /* success */ }
-///     Err(typed_err) => {
-///         // typed_err derefs to &MyError
-///         println!("Error code: {}", typed_err.code);
+/// use query_flow::{query, Db, QueryError, QueryResultExt, QueryRuntime};
+///
+/// #[derive(Debug)]
+/// struct MyError {
+///     code: u32,
+/// }
+///
+/// impl fmt::Display for MyError {
+///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+///         write!(f, "my error {}", self.code)
 ///     }
 /// }
+///
+/// impl std::error::Error for MyError {}
+///
+/// #[query]
+/// fn failing(db: &impl Db) -> Result<i32, QueryError> {
+///     let _ = db;
+///     Err(MyError { code: 42 }.into())
+/// }
+///
+/// #[query]
+/// fn caller(db: &impl Db) -> Result<String, QueryError> {
+///     let result = db.query(Failing::new()).downcast_err::<MyError>()?;
+///     Ok(match result {
+///         Ok(value) => format!("success: {}", value),
+///         Err(typed_err) => {
+///             // typed_err derefs to &MyError
+///             format!("Error code: {}", typed_err.code)
+///         }
+///     })
+/// }
+///
+/// let runtime = QueryRuntime::new();
+/// assert_eq!(*runtime.query(Caller::new()).unwrap(), "Error code: 42");
 /// ```
 #[derive(Clone)]
 pub struct TypedErr<E> {
@@ -205,16 +232,48 @@ impl<E: std::error::Error + Send + Sync + 'static> fmt::Display for TypedErr<E> 
 ///
 /// # Example
 ///
-/// ```ignore
-/// use query_flow::QueryResultExt;
+/// ```
+/// use std::fmt;
 ///
-/// // Downcast to MyError, propagating system errors and non-matching user errors
-/// let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
+/// use query_flow::{query, Db, QueryError, QueryResultExt, QueryRuntime};
 ///
-/// match result {
-///     Ok(value) => println!("Success: {:?}", value),
-///     Err(my_err) => println!("MyError: {}", my_err.code),
+/// #[derive(Debug)]
+/// struct MyError {
+///     code: u32,
 /// }
+///
+/// impl fmt::Display for MyError {
+///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+///         write!(f, "my error {}", self.code)
+///     }
+/// }
+///
+/// impl std::error::Error for MyError {}
+///
+/// #[query]
+/// fn my_query(db: &impl Db, succeed: bool) -> Result<i32, QueryError> {
+///     let _ = db;
+///     if succeed {
+///         Ok(1)
+///     } else {
+///         Err(MyError { code: 7 }.into())
+///     }
+/// }
+///
+/// #[query]
+/// fn caller(db: &impl Db, succeed: bool) -> Result<String, QueryError> {
+///     // Downcast to MyError, propagating system errors and non-matching user errors
+///     let result = db.query(MyQuery::new(succeed)).downcast_err::<MyError>()?;
+///
+///     Ok(match result {
+///         Ok(value) => format!("Success: {:?}", value),
+///         Err(my_err) => format!("MyError: {}", my_err.code),
+///     })
+/// }
+///
+/// let runtime = QueryRuntime::new();
+/// assert_eq!(*runtime.query(Caller::new(true)).unwrap(), "Success: 1");
+/// assert_eq!(*runtime.query(Caller::new(false)).unwrap(), "MyError: 7");
 /// ```
 pub trait QueryResultExt<T> {
     /// Attempts to downcast a `UserError` to a specific error type.
@@ -228,13 +287,44 @@ pub trait QueryResultExt<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// // Handle specific error type, propagate others
-    /// let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
-    /// let value = result.map_err(|e| {
-    ///     eprintln!("MyError occurred: {}", e.message);
-    ///     e
-    /// })?;
+    /// ```
+    /// use std::fmt;
+    ///
+    /// use query_flow::{query, Db, QueryError, QueryResultExt, QueryRuntime};
+    ///
+    /// #[derive(Debug)]
+    /// struct MyError {
+    ///     message: String,
+    /// }
+    ///
+    /// impl fmt::Display for MyError {
+    ///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    ///         write!(f, "{}", self.message)
+    ///     }
+    /// }
+    ///
+    /// impl std::error::Error for MyError {}
+    ///
+    /// #[query]
+    /// fn my_query(db: &impl Db) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Err(MyError { message: "boom".into() }.into())
+    /// }
+    ///
+    /// #[query]
+    /// fn caller(db: &impl Db) -> Result<i32, QueryError> {
+    ///     // Handle specific error type, propagate others
+    ///     let result = db.query(MyQuery::new()).downcast_err::<MyError>()?;
+    ///     let value = result.map_err(|e| {
+    ///         eprintln!("MyError occurred: {}", e.message);
+    ///         e
+    ///     })?;
+    ///     Ok(*value)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// let err = runtime.query(Caller::new()).unwrap_err();
+    /// assert!(err.is::<MyError>());
     /// ```
     fn downcast_err<E: std::error::Error + Send + Sync + 'static>(
         self,

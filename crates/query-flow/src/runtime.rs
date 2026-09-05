@@ -180,15 +180,29 @@ impl ExecutionContext {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let result = runtime.poll(MyQuery::new())?;
+/// ```
+/// use query_flow::{query, Db, QueryError, QueryRuntime, RevisionCounter};
 ///
-/// // Access the value via Deref
-/// println!("{:?}", *result);
+/// #[query]
+/// fn my_query(db: &impl Db) -> Result<i32, QueryError> {
+///     let _ = db;
+///     Ok(42)
+/// }
+///
+/// let runtime = QueryRuntime::new();
+/// let mut last_known_revision: RevisionCounter = 0;
+///
+/// let result = runtime.poll(MyQuery::new()).unwrap();
+///
+/// // `value` is `Result<Arc<Output>, Arc<anyhow::Error>>`: `Ok` for a successful
+/// // query, `Err` for a cached user error.
+/// match &result.value {
+///     Ok(value) => assert_eq!(**value, 42),
+///     Err(err) => panic!("query failed: {err}"),
+/// }
 ///
 /// // Check if changed since last poll
 /// if result.revision > last_known_revision {
-///     notify_subscribers(&result.value);
 ///     last_known_revision = result.revision;
 /// }
 /// ```
@@ -221,16 +235,25 @@ impl<T: Deref> Deref for Polled<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use query_flow::{query, Db, NoopTracer, QueryError, QueryRuntime};
+///
+/// #[query]
+/// fn my_query(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+///     let _ = db;
+///     Ok(x * 2)
+/// }
+///
 /// // Without tracing (default)
 /// let runtime = QueryRuntime::new();
 ///
-/// // With tracing
-/// let tracer = MyTracer::new();
+/// // With tracing (see the `tracer` module for writing a custom tracer)
+/// let tracer = NoopTracer;
 /// let runtime = QueryRuntime::with_tracer(tracer);
 ///
 /// // Sync query execution
-/// let result = runtime.query(MyQuery { ... })?;
+/// let result = runtime.query(MyQuery::new(21)).unwrap();
+/// assert_eq!(*result, 42);
 /// ```
 pub struct QueryRuntime<T: Tracer = NoopTracer> {
     /// Whale runtime for dependency tracking and cache storage.
@@ -314,7 +337,22 @@ impl QueryRuntime<NoopTracer> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use std::fmt;
+    ///
+    /// use query_flow::QueryRuntime;
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// struct MyError(u32);
+    ///
+    /// impl fmt::Display for MyError {
+    ///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    ///         write!(f, "my error {}", self.0)
+    ///     }
+    /// }
+    ///
+    /// impl std::error::Error for MyError {}
+    ///
     /// let runtime = QueryRuntime::builder()
     ///     .error_comparator(|a, b| {
     ///         // Custom error comparison logic
@@ -731,21 +769,34 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// struct Subscription<Q: Query> {
-    ///     query: Q,
-    ///     last_revision: RevisionCounter,
-    ///     tx: Sender<Result<Arc<Q::Output>, Arc<anyhow::Error>>>,
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = i32)]
+    /// struct Input(&'static str);
+    ///
+    /// #[query]
+    /// fn doubled(db: &impl Db) -> Result<i32, QueryError> {
+    ///     Ok(*db.asset(Input("x"))? * 2)
     /// }
     ///
-    /// // Polling loop
-    /// for sub in &mut subscriptions {
-    ///     let result = runtime.poll(sub.query.clone())?;
-    ///     if result.revision > sub.last_revision {
-    ///         sub.tx.send(result.value.clone())?;
-    ///         sub.last_revision = result.revision;
-    ///     }
-    /// }
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(Input("x"), 21, DurabilityLevel::Volatile);
+    ///
+    /// let result = runtime.poll(Doubled::new()).unwrap();
+    /// assert_eq!(**result.value.as_ref().unwrap(), 42);
+    /// let last_revision = result.revision;
+    ///
+    /// // Polling again without any change leaves the revision untouched,
+    /// // so a subscriber knows there is nothing to send.
+    /// let again = runtime.poll(Doubled::new()).unwrap();
+    /// assert_eq!(again.revision, last_revision);
+    ///
+    /// // Changing the input bumps the revision.
+    /// runtime.resolve_asset(Input("x"), 50, DurabilityLevel::Volatile);
+    /// let changed = runtime.poll(Doubled::new()).unwrap();
+    /// assert!(changed.revision > last_revision);
+    /// assert_eq!(**changed.value.as_ref().unwrap(), 100);
     /// ```
     ///
     /// # Errors
@@ -770,12 +821,29 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{query, Db, QueryError, QueryRuntime, RevisionCounter};
+    ///
+    /// #[query]
+    /// fn my_query(db: &impl Db, key: i32) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Ok(key * 2)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// let key = 21;
+    /// let last_known_revision: RevisionCounter = 0;
+    ///
+    /// // Never executed yet, so there is no revision to compare against.
+    /// assert!(runtime.changed_at(&MyQuery::new(key)).is_none());
+    ///
+    /// runtime.query(MyQuery::new(key)).unwrap();
+    ///
     /// // Check if query has changed before deciding to poll
     /// if let Some(rev) = runtime.changed_at(&MyQuery::new(key)) {
     ///     if rev > last_known_revision {
-    ///         let result = runtime.query(MyQuery::new(key))?;
-    ///         // Process result...
+    ///         let result = runtime.query(MyQuery::new(key)).unwrap();
+    ///         assert_eq!(*result, 42);
     ///     }
     /// }
     /// ```
@@ -800,16 +868,47 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// // Collect all keys that haven't been accessed recently
-    /// let stale_keys: Vec<_> = runtime.query_keys()
-    ///     .filter(|key| tracker.is_stale(key))
-    ///     .collect();
+    /// ```
+    /// use query_flow::{query, Db, QueryError, QueryRuntime};
     ///
-    /// // Remove stale queries that have no dependents
-    /// for key in stale_keys {
-    ///     runtime.remove_if_unused(&key);
+    /// #[query]
+    /// fn leaf(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Ok(x)
     /// }
+    ///
+    /// #[query]
+    /// fn root(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     Ok(*db.query(Leaf::new(x))? + 1)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.query(Root::new(1)).unwrap();
+    /// runtime.query(Root::new(2)).unwrap();
+    ///
+    /// // Both roots and their dependencies are cached. Note that the returned
+    /// // keys also include the internal per-type set sentinels used by
+    /// // `list_queries`, so the count is larger than the number of queries.
+    /// assert!(runtime.query_keys().len() >= 4);
+    ///
+    /// // Collect the keys that haven't been accessed recently. A real GC would
+    /// // consult access times recorded through `Tracer::on_query_key`; here
+    /// // every `Leaf` stands in for the stale set.
+    /// let stale_keys: Vec<_> = runtime
+    ///     .query_keys()
+    ///     .into_iter()
+    ///     .filter(|key| key.downcast::<Leaf>().is_some())
+    ///     .collect();
+    /// assert_eq!(stale_keys.len(), 2);
+    ///
+    /// // The sweep keeps both leaves: each one still has a root depending on it,
+    /// // and `remove_if_unused` never breaks a live dependent.
+    /// for key in &stale_keys {
+    ///     assert!(!runtime.remove_if_unused(key));
+    /// }
+    ///
+    /// // The roots themselves have no dependents, so they are reclaimed.
+    /// assert!(runtime.remove_query_if_unused(&Root::new(1)));
     /// ```
     pub fn query_keys(&self) -> Vec<FullCacheKey> {
         self.whale.keys()
@@ -823,13 +922,28 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let query = MyQuery::new(cache_key);
-    /// if runtime.remove_query_if_unused(&query) {
-    ///     println!("Query removed");
-    /// } else {
-    ///     println!("Query has dependents, not removed");
+    /// ```
+    /// use query_flow::{query, Db, QueryError, QueryRuntime};
+    ///
+    /// #[query]
+    /// fn leaf(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Ok(x)
     /// }
+    ///
+    /// #[query]
+    /// fn root(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     Ok(*db.query(Leaf::new(x))? + 1)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.query(Root::new(1)).unwrap();
+    ///
+    /// // `Leaf` has a dependent (`Root`), so it is kept.
+    /// assert!(!runtime.remove_query_if_unused(&Leaf::new(1)));
+    ///
+    /// // `Root` has no dependents, so it is removed.
+    /// assert!(runtime.remove_query_if_unused(&Root::new(1)));
     /// ```
     pub fn remove_query_if_unused<Q: Query>(&self, query: &Q) -> bool {
         let full_key = QueryCacheKey::new(query.clone()).into();
@@ -868,13 +982,32 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use std::collections::HashSet;
+    ///
+    /// use query_flow::{query, Db, FullCacheKey, QueryError, QueryRuntime};
+    ///
+    /// #[query]
+    /// fn my_query(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Ok(x * 2)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.query(MyQuery::new(1)).unwrap();
+    /// runtime.query(MyQuery::new(2)).unwrap();
+    ///
+    /// // Your GC tracker decides what has expired; here everything has.
+    /// let expired: HashSet<FullCacheKey> = runtime.query_keys().into_iter().collect();
+    ///
     /// // Implement LRU GC
     /// for key in runtime.query_keys() {
-    ///     if tracker.is_expired(&key) {
+    ///     if expired.contains(&key) {
     ///         runtime.remove_if_unused(&key);
     ///     }
     /// }
+    ///
+    /// assert!(runtime.query_keys().is_empty());
     /// ```
     pub fn remove_if_unused(&self, key: &FullCacheKey) -> bool {
         if self.whale.remove_if_unused(key.clone()).is_some() {
@@ -895,7 +1028,9 @@ impl<T: Tracer> QueryRuntime<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use query_flow::QueryRuntime;
+///
 /// let runtime = QueryRuntime::builder()
 ///     .error_comparator(|a, b| {
 ///         // Treat all errors of the same type as equal
@@ -937,7 +1072,9 @@ impl<T: Tracer> QueryRuntimeBuilder<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::QueryRuntime;
+    ///
     /// // Treat errors as equal if they have the same display message
     /// let runtime = QueryRuntime::builder()
     ///     .error_comparator(|a, b| a.to_string() == b.to_string())
@@ -983,9 +1120,32 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{
+    ///     asset_key, AssetLocator, Db, DurabilityLevel, LocateResult, QueryError, QueryRuntime,
+    /// };
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// struct InMemoryLocator {
+    ///     prefix: String,
+    /// }
+    ///
+    /// impl AssetLocator<FilePath> for InMemoryLocator {
+    ///     fn locate(&self, db: &impl Db, key: &FilePath) -> Result<LocateResult<String>, QueryError> {
+    ///         let _ = db;
+    ///         Ok(LocateResult::Ready {
+    ///             value: format!("{}{}", self.prefix, key.0),
+    ///             durability: DurabilityLevel::Static,
+    ///         })
+    ///     }
+    /// }
+    ///
     /// let runtime = QueryRuntime::new();
-    /// runtime.register_asset_locator(FileSystemLocator::new("/assets"));
+    /// runtime.register_asset_locator(InMemoryLocator {
+    ///     prefix: "/assets/".to_string(),
+    /// });
     /// ```
     pub fn register_asset_locator<K, L>(&self, locator: L)
     where
@@ -1002,13 +1162,50 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{
+    ///     asset_key, asset_locator, query, Db, DurabilityLevel, LocateResult, QueryError,
+    ///     QueryRuntime,
+    /// };
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// #[asset_locator]
+    /// fn pending(_db: &impl Db, _key: &FilePath) -> Result<LocateResult<String>, QueryError> {
+    ///     Ok(LocateResult::Pending)
+    /// }
+    ///
+    /// #[query]
+    /// fn read_file(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
+    ///     Ok(db.asset(path)?.len())
+    /// }
+    ///
+    /// fn fetch_file(path: &FilePath) -> String {
+    ///     format!("contents of {}", path.0)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.register_asset_locator(Pending);
+    ///
+    /// // The query suspends, which registers a pending asset request.
+    /// assert!(runtime
+    ///     .query(ReadFile::new(FilePath("a.txt".into())))
+    ///     .is_err());
+    ///
     /// for pending in runtime.pending_assets() {
     ///     if let Some(path) = pending.key::<FilePath>() {
     ///         let content = fetch_file(path);
-    ///         runtime.resolve_asset(path.clone(), content);
+    ///         runtime.resolve_asset(path.clone(), content, DurabilityLevel::Volatile);
     ///     }
     /// }
+    ///
+    /// assert_eq!(
+    ///     *runtime
+    ///         .query(ReadFile::new(FilePath("a.txt".into())))
+    ///         .unwrap(),
+    ///     17
+    /// );
     /// ```
     pub fn pending_assets(&self) -> Vec<PendingAsset> {
         self.pending.get_all()
@@ -1040,9 +1237,25 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let content = std::fs::read_to_string(&path)?;
-    /// runtime.resolve_asset(FilePath(path), content, DurabilityLevel::Volatile);
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// #[query]
+    /// fn byte_len(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
+    ///     Ok(db.asset(path)?.len())
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// let path = "config.json".to_string();
+    ///
+    /// // In a real program this would be `std::fs::read_to_string(&path)?`.
+    /// let content = "hello".to_string();
+    /// runtime.resolve_asset(FilePath(path.clone()), content, DurabilityLevel::Volatile);
+    ///
+    /// assert_eq!(*runtime.query(ByteLen::new(FilePath(path))).unwrap(), 5);
     /// ```
     pub fn resolve_asset<K: AssetKey>(&self, key: K, value: K::Asset, durability: DurabilityLevel) {
         self.resolve_asset_internal(key, value, durability);
@@ -1064,11 +1277,34 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// match fetch_file(&path) {
-    ///     Ok(content) => runtime.resolve_asset(FilePath(path), content, DurabilityLevel::Volatile),
-    ///     Err(e) => runtime.resolve_asset_error(FilePath(path), e, DurabilityLevel::Volatile),
+    /// ```
+    /// use std::io;
+    ///
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// #[query]
+    /// fn byte_len(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
+    ///     Ok(db.asset(path)?.len())
     /// }
+    ///
+    /// fn fetch_file(path: &str) -> io::Result<String> {
+    ///     Err(io::Error::new(io::ErrorKind::NotFound, path.to_string()))
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// let path = "missing.json".to_string();
+    ///
+    /// match fetch_file(&path) {
+    ///     Ok(content) => runtime.resolve_asset(FilePath(path.clone()), content, DurabilityLevel::Volatile),
+    ///     Err(e) => runtime.resolve_asset_error(FilePath(path.clone()), e, DurabilityLevel::Volatile),
+    /// }
+    ///
+    /// // Queries depending on the asset now observe the cached user error.
+    /// let err = runtime.query(ByteLen::new(FilePath(path))).unwrap_err();
+    /// assert!(err.is::<io::Error>());
     /// ```
     pub fn resolve_asset_error<K: AssetKey>(
         &self,
@@ -1186,11 +1422,32 @@ impl<T: Tracer> QueryRuntime<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// #[query]
+    /// fn byte_len(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
+    ///     Ok(db.asset(path)?.len())
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// let path = FilePath("config.json".into());
+    /// runtime.resolve_asset(path.clone(), "hello".into(), DurabilityLevel::Volatile);
+    /// assert_eq!(*runtime.query(ByteLen::new(path.clone())).unwrap(), 5);
+    ///
     /// // File was modified externally
-    /// runtime.invalidate_asset(&FilePath("config.json".into()));
+    /// runtime.invalidate_asset(&path);
+    ///
     /// // Queries depending on this asset will now suspend
+    /// let err = runtime.query(ByteLen::new(path.clone())).unwrap_err();
+    /// assert!(matches!(err, QueryError::Suspend { .. }));
+    ///
     /// // User should fetch the new value and call resolve_asset
+    /// runtime.resolve_asset(path.clone(), "hello world".into(), DurabilityLevel::Volatile);
+    /// assert_eq!(*runtime.query(ByteLen::new(path)).unwrap(), 11);
     /// ```
     pub fn invalidate_asset<K: AssetKey>(&self, key: &K) {
         let asset_cache_key = AssetCacheKey::new(key.clone());
@@ -1896,11 +2153,23 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// fn query(self, db: &impl Db) -> Result<Self::Output, QueryError> {
-    ///     let dep_result = db.query(OtherQuery { id: self.id })?;
-    ///     Ok(process(&dep_result))
+    /// ```
+    /// use query_flow::{query, Db, QueryError, QueryRuntime};
+    ///
+    /// #[query]
+    /// fn other_query(db: &impl Db, id: u64) -> Result<u64, QueryError> {
+    ///     let _ = db;
+    ///     Ok(id * 2)
     /// }
+    ///
+    /// #[query]
+    /// fn caller(db: &impl Db, id: u64) -> Result<u64, QueryError> {
+    ///     let dep_result = db.query(OtherQuery::new(id))?;
+    ///     Ok(*dep_result + 1)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// assert_eq!(*runtime.query(Caller::new(21)).unwrap(), 43);
     /// ```
     pub fn query<Q: Query>(&self, query: Q) -> Result<Arc<Q::Output>, QueryError> {
         let full_key: FullCacheKey = QueryCacheKey::new(query.clone()).into();
@@ -1926,13 +2195,29 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
     /// #[query]
-    /// fn process_file(db: &impl Db, path: FilePath) -> Result<Output, QueryError> {
+    /// fn process_file(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
     ///     let content = db.asset(path)?;
     ///     // Process content...
-    ///     Ok(output)
+    ///     Ok(content.len())
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(
+    ///     FilePath("a".into()),
+    ///     "hello".into(),
+    ///     DurabilityLevel::Volatile,
+    /// );
+    /// assert_eq!(
+    ///     *runtime.query(ProcessFile::new(FilePath("a".into()))).unwrap(),
+    ///     5
+    /// );
     /// ```
     ///
     /// # Errors
@@ -1950,13 +2235,34 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let state = db.asset_state(key)?;
-    /// if state.is_loading() {
-    ///     // Handle loading case explicitly
-    /// } else {
-    ///     let value = state.get().unwrap();
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// #[query]
+    /// fn describe(db: &impl Db, key: FilePath) -> Result<String, QueryError> {
+    ///     let state = db.asset_state(key)?;
+    ///     if state.is_loading() {
+    ///         // Handle loading case explicitly
+    ///         Ok("loading".to_string())
+    ///     } else {
+    ///         let value = state.get().unwrap();
+    ///         Ok(format!("{} bytes", value.len()))
+    ///     }
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(
+    ///     FilePath("a".into()),
+    ///     "hello".into(),
+    ///     DurabilityLevel::Volatile,
+    /// );
+    /// assert_eq!(
+    ///     *runtime.query(Describe::new(FilePath("a".into()))).unwrap(),
+    ///     "5 bytes"
+    /// );
     /// ```
     ///
     /// # Errors
@@ -1993,7 +2299,15 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{query, Db, QueryError, QueryRuntime};
+    ///
+    /// #[query]
+    /// fn my_query(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Ok(x * 2)
+    /// }
+    ///
     /// #[query]
     /// fn all_results(db: &impl Db) -> Result<Vec<i32>, QueryError> {
     ///     let queries = db.list_queries::<MyQuery>();
@@ -2001,8 +2315,15 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///     for q in queries {
     ///         results.push(*db.query(q)?);
     ///     }
+    ///     results.sort();
     ///     Ok(results)
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.query(MyQuery::new(1)).unwrap();
+    /// runtime.query(MyQuery::new(2)).unwrap();
+    ///
+    /// assert_eq!(*runtime.query(AllResults::new()).unwrap(), vec![2, 4]);
     /// ```
     pub fn list_queries<Q: Query>(&self) -> Vec<Q> {
         // Record dependency on the sentinel (set-level dependency)
@@ -2040,7 +2361,12 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct ConfigFile(String);
+    ///
     /// #[query]
     /// fn all_configs(db: &impl Db) -> Result<Vec<String>, QueryError> {
     ///     let keys = db.list_asset_keys::<ConfigFile>();
@@ -2049,8 +2375,18 @@ impl<'a, T: Tracer> QueryContext<'a, T> {
     ///         let content = db.asset(key)?;
     ///         contents.push((*content).clone());
     ///     }
+    ///     contents.sort();
     ///     Ok(contents)
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(ConfigFile("a".into()), "one".into(), DurabilityLevel::Volatile);
+    /// runtime.resolve_asset(ConfigFile("b".into()), "two".into(), DurabilityLevel::Volatile);
+    ///
+    /// assert_eq!(
+    ///     *runtime.query(AllConfigs::new()).unwrap(),
+    ///     vec!["one".to_string(), "two".to_string()]
+    /// );
     /// ```
     pub fn list_asset_keys<K: AssetKey>(&self) -> Vec<K> {
         // Record dependency on the sentinel (set-level dependency)

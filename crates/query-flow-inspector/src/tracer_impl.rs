@@ -29,20 +29,27 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 ///
 /// # Example
 ///
-/// ```ignore
-/// use query_flow::QueryRuntime;
+/// ```
+/// use query_flow::{query, Db, QueryError, QueryRuntime};
 /// use query_flow_inspector::{EventCollector, EventSinkTracer};
 /// use std::sync::Arc;
+///
+/// #[query]
+/// fn my_query(db: &impl Db) -> Result<i32, QueryError> {
+///     let _ = db;
+///     Ok(42)
+/// }
 ///
 /// let collector = Arc::new(EventCollector::new());
 /// let tracer = EventSinkTracer::new(collector.clone());
 /// let runtime = QueryRuntime::with_tracer(tracer);
 ///
 /// // Run queries...
-/// runtime.query(MyQuery::new())?;
+/// runtime.query(MyQuery::new()).unwrap();
 ///
 /// // Get the trace
 /// let trace = collector.trace();
+/// assert!(!trace.events.is_empty());
 /// ```
 pub struct EventSinkTracer {
     sink: Arc<dyn EventSink>,

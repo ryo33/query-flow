@@ -6,8 +6,10 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use query_flow::{QueryRuntime, Tracer, SpanId, TraceId, SpanContext, QueryCacheKey};
+//! ```
+//! use query_flow::{
+//!     query, Db, QueryCacheKey, QueryError, QueryRuntime, SpanContext, SpanId, TraceId, Tracer,
+//! };
 //!
 //! // Custom tracer implementation
 //! struct MyTracer;
@@ -26,7 +28,14 @@
 //!     }
 //! }
 //!
+//! #[query]
+//! fn double(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+//!     let _ = db;
+//!     Ok(x * 2)
+//! }
+//!
 //! let runtime = QueryRuntime::with_tracer(MyTracer);
+//! assert_eq!(*runtime.query(Double::new(21)).unwrap(), 42);
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -218,8 +227,8 @@ pub trait Tracer: Send + Sync + 'static {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use query_flow::{FullCacheKey, Tracer, SpanId};
+    /// ```
+    /// use query_flow::{query, Db, FullCacheKey, QueryError, QueryRuntime, SpanId, TraceId, Tracer};
     /// use std::collections::HashMap;
     /// use std::sync::Mutex;
     /// use std::time::Instant;
@@ -231,11 +240,24 @@ pub trait Tracer: Send + Sync + 'static {
     /// impl Tracer for GcTracer {
     ///     fn new_span_id(&self) -> SpanId { SpanId(0) }
     ///
+    ///     fn new_trace_id(&self) -> TraceId { TraceId(0) }
+    ///
     ///     fn on_query_key(&self, full_key: &FullCacheKey) {
     ///         self.access_times.lock().unwrap()
     ///             .insert(full_key.clone(), Instant::now());
     ///     }
     /// }
+    ///
+    /// #[query]
+    /// fn double(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+    ///     let _ = db;
+    ///     Ok(x * 2)
+    /// }
+    ///
+    /// let runtime = QueryRuntime::with_tracer(GcTracer {
+    ///     access_times: Mutex::new(HashMap::new()),
+    /// });
+    /// runtime.query(Double::new(21)).unwrap();
     /// ```
     #[inline]
     fn on_query_key(&self, _full_key: &FullCacheKey) {}

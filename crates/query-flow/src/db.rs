@@ -10,7 +10,7 @@ use crate::QueryError;
 /// Database trait that provides query execution and asset access.
 ///
 /// This trait is implemented by both [`QueryRuntime`](crate::QueryRuntime) and
-/// [`QueryContext`](crate::QueryContext), allowing queries to work with either.
+/// the internal `QueryContext`, allowing queries to work with either.
 ///
 /// - `QueryRuntime::query()` / `QueryRuntime::asset()`: No dependency tracking
 /// - `QueryContext::query()` / `QueryContext::asset()`: With dependency tracking
@@ -25,11 +25,25 @@ pub trait Db {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// fn query(&self, db: &impl Db) -> Result<MyOutput, QueryError> {
-    ///     let data = db.asset(key)?;  // Suspends if loading
-    ///     Ok(process(&data))
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct SourceFile(String);
+    ///
+    /// #[query]
+    /// fn line_count(db: &impl Db, name: String) -> Result<usize, QueryError> {
+    ///     let text = db.asset(SourceFile(name))?; // Suspends if loading
+    ///     Ok(text.lines().count())
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(
+    ///     SourceFile("a".into()),
+    ///     "one\ntwo\n".into(),
+    ///     DurabilityLevel::Volatile,
+    /// );
+    /// assert_eq!(*runtime.query(LineCount::new("a".into())).unwrap(), 2);
     /// ```
     fn asset<K: AssetKey>(&self, key: K) -> Result<Arc<K::Asset>, QueryError>;
 
@@ -40,13 +54,31 @@ pub trait Db {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let state = db.asset_state(key)?;
-    /// if state.is_loading() {
-    ///     // Handle loading case explicitly
-    /// } else {
-    ///     let value = state.get().unwrap();
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct SourceFile(String);
+    ///
+    /// #[query]
+    /// fn describe(db: &impl Db, name: String) -> Result<String, QueryError> {
+    ///     let state = db.asset_state(SourceFile(name))?;
+    ///     if state.is_loading() {
+    ///         // Handle loading case explicitly, without suspending.
+    ///         Ok("loading".to_string())
+    ///     } else {
+    ///         let value = state.get().unwrap();
+    ///         Ok(format!("{} bytes", value.len()))
+    ///     }
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(
+    ///     SourceFile("a".into()),
+    ///     "hello".into(),
+    ///     DurabilityLevel::Volatile,
+    /// );
+    /// assert_eq!(*runtime.query(Describe::new("a".into())).unwrap(), "5 bytes");
     /// ```
     fn asset_state<K: AssetKey>(&self, key: K) -> Result<AssetLoadingState<K>, QueryError>;
 

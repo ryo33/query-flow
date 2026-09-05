@@ -15,7 +15,7 @@ use crate::events::FlowEvent;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use query_flow_inspector::{EventSink, FlowEvent};
 ///
 /// struct PrintSink;

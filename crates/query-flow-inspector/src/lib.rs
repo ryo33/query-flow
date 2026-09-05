@@ -9,10 +9,16 @@
 //!
 //! # Quick Start
 //!
-//! ```ignore
-//! use query_flow::QueryRuntime;
+//! ```
+//! use query_flow::{query, Db, QueryError, QueryRuntime};
 //! use query_flow_inspector::{EventCollector, EventSinkTracer, FlowEvent, ExecutionResult};
 //! use std::sync::Arc;
+//!
+//! #[query]
+//! fn my_query(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+//!     let _ = db;
+//!     Ok(a + b)
+//! }
 //!
 //! // Create a collector and tracer
 //! let collector = Arc::new(EventCollector::new());
@@ -22,7 +28,7 @@
 //! let runtime = QueryRuntime::with_tracer(tracer);
 //!
 //! // Run queries - events are automatically collected
-//! runtime.query(MyQuery::new(args))?;
+//! runtime.query(MyQuery::new(1, 2)).unwrap();
 //!
 //! // Inspect collected events
 //! let trace = collector.trace();

@@ -12,18 +12,25 @@ use crate::sink::EventSink;
 ///
 /// # Example
 ///
-/// ```ignore
-/// use query_flow_inspector::{EventCollector, with_sink, FlowEvent};
+/// ```
+/// use query_flow::{query, Db, QueryError, QueryRuntime};
+/// use query_flow_inspector::{EventCollector, EventSinkTracer};
 /// use std::sync::Arc;
 ///
-/// let collector = Arc::new(EventCollector::new());
+/// #[query]
+/// fn my_query(db: &impl Db, x: i32) -> Result<i32, QueryError> {
+///     let _ = db;
+///     Ok(x * 2)
+/// }
 ///
-/// with_sink(collector.clone(), || {
-///     // Run queries here
-/// });
+/// let collector = Arc::new(EventCollector::new());
+/// let runtime = QueryRuntime::with_tracer(EventSinkTracer::new(collector.clone()));
+///
+/// // Run queries here
+/// runtime.query(MyQuery::new(21)).unwrap();
 ///
 /// let trace = collector.trace();
-/// assert!(trace.events.len() > 0);
+/// assert!(!trace.events.is_empty());
 /// ```
 #[derive(Debug, Default)]
 pub struct EventCollector {

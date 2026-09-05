@@ -16,12 +16,17 @@ use crate::QueryError;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+///
+/// #[asset_key(asset = String)]
+/// struct FilePath(String);
+///
 /// #[query]
-/// fn process_file(db: &impl Db, path: FilePath) -> Result<Output, QueryError> {
+/// fn process_file(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
 ///     // Most common: just use db.asset() which suspends automatically
 ///     let content = db.asset(path)?;
-///     Ok(process(&content))
+///     Ok(content.len())
 /// }
 ///
 /// #[query]
@@ -30,6 +35,15 @@ use crate::QueryError;
 ///     let state = db.asset_state(path)?;
 ///     Ok(state.is_loading())
 /// }
+///
+/// let runtime = QueryRuntime::new();
+/// runtime.resolve_asset(
+///     FilePath("a".into()),
+///     "hello".into(),
+///     DurabilityLevel::Volatile,
+/// );
+/// assert_eq!(*runtime.query(ProcessFile::new(FilePath("a".into()))).unwrap(), 5);
+/// assert!(!*runtime.query(CheckLoading::new(FilePath("a".into()))).unwrap());
 /// ```
 pub struct AssetLoadingState<K: AssetKey> {
     value: Option<Arc<K::Asset>>,
@@ -77,17 +91,32 @@ impl<K: AssetKey> AssetLoadingState<K> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// fn query(&self, db: &impl Db) -> Result<MyOutput, QueryError> {
+    /// ```
+    /// use query_flow::{asset_key, query, Db, DurabilityLevel, QueryError, QueryRuntime};
+    ///
+    /// #[asset_key(asset = String)]
+    /// struct FilePath(String);
+    ///
+    /// #[query]
+    /// fn byte_len(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
     ///     // Preferred: use db.asset() directly
-    ///     let data = db.asset(key)?;
+    ///     let data = db.asset(path.clone())?;
     ///
     ///     // Alternative: use asset_state() + suspend()
-    ///     let state = db.asset_state(key)?;
-    ///     let data = state.suspend()?;
+    ///     let state = db.asset_state(path)?;
+    ///     let data2 = state.suspend()?;
     ///
-    ///     Ok(process(&data))
+    ///     assert_eq!(data, data2);
+    ///     Ok(data.len())
     /// }
+    ///
+    /// let runtime = QueryRuntime::new();
+    /// runtime.resolve_asset(
+    ///     FilePath("a".into()),
+    ///     "hello".into(),
+    ///     DurabilityLevel::Volatile,
+    /// );
+    /// assert_eq!(*runtime.query(ByteLen::new(FilePath("a".into()))).unwrap(), 5);
     /// ```
     pub fn suspend(self) -> Result<Arc<K::Asset>, QueryError> {
         match self.value {

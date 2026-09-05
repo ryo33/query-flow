@@ -4,9 +4,9 @@
 # It is NOT intended as a build system, task runner, or CI configuration.
 # Please do not extend it for other purposes.
 
-.PHONY: check clippy test test-no-default-features fmt-check
+.PHONY: check clippy test test-no-default-features test-doc test-doc-no-default-features fmt-check
 
-check: clippy test test-no-default-features fmt-check
+check: clippy test test-no-default-features test-doc test-doc-no-default-features fmt-check
 	@echo "All checks passed."
 
 clippy:
@@ -16,7 +16,15 @@ test:
 	@if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run --all-targets --all-features --show-progress none --status-level fail --final-status-level fail; else cargo test -q --all-targets --all-features; fi && echo "test passed"
 
 test-no-default-features:
-	@if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run --all-targets --no-default-features --show-progress none --status-level fail --final-status-level fail; else cargo test -q --all-targets --no-default-features; fi && echo "test passed"
+	@if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run --all-targets --no-default-features --show-progress none --status-level fail --final-status-level fail; else cargo test -q --all-targets --no-default-features; fi && echo "test-no-default-features passed"
+
+# Doc tests are NOT covered by --all-targets above, and nextest cannot run them,
+# so they need their own cargo test invocation.
+test-doc:
+	@cargo test -q --doc --all-features && echo "test-doc passed"
+
+test-doc-no-default-features:
+	@cargo test -q --doc --no-default-features && echo "test-doc-no-default-features passed"
 
 fmt-check:
 	@cargo fmt --check && echo "fmt-check passed"

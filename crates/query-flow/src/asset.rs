@@ -49,13 +49,19 @@ impl DurabilityLevel {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use std::path::PathBuf;
+///
 /// use query_flow::{asset_key, AssetKey};
 ///
 /// #[asset_key(asset = String)]
 /// pub struct ConfigFile(pub PathBuf);
 ///
 /// // Or manually:
+/// pub struct ImageData {
+///     pub bytes: Vec<u8>,
+/// }
+///
 /// #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 /// pub struct TextureId(pub u32);
 ///
@@ -113,14 +119,27 @@ pub enum LocateResult<A> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use query_flow::{
+///     asset_key, query, AssetLocator, Db, LocateResult, QueryError, QueryRuntime,
+/// };
+///
+/// #[asset_key(asset = String)]
+/// struct FilePath(String);
+///
+/// #[query]
+/// fn allowed_paths(db: &impl Db) -> Result<Vec<String>, QueryError> {
+///     let _ = db;
+///     Ok(vec!["allowed.txt".to_string()])
+/// }
+///
 /// struct ConfigAwareLocator;
 ///
 /// impl AssetLocator<FilePath> for ConfigAwareLocator {
 ///     fn locate(&self, db: &impl Db, key: &FilePath) -> Result<LocateResult<String>, QueryError> {
 ///         // Access config to check if path is allowed
-///         let config = db.query(GetConfig)?.clone();
-///         if !config.allowed_paths.contains(&key.0) {
+///         let allowed = db.query(AllowedPaths::new())?;
+///         if !allowed.contains(&key.0) {
 ///             return Err(anyhow::anyhow!("Path not allowed: {:?}", key.0).into());
 ///         }
 ///
@@ -128,6 +147,26 @@ pub enum LocateResult<A> {
 ///         Ok(LocateResult::Pending)
 ///     }
 /// }
+///
+/// #[query]
+/// fn read_file(db: &impl Db, path: FilePath) -> Result<usize, QueryError> {
+///     Ok(db.asset(path)?.len())
+/// }
+///
+/// let runtime = QueryRuntime::new();
+/// runtime.register_asset_locator(ConfigAwareLocator);
+///
+/// // Allowed path: the locator returns Pending, so the query suspends.
+/// let err = runtime
+///     .query(ReadFile::new(FilePath("allowed.txt".into())))
+///     .unwrap_err();
+/// assert!(matches!(err, QueryError::Suspend { .. }));
+///
+/// // Denied path: the locator's error surfaces as a user error.
+/// let err = runtime
+///     .query(ReadFile::new(FilePath("secret.txt".into())))
+///     .unwrap_err();
+/// assert!(matches!(err, QueryError::UserError(_)));
 /// ```
 pub trait AssetLocator<K: AssetKey>: Send + Sync + 'static {
     /// Attempt to locate an asset for the given key.

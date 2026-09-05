@@ -7,11 +7,22 @@
 /// causing downstream queries to be invalidated (recomputed).
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use query_flow::{query, Db, QueryError, QueryRuntime};
+///
+/// // Note: `MyError` deliberately has no `PartialEq`.
+/// #[derive(Debug)]
+/// struct MyError(String);
+///
 /// #[query(output_eq = query_flow::output_eq::ok_or_invalidate)]
-/// fn my_query(ctx: &mut QueryContext) -> Result<Result<i32, MyError>, QueryError> {
-///     // ...
+/// fn my_query(db: &impl Db, succeed: bool) -> Result<Result<i32, MyError>, QueryError> {
+///     let _ = db;
+///     Ok(if succeed { Ok(1) } else { Err(MyError("boom".into())) })
 /// }
+///
+/// let runtime = QueryRuntime::new();
+/// assert!(matches!(*runtime.query(MyQuery::new(true)).unwrap(), Ok(1)));
+/// assert!(matches!(*runtime.query(MyQuery::new(false)).unwrap(), Err(_)));
 /// ```
 pub fn ok_or_invalidate<T: PartialEq, E>(a: &Result<T, E>, b: &Result<T, E>) -> bool {
     match (a, b) {
@@ -26,11 +37,21 @@ pub fn ok_or_invalidate<T: PartialEq, E>(a: &Result<T, E>, b: &Result<T, E>) -> 
 /// regardless of the error content.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use query_flow::{query, Db, QueryError, QueryRuntime};
+///
+/// // Note: `MyError` deliberately has no `PartialEq`.
+/// #[derive(Debug)]
+/// struct MyError(String);
+///
 /// #[query(output_eq = query_flow::output_eq::ignore_err)]
-/// fn my_query(ctx: &mut QueryContext) -> Result<Result<i32, MyError>, QueryError> {
-///     // ...
+/// fn my_query(db: &impl Db, succeed: bool) -> Result<Result<i32, MyError>, QueryError> {
+///     let _ = db;
+///     Ok(if succeed { Ok(1) } else { Err(MyError("boom".into())) })
 /// }
+///
+/// let runtime = QueryRuntime::new();
+/// assert!(matches!(*runtime.query(MyQuery::new(false)).unwrap(), Err(_)));
 /// ```
 pub fn ignore_err<T: PartialEq, E>(a: &Result<T, E>, b: &Result<T, E>) -> bool {
     match (a, b) {

@@ -29,7 +29,9 @@ use crate::QueryError;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use std::sync::Arc;
+///
 /// use query_flow::{Query, Db, QueryError};
 ///
 /// // Simple infallible query
@@ -108,24 +110,48 @@ pub trait Query: CacheKey + Clone + Send + Sync + 'static {
 ///
 /// Use `QueryOutput` for generic type parameters that appear only in query output:
 ///
-/// ```ignore
+/// ```
+/// use std::fmt::Display;
+/// use std::str::FromStr;
+///
+/// use query_flow::{query, Db, QueryError, QueryOutput, QueryRuntime};
+///
 /// #[query]
 /// fn parse<T: QueryOutput + FromStr>(db: &impl Db, text: String) -> Result<T, QueryError>
 /// where
 ///     T::Err: Display,
 /// {
-///     text.parse().map_err(|e| anyhow!("{}", e).into())
+///     let _ = db;
+///     text.parse().map_err(|e| anyhow::anyhow!("{}", e).into())
 /// }
+///
+/// let runtime = QueryRuntime::new();
+/// assert_eq!(*runtime.query(Parse::<i32>::new("42".into())).unwrap(), 42);
+/// assert_eq!(*runtime.query(Parse::<u64>::new("42".into())).unwrap(), 42u64);
 /// ```
 ///
 /// # When Not to Use
 ///
-/// If you're using `#[query(output_eq = none)]` or a custom `output_eq` function,
-/// you don't need `PartialEq`. In that case, use raw bounds instead:
+/// If you supply a custom comparator with `#[query(output_eq = path)]`, the output
+/// does not need `PartialEq`. In that case, use raw bounds instead:
 ///
-/// ```ignore
-/// #[query(output_eq = none)]
-/// fn create<T: Send + Sync + 'static>(db: &impl Db) -> Result<T, QueryError> { ... }
+/// ```
+/// use query_flow::{query, Db, QueryError, QueryRuntime};
+///
+/// // No `PartialEq` on `T`, so the comparator is supplied explicitly.
+/// // Returning `false` disables early cutoff: dependents always recompute.
+/// fn always_recompute<T>(_old: &T, _new: &T) -> bool {
+///     false
+/// }
+///
+/// #[query(output_eq = always_recompute)]
+/// fn create<T: Default + Send + Sync + 'static>(db: &impl Db) -> Result<T, QueryError> {
+///     let _ = db;
+///     Ok(T::default())
+/// }
+///
+/// let runtime = QueryRuntime::new();
+/// assert_eq!(*runtime.query(Create::<i32>::new()).unwrap(), 0);
 /// ```
 pub trait QueryOutput: PartialEq + Send + Sync + 'static {}
 impl<T: PartialEq + Send + Sync + 'static> QueryOutput for T {}

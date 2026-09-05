@@ -14,11 +14,12 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use query_flow::{query, QueryContext, QueryError, QueryRuntime};
+//! ```
+//! use query_flow::{query, Db, QueryError, QueryRuntime};
 //!
 //! #[query]
-//! fn add(ctx: &mut QueryContext, a: i32, b: i32) -> Result<i32, QueryError> {
+//! fn add(db: &impl Db, a: i32, b: i32) -> Result<i32, QueryError> {
+//!     let _ = db;
 //!     Ok(a + b)
 //! }
 //!
